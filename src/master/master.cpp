@@ -19,6 +19,7 @@
 #include "ipc/command.h"
 #include "ipc/control_channel.h"
 #include "ipc/settings.h"
+#include "master/taskbar_supervisor.h"
 #include "net/http_client.h"
 #include "net/url.h"
 #include "platform/console.h"
@@ -26,6 +27,8 @@
 #include "platform/paths.h"
 #include "platform/user_scope.h"
 #include "platform/win32_util.h"
+#include "widget/preferences.h"
+#include "widget/window.h"
 
 namespace deskfeed {
 namespace {
@@ -44,6 +47,9 @@ constexpr UINT kMsgShowRequested = WM_APP + 5;
 constexpr UINT kHeartbeatMs = 1000;
 constexpr unsigned kControlSendTimeoutMs = 3000;
 constexpr unsigned kShutdownJoinMs = 2000;
+// 悬浮窗自己的窗口类名基础部分（与隔离实例的 scope 一起由 scoped_name 展开，见
+// platform/paths.h）。控制窗口用 DeskFeedControl，这里的窗口只有主进程自己用。
+constexpr wchar_t kWidgetWindowClassBase[] = L"DeskFeedWidget";
 // 同时在跑的“有效”取数上限。取消现在是真的（HTTP 层到点或被要求就关掉在途请求句柄），
 // 所以一个被放弃的作业只占几十毫秒；它不再挡着新源的首取——名额按 active 计数，
 // 一取消就释放。kMaxFetchJobs 是作业记录的硬上限，只用来兜住极端情况下的堆积。
@@ -107,6 +113,32 @@ std::wstring read_test_environment(std::wstring const& name) {
         return std::wstring();
     }
     return std::wstring(buffer, chars);
+}
+
+// `[taskbar] component` 的读取：只认 true / false（大小写不敏感），缺省 true，写坏的值按缺省
+// 处理。口径与 widget/preferences.cpp 的 read_bool 一致，免得同一个键出现两种解释。
+// 这一份是**用户的持久意图**；它和“本次运行有没有能力提供”是两件事（见 Master 的成员说明）。
+bool read_taskbar_component_intent(SettingsFile const* settings) {
+    if (settings == nullptr) {
+        return true;
+    }
+    std::wstring text;
+    if (!settings->get(L"taskbar", L"component", text)) {
+        return true;
+    }
+    std::wstring body;
+    for (wchar_t const ch : text) {
+        if (ch != L' ' && ch != L'\t') {
+            body.push_back(ch);
+        }
+    }
+    if (_wcsicmp(body.c_str(), L"true") == 0) {
+        return true;
+    }
+    if (_wcsicmp(body.c_str(), L"false") == 0) {
+        return false;
+    }
+    return true;
 }
 
 struct FetchOutcome {
@@ -176,9 +208,15 @@ public:
 
 private:
     OutcomeQueue() {
-        ::InitializeCriticalSection(&lock_);
-        // 预分配：满员是硬上限，正常情况下永远不会走到扩容那一步（push 里也因此不会分配）。
+        // 顺序是有意的：**先 reserve，再建锁**。
+        //
+        // vector::reserve 失败会抛 std::bad_alloc，而构造函数一旦抛出，析构函数**不会**被调用
+        // （对象从未构造完成），于是先建好的 CRITICAL_SECTION 就没人 DeleteCriticalSection 了。
+        // 反过来先 reserve：分配失败时还没有任何需要归还的资源，构造失败是干净的。
+        // 这里不存在“先拿锁再分配”的逆序问题——reserve 不碰锁，锁也只在成员函数里用。
         items_.reserve(kOutcomeQueueMax);
+        // 预分配之后 push 不会再扩容（满员由 kOutcomeQueueMax 提前挡住），push 里因此不分配。
+        ::InitializeCriticalSection(&lock_);
     }
 
     // 一把锁的 RAII 帮手：这个文件里只有这一处用到锁，不值得单开一个头。
@@ -212,14 +250,16 @@ struct FetchJobContext {
     // 结果没能入队（满员 / 已经停止接受 / 线程内异常）时置起来：主进程据此立刻把这次取数
     // 当失败收尾并释放名额，不用干等墙钟预算。
     std::shared_ptr<std::atomic<bool>> finished_without_result;
+    // 测试失败注入点（见 Master::test_refuse_outcome_）：让这一次的入队**必定失败**，
+    // 用来覆盖“结果没能交回主进程 ⇒ 立刻按内部失败收尾”这条路径。只在隔离实例里为真。
+    bool refuse_outcome = false;
 };
 
-// 工作线程入口。整条路径都有 C++ 异常边界：这里是**普通线程**的入口，异常一旦跨出去就是
-// std::terminate（整个主进程直接没）；而 HTTP 层与解析层都可能抛（分配失败之类）。
-// 异常一律降级成一条“内部失败”的结果，交回主进程按正常失败处理。
-DWORD WINAPI fetch_thread_entry(void* parameter) {
-    std::unique_ptr<FetchJobContext> context(static_cast<FetchJobContext*>(parameter));
-    std::shared_ptr<OutcomeQueue> const queue = context->queue;
+// 工作线程的实际工作体。它**不是**异常边界，调用方 `fetch_thread_entry` 才是。
+//
+// 这里保留一条**诊断用**的内层 catch（把异常降级成一条带 what() 的“内部失败”结果），因为它
+// 能给出可读的原因。但它不构成安全边界：`std::string` 拼接与 `what()` 自己也会抛。
+void fetch_worker_body(FetchJobContext* context, std::shared_ptr<OutcomeQueue> const& queue) {
     auto outcome = std::make_unique<FetchOutcome>();
     outcome->job_id = context->job_id;
     outcome->generation = context->generation;
@@ -249,7 +289,7 @@ DWORD WINAPI fetch_thread_entry(void* parameter) {
     // 入队；队列满了或已经停止接受就把这块结果丢掉（有上限的降级，绝不无界增长），
     // 并置 finished_without_result 让主进程立刻收尾这次取数。
     bool queued = false;
-    if (queue) {
+    if (queue && !context->refuse_outcome) {
         queued = queue->push(std::move(outcome));
     }
     if (!queued) {
@@ -259,6 +299,35 @@ DWORD WINAPI fetch_thread_entry(void* parameter) {
         }
     }
     ::PostMessageW(context->notify, kMsgFetchDone, 0, 0);  // 只叫醒，不带指针
+}
+
+// 工作线程入口：这里是**普通线程的真实出口**，异常一旦跨出去就是 std::terminate（整个主进程
+// 直接没）。所以整个函数体都压在一条最外层边界里，包括以前漏在外面的三处：
+//   * `std::make_unique<FetchOutcome>()`（分配失败）；
+//   * 诊断 catch 里的 `std::string` 拼接与 `what()`（它们自己也会抛）；
+//   * `queue->push`，以及入队失败时的 `log_format`。
+// 最外层 catch 只做两件**不分配、不记日志、不碰别的对象**的事：置“结果没能入队”标志、投递
+// 一条不带指针的唤醒消息。这不是一套 OOM 兜底框架，只保证当前这条 OS 线程有一个安全的出口；
+// `context` 这个 unique_ptr 由本函数持有（在边界之外），无论走哪条路都会安全析构。
+DWORD WINAPI fetch_thread_entry(void* parameter) {
+    std::unique_ptr<FetchJobContext> context(static_cast<FetchJobContext*>(parameter));
+    try {
+        if (context) {
+            std::shared_ptr<OutcomeQueue> const queue = context->queue;
+            fetch_worker_body(context.get(), queue);
+        }
+    } catch (...) {
+        // 能走到这里，说明工作体在“结果成功入队”之前就抛了：push 成功之后只剩原子写与一次
+        // PostMessageW，两者都不抛。所以置这个标志不会把一条已经交回来的结果误判成丢失。
+        if (context) {
+            if (context->finished_without_result) {
+                context->finished_without_result->store(true);
+            }
+            if (context->notify != nullptr) {
+                ::PostMessageW(context->notify, kMsgFetchDone, 0, 0);
+            }
+        }
+    }
     return 0;
 }
 
@@ -300,6 +369,8 @@ public:
         // 失败注入点只在隔离实例里生效（见成员的说明）。
         test_fail_thread_ =
             !scope_.empty() && read_test_environment(L"DESKFEED_TEST_FAIL_FETCH_THREAD") == L"1";
+        test_refuse_outcome_ =
+            !scope_.empty() && read_test_environment(L"DESKFEED_TEST_REFUSE_OUTCOME") == L"1";
     }
     ~Master();
 
@@ -317,7 +388,18 @@ private:
         std::shared_ptr<std::atomic<bool>> finished_without_result;
     };
 
-    bool initialize();
+    // 第一阶段：**只做控制平面**。单实例仲裁已经在 master_main 里完成，这里建接收端、开日志、
+    // 读设置文件。它绝不建显示面：不建悬浮窗、不建显示邮箱、不武装任务栏编排、不取数。
+    //
+    // 理由就是契约里的“先仲裁后副作用”：首份命令被拒绝（地址非法、PID 非法、落盘失败）时，
+    // 这个进程除了一个控制窗口和一行日志之外什么都不该留下——尤其不能留下一个按生产命名
+    // 建好的显示邮箱或一次已经发出去的注入。
+    bool initialize_control();
+    // 第二阶段：只有“首份状态已经被接受”之后才调用：
+    //   * `--url` 命令：apply_command 返回 Accepted；
+    //   * 无参数启动：保存的设置读出来了，URL 校验过（或明确判定为“未配置 URL”）。
+    // 从这一刻起才有显示面：显示邮箱、悬浮窗、任务栏编排，以及随后的第一次取数。
+    bool start_display_face();
     ControlReply on_control(ControlRequest const& request);
     ControlReply apply_command(Command const& command, std::uint32_t sender_pid);
     void start_job();
@@ -326,9 +408,29 @@ private:
     Job* find_job(std::uint64_t id);
     void on_fetch_done(std::unique_ptr<FetchOutcome> outcome);
     void on_binding_exit(std::uint64_t generation);
-    // 把当前显示模型发布进显示邮箱。force 用于“模型没变但读端需要一帧”的场合
+    // 把当前显示模型发出去：显示邮箱与悬浮窗吃**同一份** Frame（frame_from_view 只算一次），
+    // 各自按自己的“已发布代次”判断要不要发。force 用于“模型没变但读端需要一帧”的场合
     // （启动时、任务栏组件被重新打开/重新注入时）。
-    void publish_display_frame(bool force);
+    void publish_display_outputs(bool force);
+
+    // 悬浮窗交回来的四个动作（见 widget/window.h 的重入与生命周期契约）：它们都是同步调用的，
+    // 实现里绝不销毁窗口、绝不重入 apply / show_from_request，也绝不让 SettingsFile 失效。
+    void on_widget_refresh();
+    void on_widget_quit();
+    bool on_widget_set_taskbar_component(bool enabled);
+    bool on_widget_save_preferences(widget::WindowPreferences const& preferences,
+                                    std::wstring* error);
+    // 组件开关的落盘：候选克隆 → 原子替换 → 成功才接过来（与 apply_command 同一套语义）。
+    // 返回 false 时正在用的那一份一个字节都没被碰过。
+    bool persist_component_intent(bool enabled);
+
+    // 交给 WidgetCallbacks 的普通函数指针（context 就是 this）。
+    static void widget_refresh_entry(void* context);
+    static void widget_quit_entry(void* context);
+    static bool widget_set_taskbar_component_entry(void* context, bool enabled);
+    static bool widget_save_preferences_entry(void* context,
+                                              widget::WindowPreferences const& preferences,
+                                              std::wstring* error);
     // 主进程**唯一**那条状态推进逻辑：到期 tick、墙钟截止、结果出队、绑定退出、发帧。
     //
     // 它有两个入口，但只有一份实现：
@@ -371,15 +473,35 @@ private:
     // 那条迟到的旧消息就会误伤新绑定。
     std::uint64_t next_binding_generation_ = 1;
     bool quit_requested_ = false;
-    // 任务栏那块的双击/「打开桌面悬浮窗」把这条置起来。主循环据此取消用户的隐藏意图并落盘，
-    // 然后请桌面窗口显示自己（窗口本体由 src/widget 提供；没合并进来时只记日志）。
+    // 任务栏那块的双击/「打开桌面悬浮窗」把这条置起来。主循环据此请悬浮窗显示自己
+    // （它会顺手把用户的隐藏意图清掉落盘）。它**不**触发一次新的取数：显示是显示，取数是取数。
     bool show_requested_ = false;
     bool no_taskbar_ = false;
     bool hidden_ = false;
 
-    // 显示邮箱：只有显式要求（--frame-mailbox）时才建。建起来之后它是主进程 → 显示面
-    // 唯一的输出通道；发布失败只记日志，绝不影响取数。
+    // 任务栏组件刻意分成三件事（缺一个就会写错状态）：
+    //   * component_actual_：**用户/磁盘上的意图**（`[taskbar] component`，缺省 true）。
+    //   * component_capability_：**本次运行有没有能力**提供它——用户没关掉任务栏、显示邮箱
+    //     建起来了、注入器也真的在。它决定菜单项灰不灰（WidgetOptions.taskbar_available）。
+    //   * component_effective_ = actual && capability：**现在到底是不是开着**（菜单的勾、
+    //     也是交给编排层的目标状态）。
+    // 把 capability 当成“当前开关”是错的：那样用户一关组件，菜单项就永久置灰，再也打不开。
+    bool component_actual_ = true;
+    bool component_capability_ = false;
+    bool component_effective_ = false;
+    TaskbarSupervisor supervisor_;
+
+    // 悬浮窗。窗口、邮箱与主进程同一条线程：窗口的 HWND 建在主进程这条线程上，主循环的
+    // MsgWaitForMultipleObjects + PeekMessage 已经会泵它的消息，不需要第二条消息循环。
+    // widget_revision_ 是窗口那一份“已发布代次”。
+    widget::WidgetWindow widget_;
+    bool widget_created_ = false;
+    std::uint64_t widget_revision_ = 0;
+
+    // 显示邮箱：显式要求（--frame-mailbox）或“本次运行真的有任务栏显示面”时才建。
+    // 建起来之后它是主进程 → 负载 DLL 唯一的输出通道；发布失败只记日志，绝不影响取数。
     DisplayFrameProducer frame_producer_;
+    bool mailbox_ok_ = false;
     std::uint64_t published_revision_ = 0;
 
     // 取数结果队列（工作线程入队、主进程出队）。主进程持一份所有权，每个工作线程也持一份：
@@ -393,6 +515,11 @@ private:
     // 不可能被打开，也就不会成为一个“远程可触发”的行为。它的价值是让“start_job 当场改模型、
     // 而这次改动必须在阻塞等待之前发布”这条时序有一个可复现的用例，而不是只靠读代码断言。
     bool test_fail_thread_ = false;
+    // 第二个注入点：让工作线程的入队必定失败（`DESKFEED_TEST_REFUSE_OUTCOME=1`），用来永久
+    // 覆盖 “finished_without_result ⇒ pump 立刻按内部失败收尾、不等墙钟预算” 这条路径。
+    // 同样只在 scope 非空时生效。它不伪造结果、不改变线程的真实出口，只是让“队列拒绝”这个
+    // 分支在一个用例里必然发生。
+    bool test_refuse_outcome_ = false;
 };
 
 Master::~Master() {
@@ -411,7 +538,7 @@ Master::~Master() {
     outcomes_.reset();
 }
 
-bool Master::initialize() {
+bool Master::initialize_control() {
     class_name_ = scoped_name(kControlWindowClassBase, scope_);
     settings_path_ = command_.state_dir.empty() ? deskfeed_settings_path(scope_)
                                                 : command_.state_dir + L"\\settings.ini";
@@ -435,15 +562,27 @@ bool Master::initialize() {
         [this](UINT message, WPARAM wparam, LPARAM lparam) {
             return on_window_message(message, wparam, lparam);
         });
-    if (!server_.start_heartbeat(kHeartbeatMs)) {
-        // 定时器建不起来不是致命错误：主循环自己还会按精确的到期时刻醒来，只是模态循环
-        // 期间的状态推进会退化成“等模态结束”。记一行，继续。
-        log_line(L"deskfeed: 心跳定时器建不起来；嵌套模态循环期间的状态推进会推迟到模态结束");
+    bool const have_heartbeat = server_.start_heartbeat(kHeartbeatMs);
+    if (!have_heartbeat && !command_.headless) {
+        // 心跳是**嵌套模态循环**（右键菜单的 TrackPopupMenu）期间唯一还能推进状态机的入口：
+        // 模态期间主循环那次 PeekMessage 根本跑不到。没有它，菜单开着的时候取数结果、到期与
+        // 整体失效都不会被发布，两个显示面会各自停在旧状态上——而契约明确要求到期由主进程
+        // 独立判定、两面同状态。这不是可以默默降级的东西：要开悬浮窗就可能出现模态菜单，
+        // 建不出心跳就只能 fail closed。（无界面运行没有模态循环，心跳本来也用不上，见下。）
+        console_write_stderr(
+            L"deskfeed: 心跳定时器建不起来；带界面运行时模态菜单期间无法推进状态机，拒绝启动\n");
+        server_.destroy();
+        return false;
     }
 
     if (!log_open(log_path_, false)) {
         console_write_stderr(L"deskfeed: 建不了日志文件 " + log_path_ + L"\n");
         return false;
+    }
+    if (!have_heartbeat) {
+        // 只有**无界面**运行会走到这里：没有悬浮窗就没有模态菜单，主循环仍按精确的到期时刻醒来，
+        // 控制窗口过程也照样在 WM_APP 上推进状态。这是有界、可解释的降级，不是“正常服务”。
+        log_line(L"deskfeed: 心跳定时器建不起来；本次运行没有界面，不存在模态循环，按无界面继续");
     }
     log_format(L"deskfeed: master starting (pid=%lu scope=%s class=%s)",
                ::GetCurrentProcessId(), scope_.empty() ? L"(production)" : scope_.c_str(),
@@ -461,40 +600,235 @@ bool Master::initialize() {
     if (hidden_) {
         log_line(L"deskfeed: --hidden 生效：本次运行悬浮窗保持隐藏");
     }
-    if (command_.frame_mailbox) {
-        // 显式要求了这条 seam，建不起来就是失败：静默继续会让离线验收“跑通了但什么也没验”。
-        // 它只建一块按 scope 命名的共享内存与一个通知事件，不碰界面、不注入。
+    // 到这里为止只有控制平面：控制窗口、心跳、日志、设置文件。**没有**显示邮箱、悬浮窗、
+    // 任务栏编排，也没有第一次取数——那些都在 start_display_face() 里，只有首份状态被
+    // 接受之后才建。首份 `--url` 命令被拒绝时，这个进程不该留下任何显示面或注入副作用。
+    return true;
+}
+
+bool Master::start_display_face() {
+    // 先把“能力”算清楚再动界面：菜单项灰不灰、编排层武装不武装、悬浮窗拿到的勾是什么，
+    // 全都取决于它。
+    bool const taskbar_wanted = !command_.headless && !no_taskbar_;
+
+    // 1. 显示邮箱。两种情况要建：显式要求（--frame-mailbox，隔离的离线验收通道），或本次运行
+    //    真的有任务栏显示面（负载 DLL 是邮箱唯一的读者）。它只建一块按 scope 命名的共享内存
+    //    与一个通知事件，不碰界面、不注入——但只在首份状态被接受之后才建。
+    if (command_.frame_mailbox || taskbar_wanted) {
         UserSecurity security;
         if (!security.build()) {
             log_line(L"display: 建不了用户安全描述符，显示邮箱改用系统默认 ACL");
         }
         std::string mailbox_error;
-        if (!frame_producer_.create(scope_, &security, mailbox_error)) {
+        if (frame_producer_.create(scope_, &security, mailbox_error)) {
+            mailbox_ok_ = true;
+            log_line(command_.frame_mailbox
+                         ? L"display: 显示邮箱已建立（--frame-mailbox：只建隔离的命名对象，不碰界面）"
+                         : L"display: 显示邮箱已建立（任务栏负载的显示帧通道）");
+        } else {
             std::wstring const message = wide_from_utf8(mailbox_error);
-            console_write_stderr(L"deskfeed: 建不了显示邮箱：" + message + L"\n");
-            log_line(L"display: 建不了显示邮箱：" + message);
-            return false;
+            if (command_.frame_mailbox) {
+                // 显式要求了这条 seam，建不起来就是失败：静默继续会让离线验收“跑通了但什么也没验”。
+                console_write_stderr(L"deskfeed: 建不了显示邮箱：" + message + L"\n");
+                log_line(L"display: 建不了显示邮箱：" + message);
+                return false;
+            }
+            // 生产路径：邮箱建不起来只说明“这次没有任务栏显示面”，不该拦住取数与悬浮窗。
+            log_line(L"display: 建不了显示邮箱：" + message + L"；本次运行不提供任务栏组件");
         }
-        log_line(L"display: 显示邮箱已建立（--frame-mailbox：只建隔离的命名对象，不碰界面）");
     }
-    log_line(L"deskfeed: 任务栏负载尚未实现（Phase 2）；主进程当前做取数、状态机与显示帧发布");
+
+    // 2. 任务栏编排。武装它之前先把“注入器在不在”问清楚：这个答案本身就是能力的一部分。
+    //    start() 只记配置并检查文件，**不 spawn 任何东西**；组件本来就关着时它也一次动作都不发。
+    component_actual_ = read_taskbar_component_intent(settings_.get());
+    // 初始目标状态 = 用户的持久意图 **且** 这次真的有显示面（邮箱建起来了）。
+    // 少了后半截就是一种很难看的错法：邮箱没建起来（菜单也因为能力不成立而置灰），但编排层已经
+    // 被武装成“开”，pump 每轮 tick 都会去 spawn `--load`——装进去的负载没有帧可读，只会一直
+    // 失败重试。**没有邮箱就一个动作都不许发**：下面干脆连武装都不做。
+    bool const taskbar_enabled_at_start = component_actual_ && mailbox_ok_;
+    if (taskbar_wanted && mailbox_ok_) {
+        TaskbarSupervisorOptions options;
+        options.scope = scope_;
+        options.master_pid = ::GetCurrentProcessId();
+        std::string error;
+        if (supervisor_.start(options, taskbar_enabled_at_start, error)) {
+            log_line(L"taskbar: 任务栏编排已武装");
+        } else {
+            log_line(L"taskbar: " + wide_from_utf8(error) + L"；本次运行不提供任务栏组件");
+        }
+    } else if (taskbar_wanted) {
+        // 没有显示邮箱：不进这条路径（不是“武装成关”，是根本不存在）。tick 对未武装的编排层
+        // 是空操作，所以“绝不盲装负载”这件事是结构上成立的，不靠一个可能被写错的标志位。
+        log_line(L"taskbar: 没有显示邮箱，本次运行不武装任务栏编排（绝不盲装负载）");
+    }
+    component_capability_ = taskbar_wanted && mailbox_ok_ && supervisor_.started();
+    component_effective_ = taskbar_enabled_at_start && supervisor_.started();
+
+    // 3. 悬浮窗。--headless / --mock 不建（命令解析已经把 hidden 一起置上）。
+    if (!command_.headless) {
+        widget::WidgetOptions options;
+        options.instance = ::GetModuleHandleW(nullptr);
+        options.class_name = scoped_name(kWidgetWindowClassBase, scope_);
+        // 这一项是**能力**，不是当前开关。用 effective 去填就错了：用户一关组件，菜单项就永久
+        // 置灰，再也没有把它打开的办法。能力在（注入器在、邮箱在、没关任务栏）就不置灰。
+        options.taskbar_available = component_capability_;
+        options.force_hidden = command_.hidden;  // --hidden 是本次运行的开关，绝不落盘
+        options.preferences = settings_ ? widget::read_window_preferences(*settings_)
+                                        : widget::WindowPreferences{};
+        // 读到的 `taskbar_component` 缺省是 true；这里按主进程这份 effective 状态填，它是
+        // 菜单的勾、也是交给编排层的目标状态。
+        options.preferences.taskbar_component = component_effective_;
+
+        widget::WidgetCallbacks callbacks;
+        callbacks.context = this;
+        callbacks.refresh = &Master::widget_refresh_entry;
+        callbacks.quit = &Master::widget_quit_entry;
+        callbacks.set_taskbar_component = &Master::widget_set_taskbar_component_entry;
+        callbacks.save_preferences = &Master::widget_save_preferences_entry;
+
+        std::wstring error;
+        if (widget_.create(options, callbacks, &error)) {
+            widget_created_ = true;
+            log_line(L"widget: 悬浮窗已建立");
+        } else {
+            // 建不了窗口不是致命失败：取数与任务栏那块是独立的两条显示面，照样跑。
+            log_line(L"widget: 建不了悬浮窗：" + error + L"；主进程继续运行");
+        }
+    }
+
+    log_format(L"deskfeed: display face ready (mailbox=%s widget=%s taskbar=%s component=%s)",
+               mailbox_ok_ ? L"yes" : L"no", widget_created_ ? L"yes" : L"no",
+               component_capability_ ? L"yes" : L"no", component_effective_ ? L"on" : L"off");
     return true;
 }
 
-void Master::publish_display_frame(bool force) {
-    if (!frame_producer_.created()) {
-        return;
-    }
+void Master::publish_display_outputs(bool force) {
     std::uint64_t const revision = health_.revision();
-    if (!force && revision == published_revision_) {
-        return;  // 模型没变：不往跨进程 seqlock 里白写一帧（一次一兆多字节）
+    bool const mailbox_due =
+        frame_producer_.created() && (force || revision != published_revision_);
+    bool const widget_due = widget_created_ && (force || revision != widget_revision_);
+    if (!mailbox_due && !widget_due) {
+        return;  // 模型没变：不往跨进程 seqlock 里白写一帧，也不白刷一次窗口
     }
+    // 两个显示面吃**同一份** Frame：各算一遍是显示分叉的源头，也是“一面正常、一面失效”的来源。
     Frame const frame = frame_from_view(health_.view());
-    if (frame_producer_.publish(frame, wall_ms())) {
-        published_revision_ = revision;
-    } else {
-        log_line(L"display: 发布显示帧失败（不影响取数）");
+    if (mailbox_due) {
+        if (frame_producer_.publish(frame, wall_ms())) {
+            published_revision_ = revision;
+        } else {
+            // 失败**不推进**代次：下一轮还会重发，不会把一次失败的发布当成已经发出去了。
+            log_line(L"display: 发布显示帧失败（不影响取数）");
+        }
     }
+    if (widget_due) {
+        widget_.apply(frame);
+        widget_revision_ = revision;
+    }
+}
+
+// ---------- 悬浮窗交回来的四个动作 ----------
+//
+// 它们都在主进程这条线程上被窗口**同步**调用（见 widget/window.h 的契约），所以：
+//   * 绝不在这里销毁窗口、也绝不重入 apply / show_from_request；
+//   * 只投递消息或做一次有界的落盘，不做网络；
+//   * `settings_` 在窗口 destroy() 返回之前一直有效（Master 不提前释放它）。
+
+void Master::widget_refresh_entry(void* context) {
+    auto* self = static_cast<Master*>(context);
+    if (self != nullptr) {
+        self->on_widget_refresh();
+    }
+}
+
+void Master::on_widget_refresh() {
+    // 只投递一条消息：这里还在窗口过程里，而取数要开线程。真正的取数在主循环里做，
+    // 而且它**不改地址、不改调度配置、不重绑**。
+    ::PostMessageW(server_.window(), kMsgRefreshRequested, 0, 0);
+}
+
+void Master::widget_quit_entry(void* context) {
+    auto* self = static_cast<Master*>(context);
+    if (self != nullptr) {
+        self->on_widget_quit();
+    }
+}
+
+void Master::on_widget_quit() {
+    // 同样只投递：在回调里同步销毁窗口会在窗口过程还压在栈上的时候把窗口拆掉。
+    ::PostMessageW(server_.window(), kMsgQuit, 0, 0);
+}
+
+bool Master::widget_set_taskbar_component_entry(void* context, bool enabled) {
+    auto* self = static_cast<Master*>(context);
+    return self != nullptr && self->on_widget_set_taskbar_component(enabled);
+}
+
+bool Master::on_widget_set_taskbar_component(bool enabled) {
+    if (!component_capability_) {
+        // 能力不成立（--no-inject / 找不到注入器 / 邮箱建不起来）：菜单这一项本来就是灰的。
+        // 这里绝不产生任何副作用，也绝不谎称“打开了”。
+        return false;
+    }
+    if (!persist_component_intent(enabled)) {
+        // 没落盘：实际状态一个字节都没变，如实把**当前**状态交回去，菜单的勾才不会骗人。
+        return component_effective_;
+    }
+    component_actual_ = enabled;
+    component_effective_ = component_actual_ && component_capability_;
+    // 只改编排层的目标状态：它不阻塞、不等注入器，真正的注入/卸载由 tick 异步驱动。
+    supervisor_.set_enabled(component_effective_);
+    log_format(L"taskbar: the component switch is now %s (persisted)",
+               component_effective_ ? L"on" : L"off");
+    return component_effective_;
+}
+
+bool Master::persist_component_intent(bool enabled) {
+    if (settings_ == nullptr || !settings_usable_) {
+        // 设置文件不可用（读不出来 = 行是空的）：写下去会把用户的文件覆盖成只剩这一行。
+        log_line(L"taskbar: 设置文件不可用，组件开关不落盘");
+        return false;
+    }
+    // 与 apply_command 同一套事务语义：候选克隆 → 原子替换 → 成功才接过来。写失败的候选
+    // 绝不会把正在用的那一份（URL / 调度）带脏。
+    SettingsFile candidate = *settings_;
+    std::wstring error;
+    candidate.set(L"taskbar", L"component", enabled ? L"true" : L"false", nullptr, error);
+    if (!candidate.save_as(settings_->path(), error)) {
+        log_line(L"taskbar: 保存组件开关失败：" + error + L"；实际状态不变");
+        return false;
+    }
+    settings_->adopt(candidate);
+    return true;
+}
+
+bool Master::widget_save_preferences_entry(void* context,
+                                           widget::WindowPreferences const& preferences,
+                                           std::wstring* error) {
+    auto* self = static_cast<Master*>(context);
+    return self != nullptr && self->on_widget_save_preferences(preferences, error);
+}
+
+bool Master::on_widget_save_preferences(widget::WindowPreferences const& preferences,
+                                        std::wstring* error) {
+    if (settings_ == nullptr || !settings_usable_) {
+        if (error != nullptr) {
+            *error = L"设置文件不可用";
+        }
+        return false;
+    }
+    // 界面偏好只写 `[window]` 一节；`[taskbar] component` 由组件开关那条路径自己写一次。
+    // 同样在**候选克隆**上写：write_window_preferences 失败时可能会重新 load，直接对正在用的
+    // 那一份调用会把内存里的 URL / 调度拖进一次可能也失败的回滚里。
+    SettingsFile candidate = *settings_;
+    std::wstring local_error;
+    if (!widget::write_window_preferences(candidate, preferences, &local_error)) {
+        if (error != nullptr) {
+            *error = local_error;
+        }
+        return false;
+    }
+    settings_->adopt(candidate);
+    return true;
 }
 
 ControlReply Master::on_control(ControlRequest const& request) {
@@ -713,6 +1047,7 @@ void Master::start_job() {
     context->notify = server_.window();
     context->queue = outcomes_;  // 线程自己持有一份队列所有权（见 FetchJobContext 的说明）
     context->finished_without_result = finished_without_result;
+    context->refuse_outcome = test_refuse_outcome_;
 
     // 失败注入点（见成员说明）在**创建线程之前**就分流：绝不允许“线程已经跑起来、再假装它
     // 没起来”。那样做等于让工作线程去读一个马上被 delete 的 context（真实的 use-after-free），
@@ -862,17 +1197,24 @@ void Master::shutdown() {
     if (outcomes_) {
         outcomes_->stop_accepting();
     }
-    binding_.clear();
-    // 正常收尾：保留最后一帧内容并置 closed，叫醒读端去清理任务栏组件。放在关控制窗口之前，
-    // 让读端尽早知道主进程要走了。
+    // 先撤任务栏那块：它是唯一会碰**别的进程**的那条路。收尾只**请求**一次停止（异步、不等待、
+    // 不重试、绝不强杀）；再发一帧 closed 叫醒还挂着的负载去清理自己那部分显示。
+    supervisor_.shutdown();
     if (frame_producer_.created()) {
         frame_producer_.publish_closed(wall_ms());
     }
+    // 悬浮窗随后关：destroy() 会**同步**再调一次 save_preferences（补写欠着的锚点），
+    // 所以 settings_ 必须活到它返回之后——Master 到析构才会释放 settings_，这里绝不能提前 reset。
+    if (widget_created_) {
+        widget_.destroy();
+        widget_created_ = false;
+    }
+    binding_.clear();
     server_.destroy();
 }
 
 int Master::run() {
-    if (!initialize()) {
+    if (!initialize_control()) {
         return 7;
     }
 
@@ -916,9 +1258,20 @@ int Master::run() {
         }
     }
 
-    // 启动时先发布一帧（force）：读端一挂上就该有东西可读，不必等第一次取数回来。
+    // 到这里为止首份状态**已经被接受**了：
+    //   * `--url` 命令：apply_command 返回 Accepted（地址校验过、绑定准备过、配置落盘过）；
+    //   * 无参数启动：保存的状态读出来了，地址校验过，或明确判定为“未配置 URL”。
+    // 只有从这一刻起才建显示面（显示邮箱、悬浮窗、任务栏编排）——首份命令被拒绝时，上面那条
+    // 分支已经带着退出码走掉了，绝不留下一块按生产命名建好的邮箱或一次注入副作用。
+    if (!start_display_face()) {
+        server_.destroy();
+        log_close();
+        return 7;
+    }
+
+    // 显示面一就位就先发一帧（force）：读端一挂上就该有东西可读，不必等第一次取数回来。
     // 这也是“任务栏组件被打开/重新注入时立刻给一帧缓存”的同一条路径。
-    publish_display_frame(true);
+    publish_display_outputs(true);
 
     for (;;) {
         if (quit_requested_) {
@@ -1116,17 +1469,27 @@ void Master::pump(bool from_modal_dispatch) {
 
     if (show_requested_) {
         show_requested_ = false;
-        // 桌面窗口本体在 src/widget（尚未合并进构建）；主进程这边**取消用户的隐藏意图**
-        // 这件事要等窗口落地后与偏好落盘一起做，现在只把请求记下来，绝不建窗口、不注入。
-        log_line(L"show: 任务栏请求打开悬浮窗（桌面窗口尚未合并进构建；请求已记录）");
+        // 任务栏那块的双击/「打开桌面悬浮窗」：请悬浮窗显示自己。它会清掉用户的隐藏意图并
+        // 落盘（经 save_preferences 回调），然后按全屏让位等规则决定是否真的露出来。
+        // 这里**不**顺便取数：显示是显示，取数是取数；`--hidden` 只是本次运行的开关，
+        // 窗口在 force_hidden 下不会露出来，也绝不会因此改掉用户保存的 hidden。
+        if (widget_created_) {
+            widget_.show_from_request();
+        } else {
+            log_line(L"show: 任务栏请求打开悬浮窗，但本次运行没有悬浮窗（--headless）");
+        }
     }
+
+    // 任务栏编排：非阻塞地回收已经退出的注入器，再按当前目标状态决定下一步动作。
+    // 它绝不阻塞、绝不强杀；一次动作还在跑时只把意图记成令牌。
+    supervisor_.tick(now);
 
     // 在阻塞等待之前发布，位置在**本轮全部状态转换之后**：到期 tick、整次取数的墙钟截止，
     // 以及 start_job() 自己（CreateThread 失败会当场 apply_failure(Internal)）。再往下主循环
     // 就要睡到下一个轮询点；只在循环末尾发布会让显示面在“模型已经变了”之后继续显示旧状态，
     // 直到下一次取数或别的消息把它叫醒。到期由主进程按绝对时间独立判定，失败一发生就进入
     // 整体失效——这两个时刻起就必须是读端看到它们的时刻。revision 没变时这里是空操作。
-    publish_display_frame(false);
+    publish_display_outputs(false);
 
     pumping_ = false;
 }

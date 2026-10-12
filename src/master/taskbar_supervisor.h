@@ -85,9 +85,14 @@ public:
     TaskbarSupervisor(TaskbarSupervisor const&) = delete;
     TaskbarSupervisor& operator=(TaskbarSupervisor const&) = delete;
 
-    // 记住配置并把组件目标状态置为“开”。返回 false 时配置不成立（PID 为 0、间隔越界、
-    // 注入器不存在）——调用方据此拒绝整条命令，绝不在配置不成立的情况下留下注入副作用。
-    bool start(TaskbarSupervisorOptions const& options, std::string& error);
+    // 记住配置，并把组件的**初始目标状态**设为 `enabled`。返回 false 时配置不成立（PID 为 0、
+    // 间隔越界、注入器不存在）——调用方据此把任务栏组件判为“本次运行不可用”，绝不在配置
+    // 不成立的情况下留下注入副作用。
+    //
+    // 为什么初始状态是参数而不是“先 start 再 set_enabled(false)”：后者会落一个待发的停止
+    // 令牌，于是“用户上次就把组件关了”的一次普通启动也会去 spawn 一次 `--stop`。组件本来就
+    // 关着的时候，启动不该对别的进程做任何动作；而 `enabled = false` 的武装会一次动作都不发。
+    bool start(TaskbarSupervisorOptions const& options, bool enabled, std::string& error);
 
     // 组件开关：改的是**目标状态**，不阻塞，也绝不在这里等待注入器。
     //   开：清掉待发的停止令牌（用户又要它了），按需问一次状态。

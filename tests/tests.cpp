@@ -2709,6 +2709,233 @@ TEST(master_publishes_a_start_job_failure_into_the_mailbox_before_the_wait) {
     cleanup_isolated_instance(scope, state_dir.path());
 }
 
+// ---- “先仲裁后副作用”与显示面的建立时机 --------------------------------------
+//
+// 契约要求：首份命令被拒绝时，这个进程除了一个控制窗口和一行日志之外什么都不该留下。
+// 显示面（显示邮箱、悬浮窗、任务栏编排）只在首份状态**被接受之后**才建立
+// （见 Master::start_display_face）。下面几条就是这条时序的门禁：全部在 --headless 下跑，
+// 不建窗口、不注入、绝不碰生产命名空间。
+
+TEST(master_rejects_an_invalid_first_command_without_creating_a_display_face) {
+    std::string error;
+    std::wstring const scope = L"noeffect-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    // ftp:// 不是 http/https：apply_command 的第一步（地址校验）就拒绝整条命令。
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", L"ftp://example.invalid/feed"},
+                       error));
+    CHECK(master.wait(15000));
+    CHECK_EQ(master.exit_code(), static_cast<long long>(6));
+
+    // 命令被拒绝 ⇒ 显示邮箱一个都不该建。显式要求了 --frame-mailbox 也没用：拒绝发生在
+    // 建显示面之前。这条断言就是修掉“先建邮箱、再校验首份命令”那个副作用窗口的可验证形式。
+    DisplayFrameConsumer consumer;
+    CHECK(!consumer.attach(scope, error));
+
+    // 也不该碰磁盘：整条命令被拒，设置文件必须原样不存在。
+    CHECK(::GetFileAttributesW((state_dir.path() + L"\\settings.ini").c_str()) ==
+          INVALID_FILE_ATTRIBUTES);
+
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_starts_from_the_saved_url_without_arguments) {
+    // 无参数启动：用保存的地址独立运行。它同样要在**状态被接受之后**才建显示面，
+    // 而且要有真实读数——这是“缓存下来的地址也能起一份可用的显示面”的门禁。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"cachedurl-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const settings_path = state_dir.path() + L"\\settings.ini";
+    std::string const settings = "[source]\r\nurl=" + utf8_from_wide(server.url(L"/ok")) +
+                                 "\r\npoll_ms=1000\r\n";
+    std::wstring file_error;
+    CHECK(write_file_bytes(settings_path, settings, file_error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    Frame frame;
+    bool got_content = false;
+    for (int attempt = 0; attempt < 300 && !got_content; ++attempt) {
+        if (consumer.read(frame) && frame.kind == ViewKind::Content && !frame.items.empty()) {
+            got_content = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(got_content);
+    CHECK_EQ(frame.items[0].id, std::string("cpu"));
+
+    // 保存的地址没有被改写（无参数启动不该动配置）。
+    std::string written;
+    bool exists = false;
+    CHECK(read_file_bytes(settings_path, written, exists, file_error));
+    CHECK(exists);
+    CHECK(written.find(utf8_from_wide(server.url(L"/ok"))) != std::string::npos);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_headless_without_the_flag_creates_no_display_face) {
+    // --headless 是“本次运行不碰界面、不碰任务栏”。它**不**建显示邮箱：没有负载会去读它，
+    // 建一块生产命名的共享内存只是白留副作用。要这条 seam 必须显式 --frame-mailbox。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"headlessface-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--url", server.url(L"/ok"), L"--poll-ms", L"1000"},
+                       error));
+
+    // 给它一段真实运行时间：如果它会建邮箱，这段时间足够建起来了。
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    DisplayFrameConsumer consumer;
+    CHECK(!consumer.attach(scope, error));
+
+    // 但没有显示面不等于没在运行：实例照常取数、照常应答控制通道。
+    CHECK_EQ(master.exit_code(), static_cast<long long>(-1));  // 还在跑
+    ChildProcess inspect;
+    CHECK(inspect.start(exe, {L"--scope", scope, L"--inspect"}, error));
+    CHECK(inspect.wait(15000));
+    CHECK_EQ(inspect.exit_code(), static_cast<long long>(0));
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_reports_a_fetch_result_that_could_not_be_queued) {
+    // 工作线程拿不到结果通道时（队列拒绝 / 已经停止接受 / 线程内异常），主进程必须**立刻**
+    // 按内部失败收尾，而不是干等整次取数的墙钟预算。注入点只在隔离实例里生效。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"noqueue-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    ScopedEnvironmentVariable const refuse_outcome(L"DESKFEED_TEST_REFUSE_OUTCOME", L"1");
+    ChildProcess master;
+    // 轮询与预算都放大到 30 s：这样“帧很快就变成整体失效”的原因只能是入队失败这条路，
+    // 不可能是预算到点或正常轮询结果。
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/ok"), L"--poll-ms", L"30000",
+                        L"--timeout-ms", L"30000"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    Frame frame;
+    bool got_failure = false;
+    long long const deadline = tick_ms() + 6000;
+    while (tick_ms() < deadline) {
+        if (consumer.read(frame) && frame.kind == ViewKind::Error &&
+            frame.failure == FailureKind::Internal) {
+            got_failure = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(got_failure);
+    CHECK(frame.kind == ViewKind::Error);
+    CHECK(frame.failure == FailureKind::Internal);
+    CHECK(frame.reason.find("取数结果没能交回主进程") != std::string::npos);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_refuses_the_explicit_mailbox_when_the_ready_name_is_taken) {
+    // 显式要求的显示邮箱建不起来时，必须**当场失败**：静默继续会让离线验收“跑通了但什么也没验”。
+    // 这里不用任何测试注入点——用一个名字冲突的真实内核对象把它逼出来：Windows 的命名对象共用
+    // 一个命名空间，CreateEventW 遇到同名但**类型不同**的对象会失败，而生产者是先建就绪事件、
+    // 再建共享内存（见 display/mailbox.cpp），所以占住就绪事件的名字就足够。
+    std::string error;
+    std::wstring const scope = L"mboxclash-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const ready_name = deskfeed::display_frame_ready_name(scope);
+    HANDLE const blocker = ::CreateMutexW(nullptr, FALSE, ready_name.c_str());
+    CHECK(blocker != nullptr);
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", L"http://127.0.0.1:1/never"},
+                       error));
+    CHECK(master.wait(15000));
+    CHECK_EQ(master.exit_code(), static_cast<long long>(7));
+
+    // 失败路径也不能留下半个显示面。
+    DisplayFrameConsumer consumer;
+    CHECK(!consumer.attach(scope, error));
+
+    ::CloseHandle(blocker);
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
 // ---- 主入口 ----------------------------------------------------------------
 
 int wmain(int argc, wchar_t** argv) {

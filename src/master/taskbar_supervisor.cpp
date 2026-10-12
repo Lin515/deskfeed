@@ -80,7 +80,8 @@ TaskbarSupervisor::~TaskbarSupervisor() {
     close_child();
 }
 
-bool TaskbarSupervisor::start(TaskbarSupervisorOptions const& options, std::string& error) {
+bool TaskbarSupervisor::start(TaskbarSupervisorOptions const& options, bool enabled,
+                              std::string& error) {
     if (started_) {
         error = "the taskbar supervisor is already started";
         return false;
@@ -114,18 +115,20 @@ bool TaskbarSupervisor::start(TaskbarSupervisorOptions const& options, std::stri
     }
 
     started_ = true;
-    enabled_ = true;
+    // 初始目标状态由调用方给定（见头文件里的理由）。组件本来就关着时：不发动作、不问状态，
+    // 只是把能力（注入器在不在）问清楚并武装起来，等用户打开时再按同一套状态机走。
+    enabled_ = enabled;
     shutting_down_ = false;
     stop_requested_ = false;
     pending_load_ = false;
     pending_stop_ = false;
     retry_pending_ = false;
     retry_at_ms_ = 0;
-    need_check_ = true;  // 第一次 tick 先问一次状态，别盲装
+    need_check_ = enabled;  // 组件开着：第一次 tick 先问一次状态，别盲装
     next_check_ms_ = 0;
     last_owner_pid_ = 0;
-    log_format(L"taskbar: supervisor armed (injector=%s scope=%s master pid=%lu retry=%u ms)",
-               options_.injector_path.c_str(),
+    log_format(L"taskbar: supervisor armed (enabled=%s injector=%s scope=%s master pid=%lu retry=%u ms)",
+               enabled ? L"yes" : L"no", options_.injector_path.c_str(),
                options_.scope.empty() ? L"(production)" : options_.scope.c_str(),
                options_.master_pid, options_.retry_interval_ms);
     return true;

@@ -34,7 +34,18 @@ struct HostOptions {
     unsigned install_delay_ms = 0;     // 安装竞态窗口（发布句柄之前人为延迟）
     unsigned hang_ui_ms = 0;           // UI 线程停止取消息若干毫秒
     unsigned slow_apply_ms = 0;        // 让 UI 线程上的 apply 慢若干毫秒
+    // `--feed` 的帧序列（空 = 不发帧，只跑生产入口与收尾）。每一步都由宿主自己的 UI 线程
+    // 读**自己那棵树**来判定，而不是只看状态 POD 的标记位。
+    std::wstring frame_script;
 };
+
+// `--frame-script` 的合法名字。纯函数：命令行与离线用例共用同一份清单，不允许"命令行接受、
+// 宿主不认识"这种分叉。
+inline bool frame_script_known(std::wstring const& name) {
+    return name == L"latest" || name == L"warn" || name == L"failure" || name == L"alarm" ||
+           name == L"restore" || name == L"closed" || name == L"empty" || name == L"delete" ||
+           name == L"ownerdeath";
+}
 
 // 跑一次自测宿主。返回 0 表示按预期完成（对抗用例里"观察到对抗症状"也算按预期）。
 int run_host(HostOptions const& options);

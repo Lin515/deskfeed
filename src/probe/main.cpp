@@ -38,7 +38,7 @@ void print_usage() {
         L"                          [--teardown] [--balance-check] [--third-party-hook-pump]\n"
         L"                          [--install-race] [--install-delay-ms <n>]\n"
         L"                          [--mutation-early-done] [--hang-ui-ms <n>]\n"
-        L"                          [--slow-apply-ms <n>]\n"
+        L"                          [--slow-apply-ms <n>] [--frame-script <name>]\n"
         L"\n"
         L"  --mock                  run the self-test host against the payload's probe exports\n"
         L"  --feed                  run the production entry point against the probe's own mailbox\n"
@@ -149,6 +149,14 @@ bool parse(int argc, wchar_t** argv, ParseResult& out) {
             std::wstring value;
             if (!next(value)) return false;
             out.host.slow_apply_ms = static_cast<unsigned>(::wcstoul(value.c_str(), nullptr, 10));
+        } else if (argument == L"--frame-script") {
+            std::wstring value;
+            if (!next(value)) return false;
+            if (!deskfeed::probe::frame_script_known(value)) {
+                ::fwprintf(stderr, L"unknown --frame-script: %s\n", value.c_str());
+                return false;
+            }
+            out.host.frame_script = value;
         } else {
             ::fwprintf(stderr, L"unknown argument: %s\n", argument.c_str());
             return false;
@@ -166,12 +174,28 @@ bool parse(int argc, wchar_t** argv, ParseResult& out) {
     if (!have_mock && !out.host.feed) {
         return false;
     }
-    // 两种宿主模式互斥：feed 走生产入口，inline 结构自测与对抗序列都不能同时开。
+    // 两种宿主模式**严格互斥**：feed 走生产入口，inline 结构自测是另一条路。同时给出时静默让
+    // feed 胜出会让"我以为在跑结构自测"变成假绿，所以这里直接判成无效参数组合。
+    if (have_mock && out.host.feed) {
+        ::fwprintf(stderr, L"--mock and --feed are mutually exclusive\n");
+        return false;
+    }
+    // 宿主模式绝不碰生产命名空间：空 scope 表示生产实例，那是注入器的事，不是自测宿主的事。
+    if (out.host.scope.empty()) {
+        ::fwprintf(stderr, L"the self-test host requires a non-empty --scope\n");
+        return false;
+    }
+    // 帧序列只有生产入口（真实 mailbox → 真实钩子 → XAML）能消费。
+    if (!out.host.frame_script.empty() && !out.host.feed) {
+        ::fwprintf(stderr, L"--frame-script requires --feed\n");
+        return false;
+    }
+    // feed 走生产入口，inline 结构自测与对抗序列都不能同时开。`--hang-ui-ms` 是例外：
+    // 生产收尾的"挂着 UI 时短超时 Stop 必须报未退休"正是用 feed 验的，见 host.cpp 的收尾分支。
     if (out.host.feed) {
         bool const conflicting = out.host.hook || out.host.teardown || out.host.balance_check ||
                                  out.host.third_party || out.host.mutation_early_done ||
-                                 out.host.dump_only || out.host.install_delay_ms != 0 ||
-                                 out.host.hang_ui_ms != 0;
+                                 out.host.dump_only || out.host.install_delay_ms != 0;
         if (conflicting) {
             ::fwprintf(stderr, L"--feed cannot be combined with the inline self-test switches\n");
             return false;

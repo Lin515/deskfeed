@@ -5,6 +5,7 @@
 #include "platform/win32_util.h"
 #include "probe/host_gate.h"
 #include "probe/host_wait.h"
+#include "probe/mock_producer.h"
 #include "probe/observer_pod.h"
 #include "probe/probe_hooks.h"
 
@@ -24,6 +25,7 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Documents.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
@@ -33,14 +35,24 @@
 namespace deskfeed::probe {
 namespace {
 
+namespace wux = winrt::Windows::UI::Xaml;
 namespace wuxc = winrt::Windows::UI::Xaml::Controls;
+namespace wuxd = winrt::Windows::UI::Xaml::Documents;
 namespace wuxh = winrt::Windows::UI::Xaml::Hosting;
+namespace wuxm = winrt::Windows::UI::Xaml::Media;
 
 constexpr wchar_t kWindowClass[] = L"DeskFeedProbeHost";
 constexpr UINT kRunMessage = WM_APP + 1;
 // UI 线程"停止取消息"：在窗口过程里睡，就一定不会检索消息 —— 这正是对抗"任务栏线程被挂住"的
 // 形状（钩子记录留在链上，收尾拿不到完成证明）。判断必须在 PeekMessage **之前**生效。
 constexpr UINT kHangMessage = WM_APP + 2;
+// `--feed` 的帧序列：工作线程发一帧、投一次这个请求，**UI 线程读宿主自己那棵树**判定这一帧
+// 真的变成了什么（文字/颜色/块在不在），并把 PASS/FAIL 写回给工作线程。判定绝不用状态 POD 的
+// 标记位代替——那是"负载说它做了什么"，不是"树上真的长出了什么"。
+constexpr UINT kCheckMessage = WM_APP + 3;
+
+// 定义在"`--feed` 的帧序列"那一节；窗口过程在它之前，所以先声明。
+void run_feed_check(unsigned index, unsigned deadline_ms);
 
 // 负载给自测宿主用的一组导出（签名与负载侧 common ABI 头逐字一致，见
 // src/payload/probe_api.h 与 dllmain.cpp；这里只按名字解析，不链接负载）。
@@ -91,6 +103,17 @@ struct ExtraCore {
 };
 std::vector<ExtraCore*> g_extra_cores;
 
+// 帧序列驱动与"宿主自读自己树"的判定状态（定义见下面的帧序列那一节）。
+wuxc::Grid g_tray_grid{nullptr};
+MockProducer g_producer;
+HANDLE g_check_done = nullptr;
+unsigned g_check_index = 0;
+bool g_check_pass = false;
+bool g_check_ran = false;
+std::wstring g_check_detail;
+winrt::Windows::UI::Color g_normal_value_color{};
+bool g_normal_color_known = false;
+
 std::wstring directory_of(std::wstring const& path) {
     std::wstring::size_type const slash = path.find_last_of(L"\\/");
     return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
@@ -112,6 +135,7 @@ wuxc::Grid build_content() {
     root.Background(winrt::Windows::UI::Xaml::Media::SolidColorBrush(
         winrt::Windows::UI::ColorHelper::FromArgb(255, 28, 28, 28)));
     root.Children().Append(tray);
+    g_tray_grid = tray;  // 宿主唯一合法可读的树：它属于本线程
     return root;
 }
 
@@ -514,6 +538,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             // 停在窗口过程里 = 这条线程不检索消息。负载的钩子记录留在链上，收尾会超时（0）。
             ::Sleep(g_options.hang_ui_ms);
             return 0;
+        case kCheckMessage:
+            // UI 线程读**自己那棵树**：有界采样直到 PASS 或 deadline，结论写回给工作线程。
+            run_feed_check(static_cast<unsigned>(wparam), 5000);
+            if (g_check_done != nullptr) {
+                ::SetEvent(g_check_done);
+            }
+            return 0;
         case WM_CLOSE:
             ::DestroyWindow(window);
             return 0;
@@ -551,6 +582,322 @@ bool run_hang_case() {
     ok = ok && retry_post == 1 && retry_retire == 1;
     return ok;
 }
+
+// ---- `--feed` 的帧序列：宿主自读自己那棵树 ---------------------------------
+//
+// 为什么必须是"读自己那棵树"而不是读状态 POD：POD 只说负载**声称**做了什么。这里要的是
+// "帧 → 块"这条生产路径真的走通了：发一帧合成帧进隔离 scope 的邮箱，负载经真实钩子编组把
+// 内容插进宿主自己的岛，然后由**拥有这棵树的那条 UI 线程**读出 Run 的文字与前景色，逐项判定。
+//
+// 颜色判定刻意用**相对关系**（正常/warn/error 三档互不相同、alarm 时全部同一档且不同于正常），
+// 不把负载的调色板抄一份到探针里：抄一份就等于"两边对同一件事有两套解释"。
+struct FeedStep {
+    wchar_t const* name = L"";
+    Frame frame;                 // 要发布的帧（closed/owner_death 不用它）
+    bool closed = false;         // true = publish_closed（生产者正常收尾）
+    bool owner_death = false;    // 由**辅助生产者进程**持有邮箱（本轮未建 target ⇒ NOT-RUN）
+    bool expect_block = true;
+    wchar_t const* expect_contains = L"";
+    wchar_t const* expect_absent = L"";
+    // 0 = 不查色；1 = 该子串必须用**正常**档（并与首次记录的正常色一致）；
+    // 2 = 该子串必须**不是**正常档；3 = 这些 value 全部同色且**不是**正常档（整体失效）。
+    int tone = 0;
+    wchar_t const* tone_subject = L"";
+    std::vector<std::wstring> values;
+    wchar_t const* order_first = L"";
+    wchar_t const* order_second = L"";
+};
+
+Frame content_frame(std::vector<FrameItem> items) {
+    return make_content_frame(std::move(items));
+}
+
+void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
+    out.clear();
+    if (script.empty()) {
+        return;
+    }
+    auto step = [&out](wchar_t const* name) -> FeedStep& {
+        out.push_back(FeedStep{});
+        out.back().name = name;
+        return out.back();
+    };
+    auto cpu = []() { return make_item("cpu", "CPU", "54C"); };
+
+    if (script == L"latest") {
+        FeedStep& first = step(L"latest/baseline");
+        first.frame = content_frame({cpu()});
+        first.expect_contains = L"54C";
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& next = step(L"latest/next");
+        next.frame = content_frame({make_item("mem", "MEM", "61%")});
+        next.expect_contains = L"61%";
+        next.expect_absent = L"54C";  // 邮箱只保留最新一帧，不排队
+    } else if (script == L"warn") {
+        FeedStep& first = step(L"warn/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& warn = step(L"warn/distinct-tone");
+        warn.frame = content_frame({cpu(), make_item("disk", "DISK", "7C", ItemState::Warn)});
+        warn.expect_contains = L"7C";
+        warn.tone = 2;
+        warn.tone_subject = L"7C";
+    } else if (script == L"failure") {
+        FeedStep& first = step(L"failure/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& failed = step(L"failure/error-row");
+        failed.frame = make_error_frame(FailureKind::Timeout, "connect failed");
+        failed.expect_contains = L"ERROR";
+        failed.tone = 2;
+        failed.tone_subject = L"ERROR";
+    } else if (script == L"alarm") {
+        FeedStep& first = step(L"alarm/baseline");
+        first.frame = content_frame({cpu(), make_item("mem", "MEM", "61%")});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& alarm = step(L"alarm/all-red");
+        alarm.frame = make_content_frame({cpu(), make_item("mem", "MEM", "61%")}, /*alarm=*/true,
+                                         FailureKind::Timeout, "connect failed");
+        alarm.expect_contains = L"54C";  // 整体失效时值必须**保留**，不能被折成"没有值"
+        alarm.tone = 3;
+        alarm.values = {L"54C", L"61%"};
+    } else if (script == L"restore") {
+        FeedStep& first = step(L"restore/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& alarm = step(L"restore/alarm");
+        alarm.frame = make_content_frame({cpu()}, true, FailureKind::Timeout, "connect failed");
+        alarm.tone = 2;
+        alarm.tone_subject = L"54C";
+        FeedStep& back = step(L"restore/back-to-normal");
+        back.frame = content_frame({cpu()});
+        back.expect_contains = L"54C";
+        back.tone = 1;
+        back.tone_subject = L"54C";
+    } else if (script == L"closed") {
+        FeedStep& first = step(L"closed/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& closed = step(L"closed/removes-block");
+        closed.closed = true;
+        closed.expect_block = false;
+    } else if (script == L"empty") {
+        FeedStep& first = step(L"empty/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& waiting = step(L"empty/waiting-removes-block");
+        waiting.frame = make_waiting_frame();  // 0 行：不显示读数，也不显示 ERROR
+        waiting.expect_block = false;
+        waiting.expect_absent = L"ERROR";
+    } else if (script == L"delete") {
+        FeedStep& first = step(L"delete/baseline");
+        first.frame = content_frame({cpu()});
+        first.tone = 1;
+        first.tone_subject = L"54C";
+        FeedStep& cleared = step(L"delete/clear-removes-block");
+        cleared.frame = content_frame({});  // 空列表：清空，不是 ERROR
+        cleared.expect_block = false;
+        cleared.expect_absent = L"ERROR";
+    } else if (script == L"ownerdeath") {
+        // 生产者进程死亡与"正常 closed"是**两条**不同的清块路径：这一条要求邮箱的属主是**另一个
+        // 进程**，宿主自己活着。它需要辅助生产者夹具进程（本轮没有这个 target）⇒ 报 NOT-RUN，
+        // 绝不用"宿主自己死"或"发一个 closed 帧"冒充。
+        FeedStep& owner = step(L"ownerdeath/auxiliary-producer-exit");
+        owner.owner_death = true;
+        owner.expect_block = false;
+    }
+}
+
+// UI 线程：读宿主自己的树。返回 false 表示这棵树根本读不到（宿主自己的对象，那是内部错误）。
+bool read_own_tree(bool& present, std::wstring& text,
+                   std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>>& runs) {
+    present = false;
+    text.clear();
+    runs.clear();
+    if (g_tray_grid == nullptr) {
+        return false;
+    }
+    auto children = g_tray_grid.Children();
+    for (std::uint32_t index = 0; index < children.Size(); ++index) {
+        auto element = children.GetAt(index).try_as<wux::FrameworkElement>();
+        if (element == nullptr || element.Name() != L"DeskFeedBlock") {
+            continue;
+        }
+        present = true;
+        auto border = element.try_as<wuxc::Border>();
+        if (border == nullptr) {
+            continue;
+        }
+        auto label = border.Child().try_as<wuxc::TextBlock>();
+        if (label == nullptr) {
+            continue;
+        }
+        auto inlines = label.Inlines();
+        for (std::uint32_t at = 0; at < inlines.Size(); ++at) {
+            auto run = inlines.GetAt(at).try_as<wuxd::Run>();
+            if (run == nullptr) {
+                continue;
+            }
+            std::wstring const piece = run.Text().c_str();
+            winrt::Windows::UI::Color color{};
+            if (auto brush = run.Foreground().try_as<wuxm::SolidColorBrush>()) {
+                color = brush.Color();
+            }
+            text += piece;
+            runs.emplace_back(piece, color);
+        }
+    }
+    return true;
+}
+
+bool same_color(winrt::Windows::UI::Color left, winrt::Windows::UI::Color right) {
+    return left.A == right.A && left.R == right.R && left.G == right.G && left.B == right.B;
+}
+
+// 找第一个文本包含 `needle` 的 Run 的颜色。
+bool color_of(std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>> const& runs,
+              std::wstring const& needle, winrt::Windows::UI::Color& out) {
+    for (auto const& entry : runs) {
+        if (!needle.empty() && entry.first.find(needle) != std::wstring::npos) {
+            out = entry.second;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 一次判定：全部条件都成立才 PASS，`why` 写第一个不成立的原因。
+bool evaluate_step(FeedStep const& step, std::wstring& why) {
+    bool present = false;
+    std::wstring text;
+    std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>> runs;
+    if (!read_own_tree(present, text, runs)) {
+        why = L"the host's own XAML tree is not reachable";
+        return false;
+    }
+    if (present != step.expect_block) {
+        why = present ? L"a block is still in the host's tree" : L"no block was inserted into the host's tree";
+        return false;
+    }
+    if (!step.expect_block) {
+        return true;
+    }
+    if (step.expect_contains[0] != L'\0' && text.find(step.expect_contains) == std::wstring::npos) {
+        why = L"the block text does not contain the expected value";
+        return false;
+    }
+    if (step.expect_absent[0] != L'\0' && text.find(step.expect_absent) != std::wstring::npos) {
+        why = L"the block text still contains a value that must be gone";
+        return false;
+    }
+    if (step.order_first[0] != L'\0' && step.order_second[0] != L'\0') {
+        std::size_t const first = text.find(step.order_first);
+        std::size_t const second = text.find(step.order_second);
+        if (first == std::wstring::npos || second == std::wstring::npos || first >= second) {
+            why = L"the entries are not in frame order";
+            return false;
+        }
+    }
+    if (step.tone == 0) {
+        return true;
+    }
+    winrt::Windows::UI::Color color{};
+    if (step.tone == 3) {
+        bool have = false;
+        winrt::Windows::UI::Color shared{};
+        for (std::wstring const& value : step.values) {
+            winrt::Windows::UI::Color current{};
+            if (!color_of(runs, value, current)) {
+                why = L"an expected value is not painted in the block";
+                return false;
+            }
+            if (!have) {
+                shared = current;
+                have = true;
+            } else if (!same_color(shared, current)) {
+                why = L"the entries of a failed frame do not share one tone";
+                return false;
+            }
+        }
+        if (have && g_normal_color_known && same_color(shared, g_normal_value_color)) {
+            why = L"a failed frame still uses the normal tone";
+            return false;
+        }
+        return true;
+    }
+    if (!color_of(runs, step.tone_subject, color)) {
+        why = L"the subject run is not in the block";
+        return false;
+    }
+    if (step.tone == 1) {
+        if (!g_normal_color_known) {
+            g_normal_value_color = color;  // 第一次看到正常档：记下来当后续比较的基准
+            g_normal_color_known = true;
+            return true;
+        }
+        if (!same_color(color, g_normal_value_color)) {
+            why = L"the run is not painted in the normal tone";
+            return false;
+        }
+        return true;
+    }
+    // tone == 2：必须与正常档**不同**（warn/error 各有自己的位置，不能被折成正常色）。
+    if (!g_normal_color_known) {
+        why = L"no normal tone baseline was recorded before this step";
+        return false;
+    }
+    if (same_color(color, g_normal_value_color)) {
+        why = L"the run uses the normal tone where a distinct tone is required";
+        return false;
+    }
+    return true;
+}
+
+// UI 线程：有界采样（边等边泵消息）直到 PASS 或 deadline。PASS/FAIL/NOT-RUN 三态都要有明确
+// 结论：超时是 NOT-RUN，绝不当成通过。
+void run_feed_check(unsigned index, unsigned deadline_ms) {
+    g_check_ran = true;
+    g_check_pass = false;
+    g_check_detail.clear();
+    std::vector<FeedStep> steps;
+    build_feed_steps(g_options.frame_script, steps);
+    if (index >= steps.size()) {
+        g_check_detail = L"the step index is out of range";
+        return;
+    }
+    FeedStep const& step = steps[index];
+    if (step.owner_death) {
+        g_check_ran = false;  // NOT-RUN：没有辅助生产者夹具进程，这一条没有被执行过
+        g_check_detail = L"owner death needs the auxiliary producer fixture process";
+        return;
+    }
+    DWORD const deadline = ::GetTickCount() + deadline_ms;
+    std::wstring why;
+    for (;;) {
+        if (evaluate_step(step, why)) {
+            g_check_pass = true;
+            return;
+        }
+        if (static_cast<long>(::GetTickCount() - deadline) >= 0) {
+            break;
+        }
+        MSG message{};
+        while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+        }
+        ::Sleep(20);
+    }
+    g_check_detail = why;
+}
+
 
 // 工作线程：装载负载、连接诊断、**唯一一次**走查，然后交给 UI 线程。
 DWORD WINAPI worker_entry(LPVOID) {
@@ -626,6 +973,25 @@ DWORD WINAPI worker_entry(LPVOID) {
     if (g_options.feed) {
         // 生产路径：负载自己 attach mock 邮箱、自己把帧渲染进宿主的岛。**不做** inline 应用：
         // XAML 元素有线程亲和性，内容必须由负载经真实 hook 编组到 UI 线程。
+        // 帧序列：生产者必须在 `DeskFeedStart` **之前**就位并发出第一帧。负载线程 attach 之后
+        // 立刻读一次最新帧，读到 0 行就不会插块（也就没有"帧 → 块"这条路可验）。
+        std::vector<FeedStep> steps;
+        build_feed_steps(g_options.frame_script, steps);
+        if (!steps.empty()) {
+            std::string producer_error;
+            if (!g_producer.create(g_options.scope, producer_error)) {
+                deskfeed::log_format(L"cannot create the isolated mock producer: %S",
+                                     producer_error.c_str());
+                g_failed = true;
+            } else if (!g_producer.publish(steps[0].frame)) {
+                deskfeed::log_line(L"the isolated mock producer refused the first frame");
+                g_failed = true;
+            } else {
+                deskfeed::log_format(L"frame script <%s>: %zu step(s); step 0 published before "
+                                     L"DeskFeedStart",
+                                     g_options.frame_script.c_str(), steps.size());
+            }
+        }
         // R5：把宿主的岛登记成托盘目标。返回 0 = 负载拒绝了这个窗口，那是失败而不是跳过。
         int const tray_ok = g_probe.set_tray_window(g_window);
         DWORD owner_pid = 0;
@@ -665,6 +1031,46 @@ DWORD WINAPI worker_entry(LPVOID) {
                 g_failed = true;
             }
         }
+        // 逐步发帧 + 由 UI 线程读宿主自己的树判定。PASS/FAIL/NOT-RUN 三态都写进日志：
+        // NOT-RUN（超时，或这一步需要的东西不存在）**不算通过**，也不允许把整轮当绿。
+        for (size_t index = 0; index < steps.size(); ++index) {
+            if (index != 0 && !steps[index].owner_death) {
+                bool const published = steps[index].closed ? g_producer.publish_closed()
+                                                           : g_producer.publish(steps[index].frame);
+                if (!published) {
+                    deskfeed::log_format(L"NOT-RUN: %s (the producer refused the frame)",
+                                         steps[index].name);
+                    g_failed = true;
+                    continue;
+                }
+            }
+            ::ResetEvent(g_check_done);
+            g_check_ran = false;
+            g_check_pass = false;
+            if (::PostMessageW(g_window, kCheckMessage, static_cast<WPARAM>(index), 0) == FALSE) {
+                deskfeed::log_format(L"NOT-RUN: %s (the check request was not delivered)",
+                                     steps[index].name);
+                g_failed = true;
+                continue;
+            }
+            if (::WaitForSingleObject(g_check_done, 8000) != WAIT_OBJECT_0) {
+                deskfeed::log_format(L"NOT-RUN: %s (the UI thread did not answer within the deadline)",
+                                     steps[index].name);
+                g_failed = true;
+                continue;
+            }
+            if (!g_check_ran) {
+                deskfeed::log_format(L"NOT-RUN: %s (%s)", steps[index].name, g_check_detail.c_str());
+                g_failed = true;
+                continue;
+            }
+            if (g_check_pass) {
+                deskfeed::log_format(L"PASS: %s", steps[index].name);
+            } else {
+                deskfeed::log_format(L"FAIL: %s (%s)", steps[index].name, g_check_detail.c_str());
+                g_failed = true;
+            }
+        }
         ::PostMessageW(g_window, kRunMessage, 0, 0);
         ::WaitForSingleObject(g_ui_done, 30000);
 
@@ -689,6 +1095,7 @@ DWORD WINAPI worker_entry(LPVOID) {
                 g_failed = true;
             }
         }
+        g_producer.close();  // 隔离 scope 的邮箱随最后一个句柄关闭而消失
         ::PostMessageW(g_window, WM_CLOSE, 0, 0);
         return 0;
     }
@@ -849,6 +1256,11 @@ int run_host(HostOptions const& options) {
     g_ui_done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (g_ui_done == nullptr) {
         deskfeed::log_line(L"cannot create the UI-done event");
+        return 1;
+    }
+    g_check_done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_check_done == nullptr) {
+        deskfeed::log_line(L"cannot create the frame-check event");
         return 1;
     }
 

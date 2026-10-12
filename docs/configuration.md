@@ -9,7 +9,7 @@
 | 日志 | `%LOCALAPPDATA%\DeskFeed\deskfeed.log` |
 | 日志（隔离实例） | `%LOCALAPPDATA%\DeskFeed\test-<scope>\deskfeed.log` |
 | `--inspect` 转交文件 | `%LOCALAPPDATA%\DeskFeed[\test-<scope>]\inspect-<发送方 PID>.json`（读完即删） |
-| 建议部署位置 | `%LOCALAPPDATA%\DeskFeed\deskfeed.exe`（构建产物在 `.agent\build\debug\bin`） |
+| 建议部署位置 | `%LOCALAPPDATA%\DeskFeed\`（主进程、负载 DLL 与注入器同目录；见 [building.md](building.md)） |
 
 `--state-dir <目录>` **只**覆盖设置文件所在目录（文件名仍是 `settings.ini`）。日志与
 `--inspect` 转交文件不受它影响，仍在上面 `%LOCALAPPDATA%\DeskFeed[\test-<scope>]` 的隔离目录下。
@@ -22,35 +22,58 @@ url=http://127.0.0.1:8099/snapshot
 poll_ms=30000
 retry_ms=5000
 timeout_ms=8000
-```
 
-以下栏目为**预留、当前版本不读取**（Phase 2/3 使用）：
-
-```ini
 [window]
-right=2560
-bottom=1392
+; right / bottom 是窗口右下角的屏幕坐标锚点，可以省略；省略时按下面表格的缺省落位
 expanded=false
 topmost=true
-hidden=true
+hidden=false
 
 [taskbar]
 component=true
 ```
 
-- `[source] url` 是唯一的数据源地址。没有它时按“未配置 URL”处理（红色 `ERROR`），
-  不使用任何默认地址。
+`[source]`：
+
+- `url` 是唯一的数据源地址。没有它时按“未配置 URL”处理（红色 `ERROR`），不使用任何默认地址。
 - `poll_ms` / `retry_ms` / `timeout_ms`：0 或缺省表示用默认值；越界值夹到边界。
   上下限见 [http.md](http.md) 的“调度”。
-- 值**按原样读取与保存**：字符串键不做去空白、不做大小写归一。地址里出现首尾或内部空白、
-  控制字符会被当成非法地址拒绝，而不是悄悄改写。
+- **地址的精确性**：通过命令（`--url`）提交并被接纳的地址，保存与请求都保持**精确原样**，不做
+  去空白、不做大小写归一。手写 INI 则按当前 parser 处理**整行**：整行两端的外沿空白（空格/制表符）
+  会先被去掉，`=` 之后的前导空白**保留**在值里。地址里出现空白或控制字符会被当成非法地址**报错**，
+  而不是悄悄改写（需要空格请写 `%20`）。没有可用的地址时按“未配置 URL”处理（红色 `ERROR`）。
 - URL 里的查询串会原样保存与请求；只有片段（`#...`）不会发给服务器。
 - 数值键允许首尾空白（人写的文件里常见）。
 
+`[window]` 是悬浮窗的界面偏好，`[taskbar] component` 是任务栏组件开关。**这两组键当前版本就在
+读写**，随界面动作即时落盘（语义见 [taskbar-injection.md](taskbar-injection.md) 与
+[src/widget/README.md](../src/widget/README.md)）：
+
+| 键 | 含义 | 缺省 | 读不出来时 |
+| --- | --- | --- | --- |
+| `[window] right` / `bottom` | 窗口**右下角**的屏幕坐标锚点 | 主屏可用区右下角向内 10 px | 两个键缺一个、不是整数、或放不进 `LONG`，就按缺省落位（不会把窗口丢到 `(0,0)`）；负值合法（左侧/上方显示器） |
+| `[window] expanded` | 展开详情 | `false` | 按缺省 |
+| `[window] topmost` | 置顶 | `true` | 按缺省 |
+| `[window] hidden` | 用户把悬浮窗藏起来（跨启动保持） | `false`（显示） | 按缺省 |
+| `[taskbar] component` | 任务栏组件的**持久意图** | `true`（开） | 按缺省 |
+
+- 布尔键只认 `true` / `false`（大小写不敏感，允许首尾空白），写坏的值按缺省处理，
+  不因为一行坏值改变界面行为。
+- `[taskbar] component` 缺省为 `true`，所以**没有设置文件的新实例默认就会武装任务栏组件**
+  （见 [README.md](../README.md) 的“默认行为”）。要默认关掉它得在设置文件里显式写 `false`；
+  `--no-inject` / `--no-taskbar` / `--headless` 只关本次运行。
+- `--hidden` 是本次运行的强制隐藏，**不**改写 `[window] hidden`。
+
 ## 写入规则
 
-- **只改自己负责的那一行**：写 `[source] url` 时，其它栏目、其它键、注释与顺序一个字节都不动；
-  缺失的键插到对应栏目的末尾（栏目不存在就先补一行栏目头）。
+- **只改自己负责的那一行**：写 `[source] url` 时，其它**未修改**行的正文、栏目、键、注释与顺序
+  保持不变；被改的那一行按 `key=value` 重写。缺失的键插到对应栏目的末尾（栏目不存在就先补一行
+  栏目头）。
+- **保存会统一编码与行尾**：整份文件以 **UTF-8 无 BOM** 重写，每行以 **CRLF** 结尾。原文件若是
+  LF 行尾或带 BOM，保存后就不再是逐字节相同的文件——上面说的“不动”指**未修改行的正文内容**，
+  不是整份文件的字节。
+- `[window]` 与 `[taskbar] component` 各由自己的那条路径写：界面偏好写 `[window]`，组件开关写
+  `[taskbar] component`，不重复写。
 - **原子替换**：先写同目录临时文件并 `FlushFileBuffers`，再
   `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`。失败时目标文件保持原样。
 - 设置文件读不出来（不是合法 UTF-8 等）时，本次运行**拒绝一切写入**并在日志里说明，

@@ -17,7 +17,7 @@
   `deskfeed-test-fixture-payload`、`deskfeed-tools-fixture-host`、`deskfeed-fake-injector`
   （后三者与 remote-writer 一样只服务工具用例：不部署、不安装、不进交付物）。Windows / MSVC /
   x64、C++20、静态 CRT；CTest 注册 8 条用例（含生产/测试两条成品 DLL 审计）。
-- `README.md` — 面向用户的说明：当前阶段、快速开始、安全边界、许可。
+- `README.md` — 面向用户的说明：运行前提、快速开始、默认行为与验证现状、安全边界、许可。
 - `AGENTS.md` — 本文件。
 - `LICENSE` — MIT，版权署名 Lin515。
 - `.gitignore` — 忽略 `build*/`、`.agent/`、编辑器与调试产物。
@@ -40,7 +40,10 @@
 5. **验收与测试必须用隔离实例**：`--scope <名字>`（或 `--test-instance`，或环境变量
    `DESKFEED_SCOPE`）会隔开互斥体、控制窗口类名、设置文件与日志；再加 `--headless`
    保证不碰界面与任务栏。生产实例与测试实例互不干扰。
-6. **不要在没有明确授权时注入 `explorer.exe`**。授权之后也必须按下面的纪律做：
+6. **默认运行就会请求注入 `explorer.exe`**：`[taskbar] component` 缺省为 `true`，主进程启动后会
+   武装任务栏编排并按需调用 `deskfeed-inject.exe`。所以任何自测/验收都必须带 `--scope <名字>`，
+   并带 `--headless`（或 `--no-inject`）——**没有明确授权就不要跑默认实例**。授权之后也必须按
+   下面的纪律做：
    - 先用自测宿主（不起窗口、不注入 explorer 的离线用例与 `deskfeed-probe.exe` 的
      `--cores 1/2/3` 矩阵）验，再按“注入 → 观察 → 立刻 stop”逐轮做真机实验；每轮开始前确认上一轮的
      守护进程与后台进程都已结束，日志先复制走（负载日志每注入一次截断一次）。

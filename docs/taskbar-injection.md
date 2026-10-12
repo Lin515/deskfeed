@@ -1,17 +1,42 @@
-# 任务栏真嵌入与显示邮箱（Phase 2）
+# 任务栏真嵌入与显示邮箱
 
-> **离线侧已实现，真机侧尚未验收。** 显示邮箱（主进程发布“最新完整帧”）已经落地，并有一条按 scope
-> 隔离的离线验收通道 `--frame-mailbox`；负载 `deskfeed-payload.dll`（生产）与
+> **离线侧已实现；真机侧尚未验收。** 显示邮箱（主进程发布“最新完整帧”）已经落地，并有一条按 scope
+> 隔离的验收通道 `--frame-mailbox`；负载 `deskfeed-payload.dll`（生产）与
 > `deskfeed-payload-test.dll`（同源自测）已经实现（只读最新显示帧、渲染进任务栏 XAML 树、收尾门禁
 > 与进程守卫见 [native-safety.md](native-safety.md)），注入/卸载工具 `deskfeed-inject.exe` 与自测宿主
-> `deskfeed-probe.exe` 也已经实现并有离线用例。**真机那条路**（真 `explorer.exe`、真 XAML 走查、
-> `--cores 1/2/3` 矩阵）**尚未**验收；没有任何默认开关会触发注入，真实注入只在用户明确授权下按
-> [native-safety.md](native-safety.md) 的纪律逐轮做。本文记录设计、硬性约束与已知风险。
+> `deskfeed-probe.exe` 也已经实现并有离线用例。
+>
+> **默认运行就会走这条路。** `[taskbar] component` 缺省为 `true`，主进程启动后会把任务栏编排武装成
+> “开”，并按需调用 `deskfeed-inject.exe` 把负载装进当前任务栏属主进程——注入不是“需要额外打开”的
+> 能力。只有 `--headless` / `--no-inject` / `--no-taskbar`（本次运行）或 `[taskbar] component=false`
+> （持久）会让它一次动作都不发。真实注入必须由用户明确授权，并按
+> [native-safety.md](native-safety.md) 的纪律逐轮做。
+>
+> **尚未验收**：真机 `explorer.exe` 接受、真 XAML 走查与 `--cores 1/2/3` 矩阵在真机上的结论、
+> 帧生产/消费的 R5 目标修正；干净 checkout 上的 Release 构建与部署也未验收。检查点结论见
+> [testing.md](testing.md)。本文记录设计、默认行为、硬性约束与已知风险。
 
 ## 目标
 
 把主进程算出来的显示结果**真正嵌入** Windows 11 任务栏的 XAML 树（不是叠层、不是子窗口），
 并在主进程退出或崩溃时把插入的元素与钩子清理干净，不遗留模块。
+
+## 默认行为与开关
+
+任务栏组件分成三件事，缺一个就会理解错：
+
+- **持久意图**（`[taskbar] component`，缺省 `true`）：用户想不想要这个组件。
+- **本次能力**：没关任务栏、显示邮箱建起来了、注入器真的在。它决定悬浮窗菜单项灰不灰。
+- **当前生效** = 意图 ∧ 能力：菜单的勾、也是交给编排层的目标状态。
+
+编排层（`src/master/taskbar_supervisor.*`）**不注入**：它只按有界的命令行契约异步调用
+`deskfeed-inject.exe --load/--stop/--status`，同时只允许一个动作在跑，用零等待回收子进程，
+**绝不阻塞等待、绝不强杀**；卸载的判据是注入器自己的退出码 0，非 0 一律视为“未撤下”。
+主进程收尾时只请求一次停止，不等待、不重试。
+
+- 关掉本次运行的任务栏动作：`--no-inject` / `--no-taskbar`；连悬浮窗一起关：`--headless`。
+- 持久关掉：设置文件写 `[taskbar] component=false`（缺省是开）。
+- 没有显示邮箱就不武装编排层：一次注入动作都不会发，而不是“武装成关”。
 
 ## 硬性约束（每一条都是踩过的坑）
 
@@ -60,9 +85,10 @@
 - 负载 DLL：`deskfeed-payload.dll`
 - 共享内存：`Local\DeskFeed-display-frame`；通知事件：`Local\DeskFeed-display-ready`
 - 负载清理事件：`Local\DeskFeed-payload-cleanup-<pid>`
-- 负载导出：`DeskFeedStart` / `DeskFeedStop`
+- 负载导出（生产）：`DeskFeedStart` / `DeskFeedStop` / `DeskFeedGetStatus`，外加两个 COM 入口
+  `DllGetClassObject` / `DllCanUnloadNow`；`DeskFeedProbe*` / `DeskFeedTest*` 只在自测与测试构建里存在
 - 注入工具：`deskfeed-inject.exe`；自测宿主：`deskfeed-probe.exe`
-- 互斥体与控制窗口类名都带当前用户 SID 的短哈希（与 Phase 1 的做法一致）
+- 互斥体与控制窗口类名都带当前用户 SID 的短哈希（与主进程的做法一致）
 
 ## 已知风险
 
@@ -72,7 +98,7 @@
   **既不能归因于本负载，也不能排除**。不能宣称注入绝对安全。
 - 注入使用 `CreateRemoteThread` + `LoadLibraryW`，属于会被安全软件关注的行为。
 
-## Phase 3：桌面悬浮窗
+## 桌面悬浮窗（第三个阶段）
 
 - 位置以窗口**右下角**为锚（`[window] right` / `bottom`），尺寸变化时保持这个角不动。
 - 全屏让位只认 `rcMonitor` 与 `SHQueryUserNotificationState()`，不认“任务栏可见高度”；

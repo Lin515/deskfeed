@@ -159,7 +159,12 @@ target_link_libraries(deskfeed_display PUBLIC deskfeed_core deskfeed_platform)
 # 没有 deskfeed_net、没有 deskfeed_ipc（接收端）、没有 deskfeed_symbols/dbghelp。静态库只按需拉取
 # 目标文件，所以"最终 DLL 里没有 JSON / 快照 / 协议校验器 / 符号 / HTTP"这件事由**导入表与 map
 # 文件**验收（`deskfeed-native-tests --audit <dll>` 就是这条审计的自动门禁）。
-add_library(deskfeed_payload SHARED
+#
+# **两个产物、一份源**：`deskfeed_payload`（生产）与 `deskfeed_payload_test`（自测）编译**同一份源
+# 列表、同一 manifest、同一 /guard:cf 与 /MAP**，唯一差异是后者多一个 `DESKFEED_DLL_TEST_API`
+# 定义。探针入口、完成事件变异、安装延迟、探针布防与 observer 只在那个定义下存在，所以生产 DLL 里
+# 连这些入口都没有（不是"复位成正常"，而是根本不编译）。
+set(DESKFEED_PAYLOAD_SOURCES
     src/payload/action_worker.cpp
     src/payload/control_upstream.cpp
     src/payload/dllmain.cpp
@@ -170,42 +175,54 @@ add_library(deskfeed_payload SHARED
     src/payload/taskbar_xaml.cpp
     src/payload/xaml_tap.cpp
 )
-target_link_libraries(deskfeed_payload PRIVATE
-    deskfeed_display
-    deskfeed_platform
-    deskfeed_core_text
-    deskfeed_control_wire_send
-    # comctl32：悬停提示（TOOLTIPS_CLASS）。它是负载自己的窗口，不是 XAML 窗口——任务栏那个 XAML
-    # 岛只有任务栏那么高，XAML 自己弹出的东西会被岛裁掉。
-    comctl32.lib
-    # C++/WinRT 的激活（XAML 类型、颜色、画刷）、单元初始化、调度队列。
-    windowsapp.lib
-    runtimeobject.lib
-    coremessaging.lib
-)
 
-# 负载改写各模块的导入地址表，而那些调用是**指向本模块的间接调用**。开启 Control Flow Guard 的
-# 进程会校验每一个间接调用目标，所以本模块必须带 /guard:cf，否则第一次被钩到的调用就会
-# fast-fail 掉 explorer.exe。reg_hook 会把进程与本模块的 CFG 状态写进日志作为前提证据。
-target_compile_options(deskfeed_payload PRIVATE /guard:cf)
-target_link_options(deskfeed_payload PRIVATE /guard:cf)
-# 这个警告来自 Windows SDK 自己的 C++/WinRT 投射头（Windows.UI.Xaml.Media.Animation.0.h 把
-# GetCurrentTime 这个类函数宏当带参函数调用），不是本工程的代码。抑制它，好让"本工程零警告"这条
-# 门禁继续可读。
-target_compile_options(deskfeed_payload PRIVATE /wd4002)
+# 两个负载目标共用的全部配置：链库、CFG、警告抑制、清单、输出名与 MAP。写成函数是为了让"两边只有
+# 一个编译定义之差"这件事**在结构上**成立——任何人给其中一个加东西，都会立刻在另一个上缺失。
+function(deskfeed_configure_payload target output_name)
+    target_link_libraries(${target} PRIVATE
+        deskfeed_display
+        deskfeed_platform
+        deskfeed_core_text
+        deskfeed_control_wire_send
+        # comctl32：悬停提示（TOOLTIPS_CLASS）。它是负载自己的窗口，不是 XAML 窗口——任务栏那个
+        # XAML 岛只有任务栏那么高，XAML 自己弹出的东西会被岛裁掉。
+        comctl32.lib
+        # C++/WinRT 的激活（XAML 类型、颜色、画刷）、单元初始化、调度队列。
+        windowsapp.lib
+        runtimeobject.lib
+        coremessaging.lib
+    )
 
-set_target_properties(deskfeed_payload PROPERTIES
-    OUTPUT_NAME "deskfeed-payload"
-    PREFIX ""
-)
+    # 负载改写各模块的导入地址表，而那些调用是**指向本模块的间接调用**。开启 Control Flow Guard
+    # 的进程会校验每一个间接调用目标，所以本模块必须带 /guard:cf，否则第一次被钩到的调用就会
+    # fast-fail 掉 explorer.exe。reg_hook 会把进程与本模块的 CFG 状态写进日志作为前提证据。
+    target_compile_options(${target} PRIVATE /guard:cf)
+    target_link_options(${target} PRIVATE /guard:cf)
+    # 这个警告来自 Windows SDK 自己的 C++/WinRT 投射头（Windows.UI.Xaml.Media.Animation.0.h 把
+    # GetCurrentTime 这个类函数宏当带参函数调用），不是本工程的代码。抑制它，好让"本工程零警告"
+    # 这条门禁继续可读。
+    target_compile_options(${target} PRIVATE /wd4002)
 
-# explorer 里的崩溃必须能归因到确切地址，所以负载总是带 map 文件。
-target_link_options(deskfeed_payload PRIVATE "/MAP:${CMAKE_BINARY_DIR}/bin/deskfeed-payload.map")
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME "${output_name}"
+        PREFIX ""
+    )
 
-# 清单作为源文件（见 src/payload/deskfeed-payload.manifest 里的理由）。
-target_sources(deskfeed_payload PRIVATE
-    src/payload/deskfeed-payload.manifest
-)
+    # explorer 里的崩溃必须能归因到确切地址，所以负载总是带 map 文件（两侧各一份，审计各读各的）。
+    target_link_options(${target} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/bin/${output_name}.map")
+
+    # 清单作为源文件（见 src/payload/deskfeed-payload.manifest 里的理由）。
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/payload/deskfeed-payload.manifest")
+endfunction()
+
+add_library(deskfeed_payload SHARED ${DESKFEED_PAYLOAD_SOURCES})
+deskfeed_configure_payload(deskfeed_payload "deskfeed-payload")
+
+# 自测 DLL：唯一差异就是这个定义。它保留探针 ABI 与全部对抗开关；生产 DLL 里没有它们。
+add_library(deskfeed_payload_test SHARED ${DESKFEED_PAYLOAD_SOURCES})
+deskfeed_configure_payload(deskfeed_payload_test "deskfeed-payload-test")
+target_compile_definitions(deskfeed_payload_test PRIVATE DESKFEED_DLL_TEST_API=1)
+
 
 # 主进程。WIN32 子系统：常驻的桌面程序不该带一个控制台窗口；
 # 命令行用法（--help/--inspect/报错）在需要时挂到父进程控制台，见 platform/console.cpp。
@@ -266,7 +283,10 @@ add_executable(deskfeed-native-tests
     src/payload/hook_post.cpp
     src/payload/reg_hook.cpp
 )
-target_link_libraries(deskfeed-native-tests PRIVATE deskfeed_platform deskfeed_control_wire_send)
+# 链 display：glue 用例要在本进程里当一次显示邮箱生产者，负载才会真的挂上邮箱、把动作工作线程
+# 起来，然后一条真实的回收门失败才能被咬到。链 platform/control_wire_send 是既有口径。
+target_link_libraries(deskfeed-native-tests PRIVATE deskfeed_platform deskfeed_control_wire_send
+    deskfeed_display)
 target_include_directories(deskfeed-native-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(deskfeed-native-tests PRIVATE DESKFEED_NATIVE_TESTS=1)
 
@@ -285,10 +305,10 @@ set_target_properties(deskfeed-reg-hook-caller PROPERTIES
     PREFIX ""
 )
 add_dependencies(deskfeed-native-tests deskfeed-reg-hook-caller)
-# 用例里有一条真的把**成品负载 DLL** LoadLibrary 进本进程的 status 用例（随后还有走测试 DLL 的
-# glue 用例），所以这两条也是**真实图边**：只构建 deskfeed-native-tests 时，对应的 DLL 必须一起
-# 构建出来，不能指望上一次构建在 `bin/` 里留下的旧产物。
-add_dependencies(deskfeed-native-tests deskfeed_payload)
+# 用例里有一条真的把**成品负载 DLL** LoadLibrary 进本进程的 status 用例，还有走测试 DLL 的 glue
+# 用例，所以这两条也是**真实图边**：只构建 deskfeed-native-tests 时，两个 DLL 必须一起构建出来，
+# 不能指望上一次构建在 `bin/` 里留下的旧产物。
+add_dependencies(deskfeed-native-tests deskfeed_payload deskfeed_payload_test)
 
 add_test(NAME deskfeed-native-tests COMMAND deskfeed-native-tests)
 
@@ -311,9 +331,13 @@ target_include_directories(deskfeed-supervisor-tests PRIVATE "${CMAKE_CURRENT_SO
 add_dependencies(deskfeed-supervisor-tests deskfeed-fake-injector)
 add_test(NAME deskfeed-supervisor-tests COMMAND deskfeed-supervisor-tests)
 
-# 成品导入表/map 审计：单独一条 CTest，失败就是"负载里混进了不该有的东西"。
+# 成品导入表/map/导出名审计：两侧各一条 CTest。生产侧失败 = "负载里混进了不该有的东西"（含出现
+# 了任何 DeskFeedProbe* 入口），测试侧失败 = 探针入口整批消失。
 add_test(NAME deskfeed-payload-audit
     COMMAND deskfeed-native-tests --audit $<TARGET_FILE:deskfeed_payload>
+)
+add_test(NAME deskfeed-payload-test-audit
+    COMMAND deskfeed-native-tests --audit $<TARGET_FILE:deskfeed_payload_test>
 )
 
 # ---------------------------------------------------------------------------

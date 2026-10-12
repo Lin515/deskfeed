@@ -1,5 +1,7 @@
 #pragma once
 
+#include "payload/payload_flavor.h"
+
 #include <string>
 
 // 任务栏那块上两个交互（双击、右键菜单项）的**动作工作线程**。
@@ -24,10 +26,10 @@ bool action_worker_stop(unsigned timeout_ms);
 
 bool action_worker_running();
 
-#ifdef DESKFEED_NATIVE_TESTS
-// **测试专用**（只在 `DESKFEED_NATIVE_TESTS` 的用例目标里编译，成品 DLL 里没有这个符号）：
-// 让工作线程每一轮真正醒来之后先停住若干毫秒，用来确定性地制造"stop 在期限内等不到线程句柄"。
-// 线程是真的没退出，重试路径随后必须能真的把它等回来。
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+// **测试专用**（只在自测构建里编译：测试 DLL 与原生用例目标有它，生产 `deskfeed-payload.dll`
+// 里没有这个符号）：让工作线程每一轮真正醒来之后先停住若干毫秒，用来确定性地制造"stop 在期限内
+// 等不到线程句柄"。线程是真的没退出，重试路径随后必须能真的把它等回来。
 void action_worker_probe_set_test_sleep_ms(unsigned ms);
 #endif
 

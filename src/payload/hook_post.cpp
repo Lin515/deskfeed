@@ -67,16 +67,21 @@ struct Gate {
     HookExecutor executor = nullptr;
     void* context = nullptr;
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
     unsigned install_delay_ms = 0;  // 自测用的确定性对抗窗口
 
-    // 探针专用（见 src/payload/probe_api.h）。这些量只在自测宿主进程里被读写；生产
-    // `DeskFeedStart` 启动时会把变异模式复位成 Normal。
+    // 探针专用（见 src/payload/probe_api.h）。这些量只在自测构建里存在；生产 DLL 里连它们
+    // 带的那几条代码路径都不编译。
     std::atomic<bool> observer_enabled{false};
     std::atomic<unsigned> observer_stage{0};
     std::atomic<unsigned> observer_sequence{0};
     std::atomic<unsigned> completion_mutation{0};
     // 探针"已布防"：见 hook_post_probe_set_armed 的注释。
     std::atomic<bool> probe_armed{false};
+    // **粘性**：这一次安装真的走过了"完成事件提前置位"的变异路径。只要它还在，收尾一律按"未退休"
+    // 处理，绝不归还自引用——提前置位的完成事件证明不了我们那一帧已经从 T 的栈上弹掉。
+    std::atomic<bool> completion_mutated{false};
+#endif
 };
 
 Gate g;
@@ -117,6 +122,7 @@ bool run_executor_seh(HookAction action, std::wstring& error, bool& ok) {
 // user32 类的窗口（STATIC），绝不能用本模块自己的窗口过程当 ack 目标——那会引入新的 `ret` 问题。
 HWND g_ack_window_override = nullptr;
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 // 探针的调用阶段记录。只写两个原子量，不分配、不日志、不碰任何句柄——下面这几步全部发生在
 // **最后一次 SetEvent 之前**，所以对回调末尾"只剩一次 SetEvent 与裸 return"这条断言没有影响。
 // `stage` 只增不减；`sequence` 每次回调进入时自增一次，探针据此区分"看到的是哪一次回调"。
@@ -126,6 +132,11 @@ void observer_note(unsigned stage) {
     }
     g.observer_stage.store(stage, std::memory_order_release);
 }
+#define DESKFEED_OBSERVE(stage) observer_note(static_cast<unsigned>(stage))
+#else
+// 生产构建：观测点**不存在**。参数里的探针枚举也随之整段消失（宏不解析被丢弃的实参）。
+#define DESKFEED_OBSERVE(stage) ((void)0)
+#endif
 
 HWND resolve_ack_window(HWND preferred) {
     if (preferred != nullptr && ::IsWindow(preferred) != FALSE) {
@@ -200,10 +211,12 @@ LRESULT CALLBACK hook_proc_impl(int code, WPARAM wparam, LPARAM lparam) {
     {
         // ① 取记录并自摘。取不到而确实有一次待跑的动作，说明安装方还没把句柄发布出来（T 可以在
         //    SetWindowsHookExW 返回与 store 之间就进入回调）——有界地等一次发布事件再取。
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
         if (g.observer_enabled.load(std::memory_order_acquire)) {
             g.observer_sequence.fetch_add(1, std::memory_order_acq_rel);
         }
-        observer_note(static_cast<unsigned>(HookObserverStage::Enter));
+#endif
+        DESKFEED_OBSERVE(HookObserverStage::Enter);
         HHOOK installed = g.hook.exchange(nullptr);
         if (installed == nullptr && g.pending.load(std::memory_order_acquire)) {
             ::WaitForSingleObject(g.published, 200);
@@ -221,7 +234,7 @@ LRESULT CALLBACK hook_proc_impl(int code, WPARAM wparam, LPARAM lparam) {
                 g.still_installed.store(true);
             }
         }
-        observer_note(static_cast<unsigned>(HookObserverStage::RecordRemoved));
+        DESKFEED_OBSERVE(HookObserverStage::RecordRemoved);
 
         // ②
         g.in_flight.fetch_add(1, std::memory_order_acq_rel);
@@ -241,25 +254,30 @@ LRESULT CALLBACK hook_proc_impl(int code, WPARAM wparam, LPARAM lparam) {
         }
 
         // 探针阶段：执行体与结果发布都跑完了（仍然在最后一处 SetEvent 之前）。
-        observer_note(static_cast<unsigned>(HookObserverStage::ExecutorDone));
+        DESKFEED_OBSERVE(HookObserverStage::ExecutorDone);
 
         // ④
         g.in_flight.fetch_sub(1, std::memory_order_acq_rel);
 
         // ⑤ 第三方钩子可能在这里泵消息：到此为止一切都必须做完。
-        observer_note(static_cast<unsigned>(HookObserverStage::CallNextEntered));
+        DESKFEED_OBSERVE(HookObserverStage::CallNextEntered);
         next = ::CallNextHookEx(nullptr, code, wparam, lparam);
-        observer_note(static_cast<unsigned>(HookObserverStage::CallNextReturned));
+        DESKFEED_OBSERVE(HookObserverStage::CallNextReturned);
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
         // 探针的对抗开关：把完成事件故意提前到 CallNextHookEx 之前。正常路径下事件只在下面是
         // **最后一次**模块 API；变异路径下它落在 CallNext 之前，用来证明验收能抓住这类错误。
+        // 一旦真的走过这条路，就置**粘性**的 `completion_mutated`：收尾那边见到它就一律按"未退休"
+        // 处理、不归还自引用（提前置位的事件证明不了我们那一帧已经从 T 的栈上弹掉）。
         if (g.completion_mutation.load(std::memory_order_acquire) ==
             static_cast<unsigned>(CompletionMutation::EarlyBeforeCallNext)) {
             if (g.done != nullptr) {
                 ::SetEvent(g.done);
                 signal_done = false;
+                g.completion_mutated.store(true, std::memory_order_release);
             }
         }
+#endif
     }
 
     // ⑥ 完成事件是最后一条模块 API；⑦ 之后是裸返回。
@@ -335,10 +353,12 @@ HookPostResult hook_post_run(DWORD tray_thread_id, HookAction action, unsigned t
         return result;
     }
 
-    // 自测用：把"发布句柄"这一步人为推迟，用来确定性地制造"回调先于发布进入"。
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+    // 自测用：把"发布句柄"这一步人为推迟，用来确定性地制造"回调先于发布进入"。生产里没有它。
     if (g.install_delay_ms != 0) {
         ::Sleep(g.install_delay_ms);
     }
+#endif
 
     g.hook.store(installed);
     ::SetEvent(g.published);  // 安装/发布握手：回调取不到句柄时等它
@@ -447,6 +467,18 @@ bool hook_post_retire(HWND ack_window, DWORD tray_thread_id, unsigned timeout_ms
         return false;
     }
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+    // 变异路径的观测到此为止：上面的等待、身份核验与 ping **都已经真的执行过**（第三方钩子在
+    // CallNextHookEx 里泵消息、ACK 落在我们的 return 之前时，这次 ping 的结果就是那条反例证据），
+    // 但结论**强制**为"未退休"——提前置位的完成事件不能证明我们那一帧已经弹掉，所以绝不归还自引用。
+    // 调用方要拿正常证据，必须先确认回调真的已经返回、把变异关回 Normal，再走一次本函数。
+    if (g.completion_mutated.load(std::memory_order_acquire)) {
+        g.dangling.store(true);
+        detail = L"完成事件被变异提前置位（对抗用例）：本轮一律按未退休处理，不归还自引用";
+        return false;
+    }
+#endif
+
     // 证明齐了，归还非 PIN 自引用。
     release_self_reference();
     g.completion_expected.store(false);
@@ -460,14 +492,16 @@ bool hook_post_armed() { return g.hook.load() != nullptr; }
 
 void hook_post_set_ack_window(HWND window) { g_ack_window_override = window; }
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+// ---------------------------------------------------------------------------
+// 探针 ABI 的内部实现（导出的入口在 dllmain.cpp 里做 POD 校验与受控填充）。整段只在自测构建里
+// 编译：生产 DLL 里没有 observer、没有变异开关、没有安装延迟，也没有"已布防"。
+// ---------------------------------------------------------------------------
+
 void hook_post_set_install_delay_ms(unsigned delay_ms) {
     std::lock_guard<std::mutex> guard(g.run_mutex);
     g.install_delay_ms = delay_ms;
 }
-
-// ---------------------------------------------------------------------------
-// 探针 ABI 的内部实现（导出的入口在 dllmain.cpp 里做 POD 校验与受控填充）。
-// ---------------------------------------------------------------------------
 
 bool hook_post_probe_status(HookProbeStatus& out) {
     out.hook_installed = g.hook.load() != nullptr ? 1u : 0u;
@@ -509,11 +543,15 @@ void hook_post_probe_set_observer(bool enable) {
 
 void hook_post_probe_set_completion_mutation(CompletionMutation mode) {
     g.completion_mutation.store(static_cast<unsigned>(mode), std::memory_order_release);
+    if (mode == CompletionMutation::Normal) {
+        // 只有确认回调真的已经返回之后才允许关回 Normal；关回去之后，收尾才可能给出"可以卸载"的
+        // 结论（届时完成事件、retired、in_flight 与 ping 都会按正常路径重新核一遍）。
+        g.completion_mutated.store(false, std::memory_order_release);
+    }
 }
 
 // 自测宿主"已布防"：R5 指定的托盘窗口必须活过 `DeskFeedStart`（否则真实 mailbox 的 UI 投递又会
-// 回到 `FindWindow(Shell_TrayWnd)`，探针场景根本跑不起来）。只有探针显式置位才生效；生产路径不
-// 置位，`DeskFeedStart` 照常把全部探针开关复位。
+// 回到 `FindWindow(Shell_TrayWnd)`，探针场景根本跑不起来）。只有探针显式置位才生效。
 bool hook_post_probe_armed() { return g.probe_armed.load(std::memory_order_acquire); }
 
 void hook_post_probe_set_armed(bool armed) {
@@ -521,5 +559,6 @@ void hook_post_probe_set_armed(bool armed) {
 }
 
 void hook_post_probe_set_tray_window(HWND window) { g_ack_window_override = window; }
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 
 }  // namespace deskfeed::payload

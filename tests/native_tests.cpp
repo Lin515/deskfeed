@@ -9,7 +9,10 @@
 // 用法：
 //   deskfeed-native-tests                     跑全部用例
 //   deskfeed-native-tests --filter feed       只跑名字里含 feed 的用例
-//   deskfeed-native-tests --audit <dll>       只跑成品审计（CTest 单独注册一条）
+//   deskfeed-native-tests --audit <dll>       只跑成品审计（CTest 注册两条：生产侧与测试侧）
+//   deskfeed-native-tests --filter glue       只跑"测试 DLL 上某条回收门真失败"的粘合回归
+//   deskfeed-native-tests --filter failclosed 只跑 GetStatus 的坏指针/不认 ABI 失败路径
+#include "display/mailbox.h"
 #include "payload/action_worker.h"
 #include "payload/feed.h"
 #include "payload/hook_post.h"
@@ -376,6 +379,82 @@ bool collect_imports(std::vector<unsigned char> const& image, ImportNames& out) 
     return true;
 }
 
+// 枚举导出**名字**：生产与测试两个 DLL 的差异恰恰是"有没有探针/测试入口"，所以审计必须按名字判定，
+// 不能只看几个已知 RVA。
+bool collect_export_names(std::vector<unsigned char> const& image, std::vector<std::string>& out) {
+    if (image.size() < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+    auto const* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(image.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+        return false;
+    }
+    auto const* nt = reinterpret_cast<IMAGE_NT_HEADERS const*>(image.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+    auto const& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (directory.VirtualAddress == 0 || directory.Size == 0) {
+        return true;  // 没有导出表
+    }
+    auto const* section = IMAGE_FIRST_SECTION(nt);
+    auto rva_to_offset = [&](unsigned long value) -> std::size_t {
+        for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
+            unsigned long const start = section->VirtualAddress;
+            unsigned long const size = section->Misc.VirtualSize != 0 ? section->Misc.VirtualSize
+                                                                     : section->SizeOfRawData;
+            if (value >= start && value < start + size) {
+                return section->PointerToRawData + (value - start);
+            }
+        }
+        return 0;
+    };
+
+    std::size_t const export_offset = rva_to_offset(directory.VirtualAddress);
+    if (export_offset == 0 || export_offset + sizeof(IMAGE_EXPORT_DIRECTORY) > image.size()) {
+        return false;
+    }
+    auto const* exports =
+        reinterpret_cast<IMAGE_EXPORT_DIRECTORY const*>(image.data() + export_offset);
+    std::size_t const names_offset = rva_to_offset(exports->AddressOfNames);
+    if (names_offset == 0) {
+        return false;
+    }
+    for (unsigned long index = 0; index < exports->NumberOfNames; ++index) {
+        std::size_t const entry = names_offset + index * sizeof(unsigned long);
+        if (entry + sizeof(unsigned long) > image.size()) {
+            return false;
+        }
+        unsigned long name_rva = 0;
+        std::memcpy(&name_rva, image.data() + entry, sizeof(name_rva));
+        std::size_t const name_offset = rva_to_offset(name_rva);
+        if (name_offset == 0 || name_offset >= image.size()) {
+            return false;
+        }
+        out.emplace_back(reinterpret_cast<char const*>(image.data() + name_offset));
+    }
+    return true;
+}
+
+bool has_export_named(std::vector<std::string> const& names, char const* name) {
+    for (std::string const& entry : names) {
+        if (entry == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_export_prefix(std::vector<std::string> const& names, char const* prefix) {
+    std::size_t const length = std::strlen(prefix);
+    for (std::string const& entry : names) {
+        if (entry.size() >= length && entry.compare(0, length, prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void audit_payload(std::wstring const& dll_path) {
     std::vector<unsigned char> image;
     check(read_file(dll_path, image), "audit: the payload DLL can be read");
@@ -386,6 +465,24 @@ void audit_payload(std::wstring const& dll_path) {
     check(find_export(image, "DeskFeedStop", stop_rva), "audit: DeskFeedStop is a parseable export");
     check(start_rva != 0 && stop_rva != 0 && start_rva != stop_rva,
           "audit: the two exports have distinct RVAs");
+
+    // 风味：两条 CTest 各自把对应目标文件的真实路径传进来。判不出来时按**生产**（更严的一侧）来，
+    // 所以名字写错只会更早报红，不会把生产悄悄当测试放过。
+    bool const test_flavor = dll_path.find(L"-test.dll") != std::wstring::npos;
+    std::printf("audit: flavor=%s\n", test_flavor ? "test" : "prod");
+
+    std::vector<std::string> export_names;
+    check(collect_export_names(image, export_names), "audit: the export name table can be parsed");
+    check(has_export_named(export_names, "DeskFeedGetStatus"), "audit: DeskFeedGetStatus is exported");
+    if (test_flavor) {
+        check(has_export_prefix(export_names, "DeskFeedProbe"),
+              "audit: the self-test payload still exports its DeskFeedProbe* entries");
+    } else {
+        check(!has_export_prefix(export_names, "DeskFeedProbe"),
+              "audit: the production payload exports no DeskFeedProbe* entry");
+        check(!has_export_prefix(export_names, "DeskFeedTest"),
+              "audit: the production payload exports no test-only entry");
+    }
 
     ImportNames imports;
     check(collect_imports(image, imports), "audit: the import table can be parsed");
@@ -721,6 +818,111 @@ void test_status_abi() {
     ::FreeLibrary(module);
 }
 
+// GetStatus 的失败路径：坏指针与不认的 size/abi 都必须用**真 DLL**返回失败，并且把 abi 写回 0，
+// 让调用方据此报"没有状态 ABI"。绝不用 stdout 里的一个标量当证据。
+void test_status_fail_closed() {
+    if (!name_matches("failclosed")) {
+        return;
+    }
+    HMODULE const module = ::LoadLibraryW(sibling_file_path(L"deskfeed-payload.dll").c_str());
+    check(module != nullptr, "failclosed: the production payload DLL loads into this process");
+    if (module == nullptr) {
+        return;
+    }
+    auto const get = reinterpret_cast<StatusGetFn>(::GetProcAddress(module, "DeskFeedGetStatus"));
+    check(get != nullptr, "failclosed: GetStatus resolves");
+    if (get != nullptr) {
+        check(get(nullptr) == 0, "failclosed: a null buffer is refused");
+        check(get(reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x10))) == 0,
+              "failclosed: an unmapped pointer is refused instead of faulting out");
+
+        deskfeed::payload::PayloadStatusPod wrong_abi{};
+        wrong_abi.size = deskfeed::payload::kPayloadStatusSize;
+        wrong_abi.width = deskfeed::payload::kPayloadStatusWidth;
+        wrong_abi.abi = deskfeed::payload::kPayloadStatusAbi + 1;
+        check(get(&wrong_abi) == 0, "failclosed: an unrecognised abi is refused");
+        check(wrong_abi.abi == 0, "failclosed: the refused pod comes back with abi 0");
+
+        deskfeed::payload::PayloadStatusPod wrong_size{};
+        wrong_size.size = 8;
+        wrong_size.abi = deskfeed::payload::kPayloadStatusAbi;
+        check(get(&wrong_size) == 0, "failclosed: an unrecognised size is refused");
+        check(wrong_size.abi == 0, "failclosed: the size mismatch also comes back with abi 0");
+    }
+    ::FreeLibrary(module);
+}
+
+// 测试 DLL 上的粘合回归：某条回收门**真的**失败时 `DeskFeedStop` 必须返回 0、派生值保持 0；解除
+// 之后重试必须真的拿到 1。门位推导与生产路径共用 `retire_gates.h` 与 `host.cpp`，用例不复制假逻辑。
+void test_retire_glue() {
+    if (!name_matches("glue")) {
+        return;
+    }
+
+    // 动作工作线程只在邮箱 attach 成功之后才起来，所以本进程先当一次生产者（同一个 scope）。
+    std::wstring const scope = L"nativeglue";
+    deskfeed::DisplayFrameProducer producer;
+    std::string producer_error;
+    check(producer.create(scope, nullptr, producer_error),
+          "glue: the test process owns a display mailbox producer");
+    if (!producer.created()) {
+        std::printf("      producer error: %s\n", producer_error.c_str());
+        return;
+    }
+
+    HMODULE const module = ::LoadLibraryW(sibling_file_path(L"deskfeed-payload-test.dll").c_str());
+    check(module != nullptr, "glue: the self-test payload DLL loads into this process");
+    if (module == nullptr) {
+        producer.close();
+        return;
+    }
+
+    auto const start = reinterpret_cast<StatusStartFn>(::GetProcAddress(module, "DeskFeedStart"));
+    auto const stop = reinterpret_cast<StatusStopFn>(::GetProcAddress(module, "DeskFeedStop"));
+    auto const get = reinterpret_cast<StatusGetFn>(::GetProcAddress(module, "DeskFeedGetStatus"));
+    using WorkerDelayFn = int(__stdcall*)(unsigned);
+    auto const set_worker_delay =
+        reinterpret_cast<WorkerDelayFn>(::GetProcAddress(module, "DeskFeedTestSetWorkerDelayMs"));
+    auto const stall_worker =
+        reinterpret_cast<WorkerDelayFn>(::GetProcAddress(module, "DeskFeedTestStallWorker"));
+    check(start != nullptr && stop != nullptr && get != nullptr && set_worker_delay != nullptr &&
+              stall_worker != nullptr,
+          "glue: Start/Stop/GetStatus and both test-only worker entries resolve");
+    if (start != nullptr && stop != nullptr && get != nullptr && set_worker_delay != nullptr &&
+        stall_worker != nullptr) {
+        check(start(const_cast<wchar_t*>(scope.c_str())) == 1, "glue: Start accepts the scope");
+
+        // 只有工作线程真的起来、并且真的进入那一次睡眠之后，短超时才有确定的失败可咬。
+        // `DeskFeedTestStallWorker` 返回 1 正是这个窗口。
+        bool stalled = false;
+        for (int attempt = 0; attempt < 600 && !stalled; ++attempt) {
+            stalled = stall_worker(1500) == 1;
+            if (!stalled) {
+                ::Sleep(10);
+            }
+        }
+        check(stalled, "glue: the action worker is really up and really stalled");
+        deskfeed::payload::PayloadStatusPod attached{};
+        check(query_status(get, attached) && attached.mailbox_attached == 1,
+              "glue: the payload attached the display mailbox");
+
+        check(stop(reinterpret_cast<void*>(static_cast<std::uintptr_t>(150))) == 0,
+              "glue: a short Stop cannot retire while the worker gate is unproven");
+        deskfeed::payload::PayloadStatusPod blocked{};
+        check(query_status(get, blocked) && blocked.unload_safe == 0,
+              "glue: unload_safe stays 0 after the gate really failed");
+
+        check(set_worker_delay(0) == 1, "glue: the worker stall is disarmed");
+        check(stop(reinterpret_cast<void*>(static_cast<std::uintptr_t>(4000))) == 1,
+              "glue: the retry retires it once the worker really exits");
+        deskfeed::payload::PayloadStatusPod after{};
+        check(query_status(get, after) && after.unload_safe == 1,
+              "glue: unload_safe is 1 on the retry (same derivation as production)");
+    }
+    ::FreeLibrary(module);
+    producer.close();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -742,6 +944,8 @@ int main(int argc, char** argv) {
         test_reg_hook();
         test_retire_gates();
         test_status_abi();
+        test_status_fail_closed();
+        test_retire_glue();
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

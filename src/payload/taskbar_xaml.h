@@ -47,8 +47,9 @@ int taskbar_xaml_probe_hover_cells(long* out, int capacity);
 // 自测宿主专用：让任务栏线程上的"应用读数"刻意慢下来，用来验"挂着的时候 stop 必须未退休"。
 void taskbar_xaml_probe_set_slow_apply(unsigned ms);
 
-// 自测宿主专用：本次注入由宿主提供的读数（不连邮箱时用占位内容）。
-void taskbar_xaml_probe_set_reading(deskfeed::ReadingContent const& content);
+// 本次注入的读数：**生产路径**（负载线程读到第一帧、以及每次换内容）也走这个入口，它同时是
+// 探针宿主放占位读数的入口。它只把读数写进任务栏块自己的内容槽，不碰 XAML 结构，也不依赖邮箱。
+void taskbar_xaml_set_reading(deskfeed::ReadingContent const& content);
 
 // 自测宿主专用：本线程就是树所属的线程，拆除时不必再投递（也无 Shell_TrayWnd 可投）。
 void taskbar_xaml_set_probe_inline(bool inline_mode);

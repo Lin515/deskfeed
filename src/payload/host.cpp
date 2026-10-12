@@ -370,9 +370,9 @@ void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
     // 第一份读数：主进程启动时就会发一帧，所以任务栏块一出现就是真实内容，不是占位。
     Frame first;
     if (consumer.read(first)) {
-        taskbar_xaml_probe_set_reading(reading_from_frame(first));
+        taskbar_xaml_set_reading(reading_from_frame(first));
     } else {
-        taskbar_xaml_probe_set_reading(reading_from_frame(Frame{}));
+        taskbar_xaml_set_reading(reading_from_frame(Frame{}));
     }
 
     std::wstring worker_error;
@@ -443,19 +443,40 @@ void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
 
 }  // namespace
 
+// 由 `DllMain` 调用：**只**做 kernel32 调用与栈上的名字拼接。
+//
+// 纪律（直接来自"这个模块要在 explorer 里活着"）：DllMain 跑在**加载器锁**里，这里不许做文件 I/O、
+// 不许等待、不许 user32/COM/Registry、不许查 SID、不许分配 —— 所以名字在栈上的定长缓冲里拼，不用
+// `std::wstring`。"上一次实验留下的同名对象已经置位"这种交接清理要等一次事件、还要写日志，两件事
+// 都在 `payload_run`（负载线程、加载器锁之外）里做。
 void payload_prepare() {
-    if (g_cleanup_event == nullptr) {
-        std::wstring const name = L"Local\\DeskFeed-payload-cleanup-" +
-                                  std::to_wstring(::GetCurrentProcessId());
-        g_cleanup_event = ::CreateEventW(nullptr, TRUE, FALSE, name.c_str());
-        if (g_cleanup_event != nullptr &&
-            ::WaitForSingleObject(g_cleanup_event, 0) == WAIT_OBJECT_0) {
-            // 名字虽然带 pid，仍然是会话级对象：万一同名对象已经存在且已置位（上一次实验留下的
-            // 句柄还没关掉），这一次的 stop 会立刻返回。开跑前清一次，别让交接错位。
-            log_line(L"warning: the cleanup event was already signalled; resetting it");
-            ::ResetEvent(g_cleanup_event);
-        }
+    if (g_cleanup_event != nullptr) {
+        return;
     }
+
+    constexpr std::size_t kNameCapacity = 64;
+    wchar_t const prefix[] = L"Local\\DeskFeed-payload-cleanup-";
+    wchar_t name[kNameCapacity]{};
+    std::size_t length = 0;
+    while (prefix[length] != L'\0' && length + 12 < kNameCapacity) {
+        name[length] = prefix[length];
+        ++length;
+    }
+
+    // pid：十进制、无前导零。
+    wchar_t digits[10]{};
+    std::size_t digit_count = 0;
+    unsigned long remaining = ::GetCurrentProcessId();
+    do {
+        digits[digit_count++] = static_cast<wchar_t>(L'0' + (remaining % 10u));
+        remaining /= 10u;
+    } while (remaining != 0 && digit_count < sizeof(digits) / sizeof(digits[0]));
+    for (std::size_t index = 0; index < digit_count && length + 1 < kNameCapacity; ++index) {
+        name[length++] = digits[digit_count - 1 - index];
+    }
+    name[length] = L'\0';
+
+    g_cleanup_event = ::CreateEventW(nullptr, TRUE, FALSE, name);
 }
 
 HANDLE payload_cleanup_event() { return g_cleanup_event; }
@@ -525,6 +546,15 @@ void payload_run(HINSTANCE module_instance, std::wstring const& scope) {
         log_open(default_log_path(L"deskfeed-payload.log"), false);
         log_format(L"payload thread started: pid=%lu scope=\"%s\"", ::GetCurrentProcessId(),
                    scope.c_str());
+
+        // DllMain 只把清理事件建出来（不能等待、不能写日志）。"上一次实验留下的同名对象已经置位"
+        // 这种交接清理放在这里：加载器锁之外，等一次事件与写日志都安全。不清会让这一次的 stop
+        // 立刻返回，交接就错位了。
+        if (HANDLE const cleanup = payload_cleanup_event();
+            cleanup != nullptr && ::WaitForSingleObject(cleanup, 0) == WAIT_OBJECT_0) {
+            log_line(L"warning: the cleanup event was already signalled; resetting it");
+            ::ResetEvent(cleanup);
+        }
 
         unsigned long fault_code = 0;
         unsigned long long fault_offset = 0;

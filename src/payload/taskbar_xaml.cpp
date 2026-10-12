@@ -1178,7 +1178,9 @@ bool taskbar_xaml_block_visible() { return g_block_present.load(); }
 
 void taskbar_xaml_probe_set_slow_apply(unsigned ms) { g_state.slow_apply_ms = ms; }
 
-void taskbar_xaml_probe_set_reading(deskfeed::ReadingContent const& content) {
+// 生产与自测共用的入口：只把读数写进内容槽（加锁），不碰 XAML 结构。生产路径由负载线程在读到
+// 第一帧之后调用它，所以它**不是**"自测宿主专用"，也不许被整段 guard 掉。
+void taskbar_xaml_set_reading(deskfeed::ReadingContent const& content) {
     std::lock_guard<std::mutex> guard(g_content_mutex);
     g_content = content;
     g_have_content = true;

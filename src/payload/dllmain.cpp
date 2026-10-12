@@ -1,5 +1,9 @@
 // 注入进 explorer.exe 的负载 DLL 的入口。
 //
+// 两个产物、一份源：生产 `deskfeed-payload.dll` 与自测 `deskfeed-payload-test.dll` 用的是同一份源
+// 列表、同一清单、同一 CFG/MAP，唯一差异是后者多一个 `DESKFEED_DLL_TEST_API`（见 payload_flavor.h）。
+// 探针入口与全部对抗开关只在自测构建里编译，生产 DLL 里连入口都不存在。
+//
 // DllMain 只做最小的事：记住模块句柄、关掉线程通知、准备清理事件。其余全部在导出的入口起的
 // 工作线程上跑——在 DllMain 里创建线程会在持有加载器锁时运行它。
 //
@@ -10,15 +14,19 @@
 // 超时值按 `uintptr_t` 编码在参数指针本身里（不解引用），这样注入器不必在目标进程里再写一个 DWORD。
 #include "display/reading.h"
 #include "payload/action_worker.h"
+#include "payload/payload_flavor.h"
 #include "payload/hook_post.h"
 #include "payload/host.h"
-#include "payload/probe_api.h"
 #include "payload/reg_hook.h"
 #include "payload/status_pod.h"
 #include "payload/taskbar_xaml.h"
 #include "payload/xaml_tap.h"
 #include "platform/log.h"
 #include "platform/paths.h"
+
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+#include "payload/probe_api.h"
+#endif
 
 #include <windows.h>
 
@@ -85,6 +93,7 @@ std::wstring read_scope(void* pointer, bool& ok) {
     return scope;
 }
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 void probe_placeholder_reading() {
     deskfeed::ReadingContent content;
     deskfeed::ReadingRow first;
@@ -98,17 +107,18 @@ void probe_placeholder_reading() {
     second.value = "structural self-test";
     second.tone = deskfeed::ReadingTone::Warn;
     content.rows.push_back(second);
-    deskfeed::payload::taskbar_xaml_probe_set_reading(content);
+    deskfeed::payload::taskbar_xaml_set_reading(content);
 }
 
-// 探针开关的统一复位。生产启动、探针拆除之后都必须回到这里的状态：完成事件变异关闭、阶段记录
-// 关闭、托盘窗口回退到 `FindWindow(Shell_TrayWnd)`。
+// 探针开关的统一复位。探针拆除之后都必须回到这里的状态：完成事件变异关闭、阶段记录关闭、托盘窗口
+// 回退到 `FindWindow(Shell_TrayWnd)`。（生产 DLL 里没有这些开关，所以也没有这段。）
 void reset_probe_state() {
     deskfeed::payload::hook_post_probe_set_completion_mutation(
         deskfeed::payload::CompletionMutation::Normal);
     deskfeed::payload::hook_post_probe_set_observer(false);
     deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
 }
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 
 // 状态 POD 的受控拷贝（叶子，不携带析构局部对象）：坏指针由 SEH 吃掉。
 bool copy_payload_status_seh(deskfeed::payload::PayloadStatusPod const& source, void* destination,
@@ -142,6 +152,7 @@ void write_status_abi_zero_seh(void* destination) {
     }
 }
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 // 把负载内部状态写进探针给的 POD。**先**在这个不携带析构局部对象的叶子里做受控拷贝（坏指针由
 // SEH 吃掉），再把拷贝好的值交回去——绝不把内部地址/对象交给探针。
 bool copy_status_seh(deskfeed::payload::HookProbeStatus const& source, void* destination,
@@ -163,6 +174,7 @@ bool copy_stage_seh(deskfeed::payload::HookProbeStage const& source, void* desti
     }
     return true;
 }
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 
 }  // namespace
 
@@ -177,15 +189,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
             return 4;
         }
 
-        // 生产路径：先把探针的开关全部复位，任何人都不该以为探针配置能改变生产行为。
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+        // 自测构建：先把探针的开关全部复位，避免任何人误以为探针配置能改变生产行为。
         // 例外：自测宿主显式"布防"过（R5 指定的托盘窗口必须活过 Start，真实 mailbox 的 UI 投递
         // 才能落在它那条线程上）。布防只可能来自同一进程里的探针调用。
+        //
+        // 生产 DLL 里没有这段：那些开关本身不存在，所以也不存在"caller 用探针改变生产行为"这条路。
         if (!deskfeed::payload::hook_post_probe_armed()) {
             deskfeed::payload::hook_post_probe_set_completion_mutation(
                 deskfeed::payload::CompletionMutation::Normal);
             deskfeed::payload::hook_post_probe_set_observer(false);
             deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
         }
+#endif
 
         bool expected = false;
         if (!g_started.compare_exchange_strong(expected, true)) {
@@ -282,9 +298,13 @@ extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID cl
 // 在这里答应会把模块从负载自己的线程脚下抽走。
 extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() { return S_FALSE; }
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 // ---------------------------------------------------------------------------
 // 自测宿主（deskfeed-probe.exe）用的入口。它们让诊断这条路线的全部危险动作在一个自己拥有 XAML
 // 岛的进程里先跑一遍，不必注入 explorer。
+//
+// 整段只在自测构建里编译：生产 `deskfeed-payload.dll` 的导出表里**没有**任何 `DeskFeedProbe*`，
+// 所以外部进程无法用探针入口改变它的行为。审计（`--audit`）会把这一条当硬断言检查。
 // ---------------------------------------------------------------------------
 
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeStart() {
@@ -511,6 +531,42 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetTrayWindow(HWND w
         return 0;
     }
 }
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
+
+#ifdef DESKFEED_DLL_TEST_API
+// ---------------------------------------------------------------------------
+// **测试 DLL 专用**入口：只有 `deskfeed-payload-test.dll` 导出，生产 DLL 与原生用例目标里都没有
+// 这个符号。它让用例能真的制造"某条回收门在期限内没过"，而不是 mock 一个结果出来。
+// ---------------------------------------------------------------------------
+
+// 让动作工作线程每次醒来先真的停住若干毫秒：`action_worker_stop(短超时)` 会真的等不到线程句柄，
+// 回收门（`retire_gates.h` 的派生值）因此必须保持 0；解除（传 0）之后重试必须真的等到它退出并给出 1。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedTestSetWorkerDelayMs(unsigned ms) {
+    try {
+        deskfeed::payload::action_worker_probe_set_test_sleep_ms(ms);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 把"工作线程真的起来并进入那一次睡眠"变成可确定的窗口：置好停顿时长，只有当工作线程**已经在跑**
+// 时才叫醒它（让它真的睡下去）并返回 1；还没起来就返回 0，调用方据此有界重试。
+// 直接调用 `action_worker_probe_set_test_sleep_ms` 而不叫醒，是**不可确定**的：线程可能一直等在
+// 唤醒事件上，`stop` 的信号一到，它在 `g_quit` 检查处就退出了，睡眠根本不会发生。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedTestStallWorker(unsigned ms) {
+    try {
+        deskfeed::payload::action_worker_probe_set_test_sleep_ms(ms);
+        if (!deskfeed::payload::action_worker_running()) {
+            return 0;
+        }
+        deskfeed::payload::action_worker_post_refresh();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+#endif  // DESKFEED_DLL_TEST_API
 
 // 状态 ABI（见 src/payload/status_pod.h）：把负载生命周期状态写进调用方在**目标进程里**分配好的
 // 定长缓冲。没有指针跨进程传递，也没有字符串两侧传递。`size`/`abi` 不认就写回 `abi = 0`。

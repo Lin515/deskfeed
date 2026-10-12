@@ -627,6 +627,16 @@ BOOL APIENTRY DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         // 只归还本模块自己那 3 个引用 + 只读视图，**不等待**、不分配。healthy actor 自己持着这些
         // 命名对象跨过 `FreeLibrary`，所以记录不会因为这里归还而消失。
         deskfeed::payload::payload_guard_release();
+        // 本模块**自己创建**的 4 个内核句柄：命名清理事件与负载线程句柄（`host.cpp`），以及钩子门那
+        // 两条无名事件（`hook_post.cpp`）。前两个只在"Stop 返回 1 且那次远程调用已经退出"这条唯一
+        // 合法卸载路径上才可能被调用方引用；后两个要当前状态机证明门已完全退休（完成事件 + 同 T 的
+        // `WM_NULL` ack）才归还，否则一个都不关（fail closed）。两个 helper 都只做 kernel32 调用与
+        // 栈上判断：不等待、不分配、不加锁、不日志。
+        //
+        // 进程退出时的 DETACH（`lpReserved != NULL`）走同一段代码：系统本来就回收整张句柄表，这里
+        // 关掉同样无害。那不是"平常卸载"的借口，也不改变任何结论——结论只由 `DeskFeedStop` 给出。
+        deskfeed::payload::payload_release_owned_handles();
+        deskfeed::payload::hook_post_release_owned_handles();
     }
     return TRUE;
 }

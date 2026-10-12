@@ -121,6 +121,34 @@ Native **不读快照、不读 `checksum`、不要求记录回到 Idle**。理�
 自己持着同样的命名对象句柄与视图跨过 `FreeLibrary`，所以记录不会因为本模块归还引用而消失；actor 在
 `conclude_clean` 后成对关掉，对象随之消失。
 
+### DETACH 归还本模块自己创建的 4 个内核句柄
+
+除了上面那 3 个守卫引用，负载还自己创建 4 个句柄；它们**都由 `DllMain(DLL_PROCESS_DETACH)` 归还**
+（`payload_release_owned_handles` / `hook_post_release_owned_handles`），否则每次
+`LoadLibrary`/`FreeLibrary` 都会留下永久句柄：
+
+| 句柄 | 创建处 | DETACH 的归还条件 |
+| --- | --- | --- |
+| 命名清理事件 `Local\DeskFeed-payload-cleanup-<pid>` | `payload_prepare` | 无条件（本模块是唯一创建者；它只是观测信号，不是卸载门） |
+| 负载线程句柄 | `payload_publish_thread`（`DeskFeedStart` 登记；`payload_run` 的兜底 dup） | 无条件 |
+| 钩子完成事件 `done` | `hook_post` 的 `ensure_events` | **门已完全退休**才关，否则一个都不关 |
+| 钩子发布事件 `published` | 同上 | 同上 |
+
+两条前者的安全前提是同一条合作者纪律：唯一合法的卸载路径是 `DeskFeedStop` 返回 1 **并且**那次远程
+调用已经退出（每次 API 都可能是另一次 `CreateRemoteThread`；关键是同一个**串行化** actor 的租约与
+退出证明排除了此后与卸载并发的 `Stop`/`GetStatus`）。所以 DETACH 时刻没有调用方在等这两个句柄，
+"关掉一个正被并发等待的句柄"结构上不成立。**`DeskFeedStop` 自己绝不提前关**：那次调用返回之后
+actor 还会再查一次状态，提前关就是拿一个已关闭、可能被复用的句柄值去做等待。
+
+后两者是**无名事件**，只被钩子回调与收尾线程使用，所以归还条件是"当前状态机证明门已完全退休"：
+`completion_expected` 为假只可能来自（a）从来没装成过钩子，或（b）`hook_post_retire` 在等到完成事件、
+确认记录已被摘掉、在途为零，并且向**同一条任务栏线程**的窗口发出 `WM_NULL` 并拿到应答、复验过窗口
+主人之后才清掉它。这不是拿"钩子句柄为空"或"在途为零"冒充收尾——那两条在回调开头就成立。"完成事件
+被提前置位"这种变异会走 `dangling` 分支，一律保留句柄（fail closed）。
+
+进程退出时的 DETACH（`lpReserved != NULL`）走同一段代码：系统本来就回收整张句柄表，那里关掉同样
+无害。它不是"平常卸载"的借口，也不改变任何结论——可卸载与否只由 `DeskFeedStop` 给出。
+
 ### actor 侧恢复（`WAIT_ABANDONED`）
 
 下一位 actor 拿到 `WAIT_ABANDONED`（上一位带锁退出）时**持锁**读快照，只有能证干净才清事件：

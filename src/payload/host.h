@@ -40,9 +40,26 @@ HANDLE payload_cleanup_event();
 HANDLE payload_thread_handle();
 
 // 由 `DeskFeedStart` 在线程**开始跑之前**登记它创建的线程句柄（`CREATE_SUSPENDED` + 登记 + Resume）。
-// 句柄的所有权随之交给负载：它是"线程已终止"这道卸载门要等的对象，模块卸载前不关。
+// 句柄的所有权随之交给负载：它是"线程已终止"这道卸载门要等的对象，由 `payload_release_owned_handles`
+// 在 DETACH 时归还；**绝不**在 `DeskFeedStop` 里提前关（`DeskFeedStop` 与随后的状态查询由**同一个
+// 串行化 actor** 依次发起，提前关就会在它下一次查询时留下"已关闭、可能被复用"的句柄值）。
 // 已经登记过则返回 false（调用方应关掉自己那份）。
 bool payload_publish_thread(HANDLE thread);
+
+// 由 `DllMain(DLL_PROCESS_DETACH)` 调用：归还本模块**自己创建**的那两个内核句柄（命名清理事件与
+// 负载线程句柄）。只 kernel32 + 栈：不等待、不分配、不加锁、不日志、不碰 user32/COM。
+//
+// 为什么在 DETACH 关是安全的、也是必需的：唯一合法的卸载路径是 `DeskFeedStop` 返回 1、**并且**调用
+// 它的那次远程调用已经退出之后才 `FreeLibrary`（见 docs/native-safety.md 的"退出码与等待"、"进程
+// 守卫"两节）。"退出"这条证明按 actor 的串行化纪律成立，而不是"所有 API 都来自同一条 OS 线程"：
+// 每一次 API 都可能是另一次 `CreateRemoteThread`；关键是租约 + 那次调用的退出证明保证了此后没有
+// `Stop`/`GetStatus` 与卸载并发。所以 DETACH 时刻没有调用方在等这两个句柄，"关掉一个正被并发等待的
+// 句柄"结构上不成立。反过来，常年不关就是每次 LoadLibrary 泄漏两个内核句柄——卸载路径越干净，越
+// 不该在"装载器已经决定卸载"这一步留下永久引用。
+//
+// 进程退出时的 DETACH 走的是同一段代码：系统本来就会回收整张句柄表，这里关掉同样无害；本函数不是
+// 任何"强卸"路径，也不改变任何卸载结论（结论仍然只由 `DeskFeedStop` 的门禁给出）。
+void payload_release_owned_handles() noexcept;
 
 // 卸载门（**模块侧**证据）：1 = 既定回收门禁全部通过，并且本线程已经完成全部模块侧工作（只剩
 // `ret`）；0 = 未退休。它**不**包含"线程真的终止"这条证明——那条只能由调用方对自己持有的真实

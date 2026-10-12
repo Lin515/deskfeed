@@ -502,6 +502,28 @@ bool payload_publish_thread(HANDLE thread) {
 
 DWORD payload_unload_safe() { return g_unload_safe.load(); }
 
+// `DllMain(DLL_PROCESS_DETACH)` 调用。只关本模块自己创建的两个句柄，**不等待**、不分配、不加锁。
+// 次序：先关线程句柄，最后关那个命名清理事件——后者消失是本进程里"这一轮负载引用全部归还"的机械
+// 观测点（名字见 `payload_prepare`，用例用 `OpenEventW` 咬它）。
+//
+// 安全前提（唯一合法的卸载路径，见 host.h 的声明注释）：合作 actor 只在 `DeskFeedStop` 返回 1、并且
+// 调用它的那次远程调用已经退出之后才 `FreeLibrary`。这条证明来自 actor 的**串行化**纪律（租约 +
+// 调用退出证明），不是"所有 API 都来自同一条 OS 线程"——每次 API 都可能是另一次 `CreateRemoteThread`。
+// 此后没有 Stop/GetStatus 与卸载并发，所以 DETACH 时刻没有调用方在等 `g_payload_thread`，这里关掉它
+// 不会造成"等待一个已关闭/被复用的句柄值"。`DeskFeedStop` 自己**绝不**提前关：那次 Stop 返回之后
+// actor 还会再查一次状态（同一个串行化 actor 的下一步），提前关就是 UAF。
+void payload_release_owned_handles() noexcept {
+    if (g_payload_thread != nullptr) {
+        ::CloseHandle(g_payload_thread);
+        g_payload_thread = nullptr;
+        g_thread_id = 0;
+    }
+    if (g_cleanup_event != nullptr) {
+        ::CloseHandle(g_cleanup_event);
+        g_cleanup_event = nullptr;
+    }
+}
+
 void payload_request_stop() {
     g_stop_requested.store(true);
     DWORD const thread_id = g_thread_id;
@@ -537,7 +559,8 @@ void payload_run(HINSTANCE module_instance, std::wstring const& scope) {
             if (::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(),
                                   &duplicate, SYNCHRONIZE, FALSE, 0) != FALSE) {
                 if (payload_publish_thread(duplicate)) {
-                    // 登记的句柄归负载所有，模块卸载前不关。
+                    // 登记的句柄归负载所有，由 `payload_release_owned_handles` 在 DETACH 时归还
+                    // （`DeskFeedStop` 只等它，不关它）。
                 } else {
                     ::CloseHandle(duplicate);
                 }

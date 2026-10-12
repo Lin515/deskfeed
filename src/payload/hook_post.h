@@ -84,6 +84,23 @@ bool hook_post_dangling();
 // 是否还有装着没退休的钩子记录。
 bool hook_post_armed();
 
+// 由 `DllMain(DLL_PROCESS_DETACH)` 调用：**只有当前状态机证明门已完全退休**才归还那两条无名事件
+// （`done` / `published`），否则一个都不关（fail closed）。只读原子量 + `CloseHandle`：不等待、
+// 不分配、不加锁、不日志、不碰 user32/COM，也不装作"卸载是安全的"。
+//
+// "门已完全退休"就是收尾那两道证明真的走过：`done` 是完成事件（手动复位，回调的最后一步才置位），
+// 而 `completion_expected` 只在两种情况下为 0 —— 要么从来没装成过钩子（`SetWindowsHookExW` 失败，
+// 链上没有任何回调），要么 `hook_post_retire` 在等到完成事件、确认记录已被摘掉、在途为零，并且向
+// **同一条任务栏线程**的窗口发出 `WM_NULL` 并拿到应答、复验过窗口主人之后才清掉它。所以这里不是
+// 拿"钩子句柄为空"或"在途为零"冒充收尾：在途为零在回调开头就成立，那时执行体、`CallNextHookEx`
+// 与它们的析构都还没跑完。粘性变异（完成事件被提前置位）走的是 `dangling` 分支，一律保留句柄。
+//
+// 为什么 DETACH 时刻没有并发读者：唯一合法的卸载路径是 `DeskFeedStop` 返回 1（内含这道门的证明）
+// 且**那次远程调用已经退出**之后才 `FreeLibrary`（同一个串行化 actor 的下一步才可能再来查询，而它
+// 已经被租约与退出证明排除在外），此后没有新的投递/收尾；回调那边一旦退休就再也不会被调用（记录已
+// 从链上摘掉）。时序见上方头注释里 sentinel < done < 帧弹掉 < ack < FreeLibrary。
+void hook_post_release_owned_handles() noexcept;
+
 // 自测宿主专用：没有 Shell_TrayWnd 时，用它指定的、**属于同一条 UI 线程**的窗口当收尾 ping 的
 // 确认目标。必须是 user32 类的窗口（例如一个 STATIC 子窗口），绝不能用本模块自己的窗口过程——
 // 那会引入新的 `ret` 问题。

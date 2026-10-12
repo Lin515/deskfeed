@@ -14,6 +14,7 @@
 //   deskfeed-native-tests --filter failclosed 只跑 GetStatus 的坏指针/不认 ABI 失败路径
 //   deskfeed-native-tests --filter guard      只跑进程守卫（纯函数/名字/校验和/恢复表 + 子进程场景）
 //   deskfeed-native-tests --guard-child <场景> 内部用法：父进程把自己当**新进程**起出来跑一个守卫场景
+//                                              （含 reload 的句柄零增长与 hookevents 的无名钩子事件归还）
 #include "display/mailbox.h"
 #include "payload/action_worker.h"
 #include "payload/feed.h"
@@ -998,6 +999,23 @@ bool guard_objects_exist() {
     return any;
 }
 
+// 本进程那条命名清理事件（`payload_prepare` 建、`payload_release_owned_handles` 在 `DllMain(DETACH)`
+// 归还）的名字与存在性。口径限定：这条"对象消失"只在本 own-PID + 本协议合作者的 fixture 里可证——
+// 同一个进程里若有别的合作者持着同名事件，对象当然还会活着，那时不能据此断言泄漏（与 actor-refs 的
+// 限定同一口径）。
+std::wstring cleanup_event_name() {
+    return L"Local\\DeskFeed-payload-cleanup-" + std::to_wstring(::GetCurrentProcessId());
+}
+
+bool cleanup_event_exists() {
+    HANDLE const event = ::OpenEventW(SYNCHRONIZE, FALSE, cleanup_event_name().c_str());
+    if (event == nullptr) {
+        return false;
+    }
+    ::CloseHandle(event);
+    return true;
+}
+
 // 用例侧的 cooperating actor：建/开那三个命名对象、持租约、按写序写记录。
 struct GuardActor {
     HANDLE mutex = nullptr;
@@ -1386,39 +1404,206 @@ int child_actor_held_references() {
     return child_result("actor-refs");
 }
 
-// 每轮 Load/Start/Stop/FreeLibrary 之后三个守卫对象都必须消失：这就是"本模块不每 reload 泄漏 3 个
-// 引用"的机械证据（只要泄漏一个，Open* 就还能成功）。句柄计数只作辅助：本模块还有两条与守卫无关的
-// 既有 per-load 归属（清理事件与负载线程句柄），所以这里给一个有界余量而不是要求逐轮零增长。
+// 每轮 Load/Start/Stop/FreeLibrary 之后三条都必须是机械事实：
+//   1. 三个守卫对象消失（E 的机械证据：泄漏一个 `Open*` 就还能成功）；
+//   2. 命名清理事件的对象消失（`OpenEventW` 失败）：它同时证明 DETACH 真的跑到了，并且本 own-PID
+//      fixture 里没有别的持有者（真实机器上不能据此断言，见 `cleanup_event_name` 的口径）；
+//   3. **进程句柄数逐轮零增长**：`DllMain(DETACH)` 归还本模块自己拿的那 4 个句柄（命名清理事件 +
+//      守卫 mutex/event/mapping），所以"装载之后比上一轮的稳态恰好多 4 个、卸载之后一个不剩"这
+//      两条等式必须在第一轮之后的每一轮都成立。
+// 首轮会额外产生一次性的**进程级**状态（user32/COM/WinRT 的进程级缓存：这里实测 +35，之后恒定），
+// 所以用它之后的稳态值当参考。这条断言对"少一次 CloseHandle"是确定性的：删掉任一归还，句柄数就
+// 每轮 +1/+2，两条等式立刻不成立。
 int child_reload_objects_gone() {
     constexpr int kCycles = 6;
-    DWORD first_handles = 0;
-    DWORD last_handles = 0;
+    DWORD baseline = 0;
+    ::GetProcessHandleCount(::GetCurrentProcess(), &baseline);
+    std::printf("reload: handles before any load=%lu\n", static_cast<unsigned long>(baseline));
+    DWORD plateau = 0;
     for (int cycle = 0; cycle < kCycles; ++cycle) {
         PayloadApi api;
         check(api.load(L"deskfeed-payload-test.dll"), "reload: the self-test payload loads");
         if (api.module == nullptr) {
             break;
         }
+        DWORD loaded = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &loaded);
+        check(cleanup_event_exists(),
+              "reload: the named cleanup event exists while the payload is mapped");
         check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "reload: Start accepts");
         check(api.stop_ms(5000) == 1, "reload: Stop retires");
         check(api.unload(), "reload: FreeLibrary succeeds after a retired Stop");
         check(!guard_objects_exist(), "reload: every keeper reference is released on FreeLibrary");
-        DWORD handles = 0;
-        ::GetProcessHandleCount(::GetCurrentProcess(), &handles);
+        check(!cleanup_event_exists(), "reload: the named cleanup event is gone after FreeLibrary");
+        DWORD after = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &after);
+        std::printf("reload: cycle %d loaded=%lu after=%lu\n", cycle,
+                    static_cast<unsigned long>(loaded), static_cast<unsigned long>(after));
         if (cycle == 0) {
-            first_handles = handles;
+            plateau = after;
+            continue;
         }
-        last_handles = handles;
+        check(loaded == plateau + 4,
+              "reload: one load adds exactly the module's four own handles (cleanup + guard x3)");
+        check(after == plateau, "reload: FreeLibrary returns every one of the module's own handles");
     }
-    std::printf("reload: handles first=%lu last=%lu over %d cycles\n",
-                static_cast<unsigned long>(first_handles), static_cast<unsigned long>(last_handles),
-                kCycles);
-    // 每轮允许的既有归属：清理事件（`payload_prepare`）与负载线程句柄（`DeskFeedStart` 登记后
-    // "模块卸载前不关"），实测 2/轮；守卫那 3 个引用若真的每轮泄漏，这里的增长会变成 5/轮。
-    check(last_handles >= first_handles &&
-              last_handles - first_handles <= static_cast<DWORD>(kCycles - 1) * 3u,
-          "reload: handle growth across the cycles stays bounded (no 3-refs-per-reload leak)");
     return child_result("reload");
+}
+
+// 无名钩子事件（`hook_post` 的 `done` / `published`）在 DETACH 的归还条件：门已完全退休。这两条事件
+// 外面看不见，所以这里用测试 DLL 的探针入口在**本进程自己的一条隐藏 UI 线程**上真造一次安装：
+//   * 线程 T 只建一个不可见的 STATIC 窗口并泵消息。绝不查找/触碰任何真实托盘窗口，不注入 explorer，
+//     不起可见 GUI，不动光标；
+//   * `DeskFeedProbePostApply` 走真实 `hook_post_run`：真装 WH_GETMESSAGE 线程钩子、真发布、
+//     T 真进回调、真自摘、真置完成事件（执行体未注册 ⇒ 动作本身报失败，这里不咬动作）；
+//   * `DeskFeedProbeHookStatus` 咬住"这一次真的发生过"（retired=1、hook_installed=0、in_flight=0、
+//     completion_expected=1、dangling=0），避免"什么都没装、收尾当然返回 1"这种假绿；
+//   * `DeskFeedProbeRetire` 走同一条收尾门：等完成事件、向 T 的窗口发 `WM_NULL` 并拿到应答之后才
+//     归还非 PIN 自引用 ⇒ 此后 `DllMain(DETACH)` 才有权关那两条事件。
+// 每轮卸载后句柄数必须回到基线：少关一条事件就会每轮 +1/+2，这里必红。
+struct SyntheticUiThread {
+    std::atomic<bool> stop{false};
+    std::atomic<HWND> window{nullptr};
+    std::atomic<DWORD> thread_id{0};
+    HANDLE thread = nullptr;
+
+    static DWORD WINAPI entry(void* parameter) {
+        auto* const self = static_cast<SyntheticUiThread*>(parameter);
+        self->thread_id.store(::GetCurrentThreadId());
+        HWND const window = ::CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr,
+                                              nullptr, ::GetModuleHandleW(nullptr), nullptr);
+        self->window.store(window);
+        if (window == nullptr) {
+            return 1;
+        }
+        MSG message{};
+        while (!self->stop.load(std::memory_order_acquire)) {
+            while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                ::TranslateMessage(&message);
+                ::DispatchMessageW(&message);
+            }
+            ::MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        ::DestroyWindow(window);
+        self->window.store(nullptr);
+        return 0;
+    }
+
+    bool start() {
+        thread = ::CreateThread(nullptr, 0, &entry, this, 0, nullptr);
+        for (int attempt = 0; attempt < 500 && window.load() == nullptr; ++attempt) {
+            ::Sleep(10);
+        }
+        return thread != nullptr && window.load() != nullptr;
+    }
+
+    void shutdown() {
+        stop.store(true, std::memory_order_release);
+        if (thread != nullptr) {
+            ::WaitForSingleObject(thread, 5000);
+            ::CloseHandle(thread);
+            thread = nullptr;
+        }
+    }
+};
+
+int child_hook_events_released() {
+    SyntheticUiThread ui;
+    check(ui.start(), "hookevents: the hidden synthetic UI thread is up with its own window");
+    if (ui.window.load() == nullptr) {
+        ui.shutdown();
+        return child_result("hookevents");
+    }
+
+    DWORD baseline = 0;
+    ::GetProcessHandleCount(::GetCurrentProcess(), &baseline);
+    std::printf("hookevents: handles before any load=%lu\n", static_cast<unsigned long>(baseline));
+
+    DWORD plateau = 0;
+    DWORD loaded_reference = 0;
+    constexpr int kCycles = 4;
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        PayloadApi api;
+        check(api.load(L"deskfeed-payload-test.dll"), "hookevents: the self-test payload loads");
+        if (api.module == nullptr) {
+            break;
+        }
+        auto const set_tray = reinterpret_cast<int(__stdcall*)(HWND)>(
+            ::GetProcAddress(api.module, "DeskFeedProbeSetTrayWindow"));
+        auto const post = reinterpret_cast<int(__stdcall*)(unsigned, unsigned)>(
+            ::GetProcAddress(api.module, "DeskFeedProbePostApply"));
+        auto const retire = reinterpret_cast<int(__stdcall*)(unsigned)>(
+            ::GetProcAddress(api.module, "DeskFeedProbeRetire"));
+        auto const hook_status = reinterpret_cast<int(__stdcall*)(gp::HookProbeStatus*, unsigned)>(
+            ::GetProcAddress(api.module, "DeskFeedProbeHookStatus"));
+        check(set_tray != nullptr && post != nullptr && retire != nullptr && hook_status != nullptr,
+              "hookevents: the probe entries resolve");
+        if (set_tray == nullptr || post == nullptr || retire == nullptr || hook_status == nullptr) {
+            api.unload();
+            break;
+        }
+        check(set_tray(ui.window.load()) == 1,
+              "hookevents: the synthetic window is accepted as the same-thread ack target");
+
+        DWORD loaded = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &loaded);
+        check(cleanup_event_exists(),
+              "hookevents: the named cleanup event exists while the payload is mapped");
+
+        post(ui.thread_id.load(), 3000);
+        DWORD posted_handles = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &posted_handles);
+        gp::HookProbeStatus armed{};
+        armed.size = gp::kProbeStatusSize;
+        armed.version = gp::kProbeStatusVersion;
+        check(hook_status(&armed, gp::kProbeStatusSize) == 1 && armed.retired == 1 &&
+                  armed.hook_installed == 0 && armed.in_flight == 0 &&
+                  armed.completion_expected == 1 && armed.dangling == 0,
+              "hookevents: the hook really went in, self-removed, and fired the completion event");
+
+        check(retire(3000) == 1,
+              "hookevents: the completion event + same-thread WM_NULL ack gate is really proven");
+        gp::HookProbeStatus after{};
+        after.size = gp::kProbeStatusSize;
+        after.version = gp::kProbeStatusVersion;
+        check(hook_status(&after, gp::kProbeStatusSize) == 1 && after.completion_expected == 0 &&
+                  after.dangling == 0,
+              "hookevents: the gate is closed and nothing dangles before the unload");
+
+        DWORD armed_handles = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &armed_handles);
+
+        check(api.unload(), "hookevents: FreeLibrary succeeds after the gate was proven");
+        check(!cleanup_event_exists(), "hookevents: the named cleanup event is gone after FreeLibrary");
+        DWORD released = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &released);
+        std::printf("hookevents: cycle %d loaded=%lu posted=%lu armed=%lu released=%lu\n", cycle,
+                    static_cast<unsigned long>(loaded),
+                    static_cast<unsigned long>(posted_handles),
+                    static_cast<unsigned long>(armed_handles),
+                    static_cast<unsigned long>(released));
+        if (cycle == 0) {
+            // 首轮会额外产生一次性的进程级状态（装载器 + user32 各一次）；用它之后的稳态值当参考。
+            plateau = released;
+            continue;
+        }
+        if (cycle == 1) {
+            loaded_reference = loaded;
+        } else {
+            check(loaded == loaded_reference,
+                  "hookevents: the load path itself adds the same handles every cycle");
+        }
+        // 稳态实测：装载 +6、钩子门 +2（就是那两条无名事件）、卸载 -8，净 0。那 +6 里只有 4 个是本
+        // 模块的（命名清理事件 + 守卫 mutex/event/mapping）：同一次循环里 `DllMain(DETACH)` 只关这 4 个
+        // （没有钩子动作时），而句柄数仍然回到原值 ⇒ 另外 2 个由系统侧开、也由系统侧在 `FreeLibrary`
+        // 时关（带清单模块的装载器/激活上下文开销），不是本模块的归属。
+        check(armed_handles == loaded + 2,
+              "hookevents: the two unnamed hook events really exist before the unload");
+        check(released == plateau,
+              "hookevents: DETACH returns the unnamed hook events (no per-cycle growth)");
+    }
+    ui.shutdown();
+    return child_result("hookevents");
 }
 
 // 父进程侧的驱动器：每个场景一个**新进程**（守卫对象名按 pid+creation，DllMain 每进程只跑一次）。
@@ -1472,6 +1657,7 @@ void test_guard_child_scenarios() {
         {L"abandoned-idle", "guard-child abandoned-idle: the actor's provable clear works"},
         {L"actor-refs", "guard-child actor-refs: references survive FreeLibrary until the actor closes"},
         {L"reload", "guard-child reload: no keeper reference leaks per reload"},
+        {L"hookevents", "guard-child hookevents: the unnamed hook events are returned on DETACH"},
     };
     for (Case const& item : cases) {
         run_guard_child(item.scenario, item.label);
@@ -1494,6 +1680,7 @@ int run_guard_child_scenario(char const* scenario) {
         {"abandoned-idle", &child_abandoned_idle_recovered},
         {"actor-refs", &child_actor_held_references},
         {"reload", &child_reload_objects_gone},
+        {"hookevents", &child_hook_events_released},
     };
     for (Entry const& entry : entries) {
         if (std::strcmp(entry.name, scenario) == 0) {

@@ -490,6 +490,33 @@ bool hook_post_dangling() { return g.dangling.load(); }
 
 bool hook_post_armed() { return g.hook.load() != nullptr; }
 
+// `DllMain(DLL_PROCESS_DETACH)` 调用。条件与 `hook_post_retire` 的成功结论同构（见头文件注释）：
+// `completion_expected` 为假只可能来自"从来没装成过"或"收尾两道证明都拿到"，再叠上同一份状态机上
+// 的四条冗余印证（记录不在链上、没有在途回调、没有悬挂、没有待跑动作）。任何一条不成立就一个都不
+// 关：宁可让进程在退出前多持两个句柄，也绝不把回调还要用的事件提前关掉。
+//
+// 不取 `g.run_mutex`：DETACH 在加载器锁里，而这里读的全是原子量 + 两个只有本线程会写的 HANDLE 槽
+// 位；合作 actor 的纪律保证了此时没有投递/收尾在飞（否则 Stop 不会返回 1、actor 也不会 FreeLibrary）。
+void hook_post_release_owned_handles() noexcept {
+    bool const fully_retired = !g.completion_expected.load(std::memory_order_acquire) &&
+                               !g.dangling.load(std::memory_order_acquire) &&
+                               !g.pending.load(std::memory_order_acquire) &&
+                               !g.still_installed.load(std::memory_order_acquire) &&
+                               g.hook.load(std::memory_order_acquire) == nullptr &&
+                               g.in_flight.load(std::memory_order_acquire) == 0;
+    if (!fully_retired) {
+        return;
+    }
+    if (g.done != nullptr) {
+        ::CloseHandle(g.done);
+        g.done = nullptr;
+    }
+    if (g.published != nullptr) {
+        ::CloseHandle(g.published);
+        g.published = nullptr;
+    }
+}
+
 void hook_post_set_ack_window(HWND window) { g_ack_window_override = window; }
 
 #ifdef DESKFEED_PAYLOAD_PROBE_BUILD

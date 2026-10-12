@@ -139,6 +139,8 @@ bool command_parse(std::vector<std::wstring> const& args, Command& out, std::wst
             command.no_taskbar = true;
         } else if (arg == L"--hidden") {
             command.hidden = true;
+        } else if (arg == L"--frame-mailbox") {
+            command.frame_mailbox = true;
         } else {
             error = L"不认识的参数：" + arg;
             return false;
@@ -162,6 +164,18 @@ bool command_parse(std::vector<std::wstring> const& args, Command& out, std::wst
         command.no_taskbar = true;
         command.hidden = true;
     }
+    if (command.frame_mailbox) {
+        // 这条 seam 只给**按 scope 隔离的无界面**运行用：它建的是隔离命名空间里的共享内存与
+        // 通知事件，不碰界面也不注入，但绝不能在没给 scope 时打开——那会落到生产命名空间。
+        if (command.scope.empty()) {
+            error = L"--frame-mailbox 必须与 --scope 一起使用（它只用于隔离实例的离线验收）";
+            return false;
+        }
+        if (!command.no_taskbar) {
+            error = L"--frame-mailbox 必须与 --headless 或 --no-inject 一起使用";
+            return false;
+        }
+    }
     if (command.kind == CommandKind::Start && command.has_url) {
         command.kind = CommandKind::Apply;
     }
@@ -183,11 +197,15 @@ std::string command_usage() {
         "  --quit                    无条件正常退出运行中的实例\n"
         "  --inspect, --dump-state   查询运行中的实例并打印一行 JSON\n"
         "  --poll-ms / --retry-ms / --timeout-ms <毫秒>   随 --url 一起提交调度配置\n"
-        "  --scope <名字>            使用隔离的实例命名空间（测试用）\n"
+        "  --scope <名字>            使用隔离的实例命名空间（测试用；别名 --test-instance）\n"
+        "                            环境变量 DESKFEED_SCOPE / DESKFEED_TEST_INSTANCE 同义，\n"
+        "                            命令行优先；实例名只允许字母、数字、连字符与下划线，最长 32\n"
         "  --state-dir <目录>        本次运行改用指定目录里的 settings.ini\n"
         "  --headless, --mock        本次运行不显示悬浮窗、不碰任务栏（--mock 不伪造数据）\n"
         "  --no-inject, --no-taskbar 本次运行不碰任务栏\n"
         "  --hidden                  本次运行保持悬浮窗隐藏\n"
+        "  --frame-mailbox           按 scope 建隔离的显示邮箱（只给离线验收用；必须与\n"
+        "                            --scope 以及 --headless / --no-inject 同时出现）\n"
         "  -h, --help                这一段\n"
         "\n"
         "退出码: 0 命令被接受（或条件退出无需操作）；2 用法错误；3 PID 不合法；\n"

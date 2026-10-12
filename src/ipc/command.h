@@ -14,6 +14,8 @@
 //   --scope / --test-instance 隔离命名空间（测试用，见 docs/testing.md）
 //   --headless / --no-inject / --no-taskbar / --hidden / --mock  本次运行不碰界面与任务栏
 //   --state-dir <DIR>         覆盖设置文件所在目录（仅本次运行）
+//   --frame-mailbox           按 scope 建隔离的显示邮箱（只给离线验收用，必须与 --scope 和
+//                             --headless / --no-inject 同时出现）
 //   --poll-ms / --retry-ms / --timeout-ms  随 URL 一起提交调度配置
 namespace deskfeed {
 
@@ -49,6 +51,10 @@ struct Command {
     bool headless = false;   // 不显示悬浮窗，也不碰任务栏
     bool no_taskbar = false; // 不碰任务栏（不注入 explorer）
     bool hidden = false;     // 悬浮窗保持隐藏
+    // 显式要求建立隔离的显示邮箱。这不是“碰界面”：它只建一块按 scope 命名的共享内存与
+    // 一个通知事件，用来在无界面、不注入的前提下离线验收“主进程 → 显示面”这条 seam。
+    // 必须与 --scope 同时出现，否则会落到生产命名空间里。
+    bool frame_mailbox = false;
 };
 
 bool command_parse(std::vector<std::wstring> const& args, Command& out, std::wstring& error);

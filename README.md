@@ -15,9 +15,10 @@ DeskFeed 不解释业务数值。温度、百分比、币种、剩余量都只�
 | 单主进程 `deskfeed.exe`：单实例、命令通道、URL/PID 事务、生产者绑定 | 已实现 |
 | 取数：HTTP GET、200 才接纳、重定向与超时规则 | 已实现 |
 | 离线检查器 `deskfeed-check.exe` 与离线用例 `deskfeed-tests.exe` | 已实现 |
-| 任务栏真嵌入组件（`deskfeed-payload.dll`、显示邮箱） | **尚未实现**（Phase 2） |
-| 桌面悬浮窗 | **尚未实现**（Phase 3） |
+| 显示帧与显示邮箱（`src/display/`：主进程 → 显示面的 seam） | 已实现（含 `--frame-mailbox` 隔离验收通道） |
+| 任务栏真嵌入负载 `deskfeed-payload.dll` | **尚未实现**（Phase 2） |
 | `deskfeed-inject.exe`、`deskfeed-probe.exe` | **尚未实现**（Phase 2） |
+| 桌面悬浮窗 | **尚未实现**（Phase 3） |
 
 主进程目前是无界面后台进程：它取数、校验、维护状态机，并提供命令行控制与状态查询。
 任务栏与悬浮窗的路线与安全约束见 [任务栏注入计划](<docs/taskbar-injection.md>)。
@@ -27,25 +28,27 @@ DeskFeed 不解释业务数值。温度、百分比、币种、剩余量都只�
 前提：Windows 10/11 x64；生产端提供一个返回快照 JSON 的 HTTP 端点（可先用
 [示例生产端](<examples/producer/README.md>)，只需要 Node.js，无第三方依赖）。
 
+构建产物在 `.agent\build\debug\bin`（构建命令见 [docs/building.md](<docs/building.md>)）：
+
 ```
 :: 1. 启动示例生产端
 node examples\producer\minimal-producer.mjs --port 8099
 
 :: 2. 启动主进程（首个实例，指定地址）
-build\bin\deskfeed.exe --url "http://127.0.0.1:8099/snapshot"
+.agent\build\debug\bin\deskfeed.exe --url "http://127.0.0.1:8099/snapshot"
 
 :: 3. 另开一个终端查看运行状态
-build\bin\deskfeed.exe --inspect
+.agent\build\debug\bin\deskfeed.exe --inspect
 
 :: 4. 正常退出
-build\bin\deskfeed.exe --quit
+.agent\build\debug\bin\deskfeed.exe --quit
 ```
 
 离线校验一份快照文件、或直接量一次 HTTP 取数：
 
 ```
-build\bin\deskfeed-check.exe --file snapshot.json --report json
-build\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --report json
+.agent\build\debug\bin\deskfeed-check.exe --file snapshot.json --report json
+.agent\build\debug\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --report json
 ```
 
 ## 文档

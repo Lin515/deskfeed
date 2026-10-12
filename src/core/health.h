@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,12 @@ public:
 
     View view() const;
 
+    // 模型变更计数：每一次**真正改变显示模型**的操作 +1。
+    //
+    // 主进程用它做 O(1) 的“要不要重新发布一帧”判断：发布一帧要往跨进程 seqlock 里写
+    // 一兆多字节，而 tick() 每次循环都会被调用，空转的 tick 绝不能触发发布。
+    std::uint64_t revision() const { return revision_; }
+
 private:
     enum class Phase { Unconfigured, Waiting, Data };
 
@@ -95,6 +102,7 @@ private:
     FailureKind failure_ = FailureKind::NoUrl;
     std::string reason_;
     long long received_at_ms_ = 0;
+    std::uint64_t revision_ = 0;
 };
 
 }  // namespace deskfeed

@@ -34,6 +34,7 @@ void HealthState::clear_content() {
 
 void HealthState::set_configured(bool configured) {
     clear_content();
+    ++revision_;  // 换源/清缓存一定改变显示模型（内容清空、可能进入 waiting）
     if (configured) {
         phase_ = Phase::Waiting;
         failure_ = FailureKind::None;
@@ -54,17 +55,20 @@ void HealthState::apply_snapshot(Snapshot const& snapshot, long long now_ms) {
     phase_ = Phase::Data;
     failure_ = FailureKind::None;
     reason_.clear();
+    ++revision_;
 }
 
 void HealthState::apply_failure(FailureKind kind, std::string reason, long long now_ms) {
     (void)now_ms;  // 失败不改写“收到快照的绝对时间”，过期仍按快照自己的 expiresAtMs 判断。
     failure_ = kind == FailureKind::None ? FailureKind::Internal : kind;
     reason_ = std::move(reason);
+    ++revision_;
 }
 
 void HealthState::tick(long long now_ms) {
     if (has_snapshot_ && !expired_ && snapshot_.has_expires_at && now_ms >= snapshot_.expires_at_ms) {
         expired_ = true;
+        ++revision_;  // 只有真的翻转才 +1：tick 每次循环都跑，空转不能触发发布
     }
 }
 

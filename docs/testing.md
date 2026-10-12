@@ -13,19 +13,27 @@ ctest --test-dir .agent/build/debug --output-on-failure
 
 `deskfeed-tests.exe` 覆盖：JSON 严格解析与深度上限、`expiresAtMs` 的数值整数语义、容量边界、
 单行/空白判据、完整替换、失效与恢复、独立到期与不续期、首份即过期、调度夹取、命令行解析、
-实例名白名单、控制通道线格式、地址解析/脱敏/点段合并、设置文件保留其它键、进程绑定的“已退出”拒绝。
-全部离线：不读凭据、不联网、不注入、不碰用户正在跑的实例。
+实例名白名单、控制通道线格式、地址解析/脱敏/点段合并、设置文件保留其它键、进程绑定的“已退出”拒绝、
+回环 HTTP 的整次墙钟预算与取消、显示帧编解码与显示邮箱（每次读的帧头校验、生产者退出后不再交出
+陈旧帧、消费者始终绑定原生产者身份）、检查器输出的严格 JSON 与 `--stdin` 的管道输入。
+全部离线：不读凭据、不连外网、不注入、不碰用户正在跑的实例（回环用例只连 `127.0.0.1`）。
 
 ## 离线检查器
 
+产物在 `.agent/build/debug/bin`（见 [building.md](building.md)），下面统一用这个路径：
+
 ```powershell
-.\build\bin\deskfeed-check.exe --file snapshot.json --report json
-.\build\bin\deskfeed-check.exe --stdin --report json < snapshot.json
-.\build\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --timeout-ms 8000 --report json
-.\build\bin\deskfeed-check.exe --help
+.\.agent\build\debug\bin\deskfeed-check.exe --file snapshot.json --report json
+.\.agent\build\debug\bin\deskfeed-check.exe --stdin --report json < snapshot.json
+.\.agent\build\debug\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --timeout-ms 8000 --report json
+.\.agent\build\debug\bin\deskfeed-check.exe --help
 ```
 
-退出码：`0` 接受、`2` 拒绝（HTTP 或校验）、`1` 用法/内部错误。`--report json` 的输出形状：
+`--stdin` 按**字节流**读取，文件重定向（上面的 `< snapshot.json`）与管道
+（`... | deskfeed-check --stdin`、或程序化起子进程喂管道）都支持。
+
+退出码：`0` 接受、`2` 拒绝（HTTP 或校验）、`1` 用法/内部错误。`--report json` 的输出形状
+——**接受与拒绝两条路径都是一行合法 JSON**，可以直接交给任何严格解析器：
 
 ```json
 {"accept":true,"kind":"none","message":"","bodyBytes":210,"version":1,"expiresAtMs":1791825470141,
@@ -36,6 +44,10 @@ ctest --test-dir .agent/build/debug --output-on-failure
 `required-field` / `field-type` / `field-limit` / `item-count` / `duplicate-id` / `empty-id` /
 `invalid-state` / `blank` / `single-line` / `expiry`）或 HTTP 失败名（`invalid-url` / `connect` /
 `timeout` / `send` / `receive` / `redirect` / `http-status` / `too-large` / `empty`）。
+
+`expiry` 表示 **`expiresAtMs` 这个字段本身非法**（类型或取值范围不对），不是“快照已经过期”：
+结构合法但时间已过的快照属于**接受**（首份也接纳，只是整体染红），见
+[protocol.md](protocol.md) 的失效与到期规则。
 没有 `--insecure` 之类的 TLS 绕过开关，这是刻意的。
 
 ## mock 生产端
@@ -52,7 +64,7 @@ node examples\producer\minimal-producer.mjs --port 8099
 验收脚本只能在**隔离实例**上跑，绝不能碰用户的生产实例，更不能碰 `explorer.exe`：
 
 ```powershell
-$bin = "build\bin"
+$bin = ".agent\build\debug\bin"
 node examples\producer\minimal-producer.mjs --port 8099   # 另开一个窗口
 
 # 用隔离命名空间 + 无界面 + 不注入 启动主实例

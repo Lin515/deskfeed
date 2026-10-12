@@ -8,8 +8,9 @@
 
 // 极简只读 JSON 解析器（RFC 8259），专供快照协议使用。
 //
-// 引入它的理由：这一层要跑在 explorer.exe 里，而它读的 JSON 形状由本协议自身规定；
-// 为它拉一个第三方库，或引入 Windows.Data.Json 那层 WinRT 依赖都不划算。
+// 引入它的理由：它读的 JSON 形状由本协议自身规定，为它拉一个第三方库、或引入
+// Windows.Data.Json 那层 WinRT 依赖都不划算。它**只跑在主进程里**：任务栏负载 DLL 读的是
+// 主进程已经算好的显示帧，自己不做任何 JSON 解析（见 docs/architecture.md 的 seam 表）。
 // 这里只实现取值需要的那部分：对象、数组、字符串（含 \uXXXX 与代理对）、数字、布尔与 null。
 //
 // 与“宽容解析”的差别（协议要求严格校验，见 docs/protocol.md）：

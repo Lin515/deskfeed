@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -54,6 +56,17 @@ namespace {
 
 // 单调时钟，只用于用例里的“不许拖过预算”这类计时断言。
 long long tick_ms() { return static_cast<long long>(::GetTickCount64()); }
+
+// 墙钟 Unix 毫秒：协议里的 expiresAtMs 就是这个域。与进程内的绝对时间比较必须用它，
+// 不能拿单调时钟凑（两者不能互相换算）。
+long long unix_ms() {
+    FILETIME file_time{};
+    ::GetSystemTimeAsFileTime(&file_time);
+    ULARGE_INTEGER value{};
+    value.LowPart = file_time.dwLowDateTime;
+    value.HighPart = file_time.dwHighDateTime;
+    return static_cast<long long>(value.QuadPart / 10000ULL) - 11644473600000LL;
+}
 
 std::string body_with(std::string const& items, std::string const& extra = std::string()) {
     return "{\"version\":1,\"items\":" + items + extra + "}";
@@ -1125,6 +1138,277 @@ TEST(display_mailbox_concurrent_publish_never_yields_a_torn_frame) {
     producer.close();
 }
 
+// ---- 显示邮箱：attach 之后的帧头篡改 / 生产者退出 / 身份被换 -----------------
+//
+// 这三条补的都是“只在 attach 时校验一次”留下的空洞：attach 通过之后，同一块 section 仍可能被
+// 改写（旧生产者没退干净，或者同名 section 被新生产者重新建起来）。三条都必须在**读**这一侧挡住，
+// 而不是靠 attach 时的历史结论。
+
+namespace {
+
+// 按名字把同一块 section 映射成可写，用来在本进程里伪造“帧头被改过”。
+class RawMailboxView {
+public:
+    ~RawMailboxView() { close(); }
+
+    bool open(std::wstring const& scope, std::string& error) {
+        close();
+        std::wstring const name = display_frame_map_name(scope);
+        mapping_ = ::OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name.c_str());
+        if (mapping_ == nullptr) {
+            error = "打不开显示邮箱共享内存";
+            return false;
+        }
+        view_ =
+            ::MapViewOfFile(mapping_, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, kFrameSharedBytes);
+        if (view_ == nullptr) {
+            close();
+            error = "映射不了显示邮箱";
+            return false;
+        }
+        return true;
+    }
+
+    FrameSharedHeader* header() const { return reinterpret_cast<FrameSharedHeader*>(view_); }
+
+    void close() {
+        if (view_ != nullptr) {
+            ::UnmapViewOfFile(view_);
+            view_ = nullptr;
+        }
+        if (mapping_ != nullptr) {
+            ::CloseHandle(mapping_);
+            mapping_ = nullptr;
+        }
+    }
+
+private:
+    HANDLE mapping_ = nullptr;
+    void* view_ = nullptr;
+};
+
+// 本用例程序自己的路径：子模式用它再起一个真正的“别的生产者进程”。
+std::wstring test_executable_path() {
+    wchar_t buffer[4096];
+    DWORD const size = ::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+    return std::wstring(buffer, size);
+}
+
+// 用本程序自己的 `--mailbox-owner` 子模式起一个独立生产者进程。
+// “生产者退出”与“身份被换”必须是真的跨进程，同一个进程里造不出来。
+class ChildProducer {
+public:
+    ~ChildProducer() { stop(); }
+
+    bool start(std::wstring const& scope, unsigned hold_ms, std::string& error) {
+        stop();
+        std::wstring const exe = test_executable_path();
+        std::wstring const command = L"\"" + exe + L"\" --mailbox-owner " + scope +
+                                     L" --hold-ms " + std::to_wstring(hold_ms);
+        std::vector<wchar_t> mutable_command(command.begin(), command.end());
+        mutable_command.push_back(L'\0');
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info{};
+        if (::CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info) == FALSE) {
+            error = "起不了子生产者进程";
+            return false;
+        }
+        ::CloseHandle(info.hThread);
+        process_ = info.hProcess;
+        return true;
+    }
+
+    bool wait(unsigned timeout_ms) {
+        if (process_ == nullptr) {
+            return true;
+        }
+        return ::WaitForSingleObject(process_, timeout_ms) == WAIT_OBJECT_0;
+    }
+
+    // 模拟崩溃：不发任何收尾信号，直接结束。
+    void kill() {
+        if (process_ != nullptr) {
+            ::TerminateProcess(process_, 1);
+            ::WaitForSingleObject(process_, 5000);
+        }
+    }
+
+    void stop() {
+        if (process_ != nullptr) {
+            ::TerminateProcess(process_, 0);
+            ::WaitForSingleObject(process_, 5000);
+            ::CloseHandle(process_);
+            process_ = nullptr;
+        }
+    }
+
+private:
+    HANDLE process_ = nullptr;
+};
+
+// 子模式本体：建邮箱、发一帧、按住不放。崩溃由父进程直接结束本进程来模拟。
+int mailbox_owner_child(std::wstring const& scope, unsigned hold_ms) {
+    DisplayFrameProducer producer;
+    std::string error;
+    if (!producer.create(scope, nullptr, error)) {
+        return 3;
+    }
+    if (!producer.publish(sample_frame(), 111)) {
+        return 4;
+    }
+    ::Sleep(hold_ms);
+    return 0;
+}
+
+// 生产者进程刚起来时帧头可能还没写完，attach 允许重试。
+bool attach_with_retry(DisplayFrameConsumer& consumer, std::wstring const& scope, int tries) {
+    std::string error;
+    for (int attempt = 0; attempt < tries; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(display_mailbox_rejects_malformed_header_after_attach) {
+    // attach 之后把帧头逐项改坏，每一次 read() 都必须拒绝；改回来之后必须重新读到。
+    // 依据是“版本与一致性在**每次读**上成立”，不是只在 attach 上成立。
+    DisplayFrameProducer producer;
+    std::string error;
+    CHECK(producer.create(L"mbox-tamper", nullptr, error));
+    CHECK(producer.publish(sample_frame(), 4321));
+
+    DisplayFrameConsumer consumer;
+    CHECK(consumer.attach(L"mbox-tamper", error));
+
+    Frame read;
+    CHECK(consumer.read(read));  // 基线：未篡改时读得到
+    CHECK_EQ(read.items.size(), static_cast<std::size_t>(2));
+
+    RawMailboxView raw;
+    CHECK(raw.open(L"mbox-tamper", error));
+    FrameSharedHeader* const header = raw.header();
+    CHECK(header != nullptr);
+
+    std::uint32_t const item_count = header->item_count;
+    std::uint32_t const kind = header->kind;
+    std::uint32_t const alarm = header->alarm;
+    std::uint32_t const failure = header->failure;
+    std::uint32_t const flags = header->flags;
+
+    auto expect_rejected = [&](char const* what) {
+        Frame out;
+        if (consumer.read(out)) {
+            ::testing::report_failure(std::string("篡改帧头后仍被接受：") + what);
+        }
+    };
+
+    header->version = 99;
+    expect_rejected("version");
+    header->version = kFrameVersion;
+    header->magic = 0;
+    expect_rejected("magic");
+    header->magic = kFrameMagic;
+    header->header_bytes = 8;
+    expect_rejected("header_bytes");
+    header->header_bytes = static_cast<std::uint32_t>(sizeof(FrameSharedHeader));
+    header->capacity = 12345;
+    expect_rejected("capacity");
+    header->capacity = static_cast<std::uint32_t>(kFrameSharedBytes);
+    header->payload_capacity = 1;
+    expect_rejected("payload_capacity");
+    header->payload_capacity = static_cast<std::uint32_t>(kFramePayloadCapacity);
+    header->flags = flags | 0x8000u;
+    expect_rejected("未知 flag 位");
+    header->flags = flags;
+    // 下面四条是**重复元数据**：数值都留在各自合法范围内，所以只有“与帧体一致”这一条能挡住它。
+    header->item_count = item_count + 1;
+    expect_rejected("item_count 与 items 不符");
+    header->item_count = item_count;
+    header->kind = kind == 0 ? 1u : 0u;
+    expect_rejected("kind 与帧体不符");
+    header->kind = kind;
+    header->alarm = alarm ^ 1u;
+    expect_rejected("alarm 与帧体不符");
+    header->alarm = alarm;
+    header->failure = failure == 3 ? 4u : 3u;
+    expect_rejected("failure 与帧体不符");
+    header->failure = failure;
+
+    // 全部改回来之后必须重新可读：否则上面那些 false 可能只是因为邮箱被彻底弄坏了。
+    CHECK(consumer.read(read));
+    CHECK_EQ(read.generation, static_cast<std::uint64_t>(1));
+
+    raw.close();
+    consumer.detach();
+    producer.close();
+}
+
+TEST(display_mailbox_refuses_frames_after_producer_exit) {
+    // 生产者退出之后 section 还活着（这边的句柄还在），里面也仍有一帧合法内容。
+    // read() 必须拒绝：已经死掉的主进程不能再提供可绘制的帧。
+    ChildProducer child;
+    std::string error;
+    CHECK(child.start(L"mbox-dead", 30000, error));
+
+    DisplayFrameConsumer consumer;
+    CHECK(attach_with_retry(consumer, L"mbox-dead", 250));
+    CHECK(consumer.producer_running());
+    Frame read;
+    CHECK(consumer.read(read));
+    CHECK_EQ(read.items.size(), static_cast<std::size_t>(2));
+
+    child.kill();
+    CHECK(child.wait(5000));
+    CHECK(!consumer.producer_running());
+
+    Frame stale;
+    CHECK(!consumer.read(stale));  // 陈旧帧不许再交出去
+
+    consumer.detach();
+}
+
+TEST(display_mailbox_stays_bound_to_the_original_owner) {
+    // 原生产者**还活着**，但同名的 section 被另一个进程重新建起来并改写了帧头里的身份。
+    // 消费者绑定的必须是 attach 时那个活动句柄对应的身份，不能接受新主人的帧。
+    ChildProducer first;
+    std::string error;
+    CHECK(first.start(L"mbox-rebind", 30000, error));
+
+    DisplayFrameConsumer consumer;
+    CHECK(attach_with_retry(consumer, L"mbox-rebind", 250));
+    Frame read;
+    CHECK(consumer.read(read));
+
+    // 第二个进程用同一个 scope 建同一块 section：create() 会覆盖帧头里的身份。
+    ChildProducer second;
+    CHECK(second.start(L"mbox-rebind", 8000, error));
+
+    bool refused = false;
+    for (int attempt = 0; attempt < 250 && !refused; ++attempt) {
+        Frame out;
+        if (!consumer.read(out)) {
+            refused = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(refused);
+    // 关键：原主人仍然活着，所以挡下这一帧的必须是**身份校验**，而不是“生产者已退出”。
+    CHECK(consumer.producer_running());
+
+    consumer.detach();
+    second.stop();
+    first.stop();
+}
+
 // ---- 回环 mock 生产端 ------------------------------------------------------
 //
 // 这一组用例只碰 127.0.0.1：给 HTTP 层量“整次墙钟预算”与取消。慢头部与慢滴流正是旧实现
@@ -1336,6 +1620,24 @@ private:
             }
             return;
         }
+        if (path == "/expires-soon") {
+            // 一份**刚收到就已经定好很快到期**的合法快照：取数本身成功，到期由主进程按绝对
+            // 时间独立判定。用例用它验“到期那一刻显示面就该看到整体失效”，不等下一次轮询。
+            long long const expires_at = unix_ms() + 800;
+            std::string const body =
+                "{\"version\":1,\"expiresAtMs\":" + std::to_string(expires_at) +
+                ",\"items\":[{\"id\":\"cpu\",\"label\":\"CPU\",\"value\":\"54\"}]}";
+            send_response(client, body, "200 OK");
+            return;
+        }
+        if (path == "/hang") {
+            // 收下请求但永远不回答：整次取数只能由主进程的墙钟预算叫停。用例用它验
+            // “截止失败那一刻显示面就该看到整体失效”，不等下一次重试。
+            for (int slept = 0; slept < 20000 && !stop_.load(); slept += 50) {
+                ::Sleep(50);
+            }
+            return;
+        }
         if (path == "/oversized") {
             // 正文超过 1 MiB 上限：客户端必须边读边拒绝，不等读完。
             std::size_t const size = kMaxBodyBytes + 4096;
@@ -1530,9 +1832,691 @@ TEST(http_get_abort_mid_read_keeps_context_and_buffer_alive) {
     }
 }
 
-// ---- 主入口 ----------------------------------------------------------------
+// ---- 检查器：机器可读输出与 stdin 管道 -------------------------------------
+//
+// 这两个用例都**只认实际输出**，不认退出码：缺陷 1 是接受路径多出一个 `}`（退出码本来就是 0），
+// 缺陷 2 是管道 stdin 被当成读取失败。两者都只能在真实子进程上验——也正是它们当初漏掉的原因。
+
+namespace {
+
+int g_temp_file_counter = 0;
+
+std::wstring check_executable_path() {
+    std::wstring const self = test_executable_path();
+    std::size_t const slash = self.find_last_of(L"\\/");
+    std::wstring const dir =
+        slash == std::wstring::npos ? std::wstring() : self.substr(0, slash + 1);
+    return dir + L"deskfeed-check.exe";
+}
+
+class TempFile {
+public:
+    ~TempFile() { remove(); }
+
+    bool write(std::string const& bytes, char const* suffix, std::string& error) {
+        remove();
+        wchar_t directory[MAX_PATH]{};
+        if (::GetTempPathW(static_cast<DWORD>(std::size(directory)), directory) == 0) {
+            error = "拿不到临时目录";
+            return false;
+        }
+        path_ = std::wstring(directory) + L"deskfeed-tests-" +
+                std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                std::to_wstring(++g_temp_file_counter) + L"-" +
+                std::wstring(suffix, suffix + std::strlen(suffix));
+        HANDLE const file =
+            ::CreateFileW(path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            error = "建不了临时文件";
+            path_.clear();
+            return false;
+        }
+        DWORD written = 0;
+        bool const ok = ::WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written,
+                                    nullptr) != FALSE &&
+                        written == bytes.size();
+        ::CloseHandle(file);
+        if (!ok) {
+            error = "写不了临时文件";
+            return false;
+        }
+        return true;
+    }
+
+    std::wstring const& path() const { return path_; }
+
+    void remove() {
+        if (!path_.empty()) {
+            ::DeleteFileW(path_.c_str());
+            path_.clear();
+        }
+    }
+
+private:
+    std::wstring path_;
+};
+
+struct CheckResult {
+    DWORD exit_code = 0;
+    std::string out;
+    std::string err;
+};
+
+// 起一次真实的 deskfeed-check.exe。stdin 可以是管道（程序化调用者的常规形态）或文件句柄
+// （等价于 shell 的 `< file`）——两条路都必须能用。
+class CheckRun {
+public:
+    enum class Stdin { None, Pipe, File };
+
+    ~CheckRun() { close(); }
+
+    bool start(std::vector<std::wstring> const& args, Stdin stdin_mode,
+               std::wstring const& stdin_file, std::string& error) {
+        close();
+        std::wstring const exe = check_executable_path();
+        std::wstring command = L"\"" + exe + L"\"";
+        for (std::wstring const& arg : args) {
+            command += arg.find(L' ') == std::wstring::npos ? (L" " + arg)
+                                                            : (L" \"" + arg + L"\"");
+        }
+        std::vector<wchar_t> mutable_command(command.begin(), command.end());
+        mutable_command.push_back(L'\0');
+
+        SECURITY_ATTRIBUTES inheritable{};
+        inheritable.nLength = sizeof(inheritable);
+        inheritable.bInheritHandle = TRUE;
+
+        HANDLE child_stdout = nullptr;
+        HANDLE child_stderr = nullptr;
+        HANDLE child_stdin = nullptr;
+        if (::CreatePipe(&stdout_read_, &child_stdout, &inheritable, 0) == FALSE) {
+            error = "CreatePipe(stdout) 失败";
+            close();
+            return false;
+        }
+        ::SetHandleInformation(stdout_read_, HANDLE_FLAG_INHERIT, 0);
+        if (::CreatePipe(&stderr_read_, &child_stderr, &inheritable, 0) == FALSE) {
+            error = "CreatePipe(stderr) 失败";
+            close();
+            return false;
+        }
+        ::SetHandleInformation(stderr_read_, HANDLE_FLAG_INHERIT, 0);
+
+        if (stdin_mode == Stdin::Pipe) {
+            HANDLE parent_write = nullptr;
+            if (::CreatePipe(&child_stdin, &parent_write, &inheritable, 0) == FALSE) {
+                error = "CreatePipe(stdin) 失败";
+                close();
+                return false;
+            }
+            ::SetHandleInformation(parent_write, HANDLE_FLAG_INHERIT, 0);
+            stdin_write_ = parent_write;
+        } else if (stdin_mode == Stdin::File) {
+            child_stdin = ::CreateFileW(stdin_file.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                        &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (child_stdin == INVALID_HANDLE_VALUE) {
+                error = "打不开当 stdin 的文件";
+                close();
+                return false;
+            }
+        } else {
+            child_stdin = ::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        &inheritable, OPEN_EXISTING, 0, nullptr);
+            if (child_stdin == INVALID_HANDLE_VALUE) {
+                error = "打不开 NUL";
+                close();
+                return false;
+            }
+        }
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = child_stdin;
+        startup.hStdOutput = child_stdout;
+        startup.hStdError = child_stderr;
+
+        PROCESS_INFORMATION info{};
+        BOOL const created =
+            ::CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info);
+        // 这几端已经交给子进程，父进程不该再持有它们——否则管道永远等不到 EOF。
+        ::CloseHandle(child_stdout);
+        ::CloseHandle(child_stderr);
+        ::CloseHandle(child_stdin);
+        if (created == FALSE) {
+            error = "起不了 deskfeed-check.exe（" + utf8_from_wide(exe) + "）";
+            close();
+            return false;
+        }
+        ::CloseHandle(info.hThread);
+        process_ = info.hProcess;
+        return true;
+    }
+
+    bool write_stdin(std::string const& bytes) {
+        if (stdin_write_ == nullptr) {
+            return false;
+        }
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            DWORD written = 0;
+            if (::WriteFile(stdin_write_, bytes.data() + offset,
+                            static_cast<DWORD>(bytes.size() - offset), &written, nullptr) == FALSE ||
+                written == 0) {
+                return false;
+            }
+            offset += written;
+        }
+        return true;
+    }
+
+    void close_stdin() {
+        if (stdin_write_ != nullptr) {
+            ::CloseHandle(stdin_write_);
+            stdin_write_ = nullptr;
+        }
+    }
+
+    bool finish(CheckResult& result, unsigned timeout_ms) {
+        close_stdin();
+        drain(stdout_read_, result.out);
+        drain(stderr_read_, result.err);
+        if (process_ == nullptr) {
+            return false;
+        }
+        if (::WaitForSingleObject(process_, timeout_ms) != WAIT_OBJECT_0) {
+            return false;
+        }
+        DWORD code = 0;
+        if (::GetExitCodeProcess(process_, &code) == FALSE) {
+            return false;
+        }
+        result.exit_code = code;
+        return true;
+    }
+
+    void close() {
+        close_stdin();
+        for (HANDLE* handle : {&stdout_read_, &stderr_read_}) {
+            if (*handle != nullptr) {
+                ::CloseHandle(*handle);
+                *handle = nullptr;
+            }
+        }
+        if (process_ != nullptr) {
+            if (::WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) {
+                ::TerminateProcess(process_, 1);
+                ::WaitForSingleObject(process_, 5000);
+            }
+            ::CloseHandle(process_);
+            process_ = nullptr;
+        }
+    }
+
+private:
+    static void drain(HANDLE handle, std::string& out) {
+        if (handle == nullptr) {
+            return;
+        }
+        char buffer[4096];
+        for (;;) {
+            DWORD read = 0;
+            if (::ReadFile(handle, buffer, sizeof(buffer), &read, nullptr) == FALSE || read == 0) {
+                break;
+            }
+            out.append(buffer, read);
+        }
+    }
+
+    HANDLE process_ = nullptr;
+    HANDLE stdin_write_ = nullptr;
+    HANDLE stdout_read_ = nullptr;
+    HANDLE stderr_read_ = nullptr;
+};
+
+// 一条合法快照：接受路径的 report json 必须能被称为严格 JSON 的解析器吃下去。
+std::string accept_body() {
+    return "{\"version\":1,\"items\":[{\"id\":\"a\",\"label\":\"A\",\"value\":\"V\"}]}";
+}
+
+// 主进程产物路径：与用例在同一个 bin 目录。
+std::wstring master_executable_path() {
+    std::wstring const self = test_executable_path();
+    std::size_t const slash = self.find_last_of(L"\\/");
+    std::wstring const dir =
+        slash == std::wstring::npos ? std::wstring() : self.substr(0, slash + 1);
+    return dir + L"deskfeed.exe";
+}
+
+// 隔离实例自己用的临时目录。收尾只删自己写进去的东西。
+class TempDirectory {
+public:
+    ~TempDirectory() { remove(); }
+
+    bool create(std::string& error) {
+        remove();
+        wchar_t base[MAX_PATH]{};
+        if (::GetTempPathW(static_cast<DWORD>(std::size(base)), base) == 0) {
+            error = "拿不到临时目录";
+            return false;
+        }
+        path_ = std::wstring(base) + L"deskfeed-tests-" +
+                std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                std::to_wstring(++g_temp_file_counter) + L"-dir";
+        if (::CreateDirectoryW(path_.c_str(), nullptr) == FALSE) {
+            error = "建不了临时目录";
+            path_.clear();
+            return false;
+        }
+        return true;
+    }
+
+    std::wstring const& path() const { return path_; }
+
+    void remove() {
+        if (!path_.empty()) {
+            ::DeleteFileW((path_ + L"\\settings.ini").c_str());
+            ::RemoveDirectoryW(path_.c_str());  // 非空会失败，正好不会误删
+            path_.clear();
+        }
+    }
+
+private:
+    std::wstring path_;
+};
+
+// 起一个子进程并持有它的句柄（用来跑真实的 deskfeed.exe）。
+class ChildProcess {
+public:
+    ~ChildProcess() { stop(); }
+
+    bool start(std::wstring const& exe, std::vector<std::wstring> const& args, std::string& error) {
+        stop();
+        std::wstring command = L"\"" + exe + L"\"";
+        for (std::wstring const& arg : args) {
+            command += arg.find(L' ') == std::wstring::npos ? (L" " + arg)
+                                                            : (L" \"" + arg + L"\"");
+        }
+        std::vector<wchar_t> mutable_command(command.begin(), command.end());
+        mutable_command.push_back(L'\0');
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info{};
+        if (::CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info) == FALSE) {
+            error = "起不了子进程：" + utf8_from_wide(exe);
+            return false;
+        }
+        ::CloseHandle(info.hThread);
+        process_ = info.hProcess;
+        return true;
+    }
+
+    bool wait(unsigned timeout_ms) {
+        return process_ != nullptr &&
+               ::WaitForSingleObject(process_, timeout_ms) == WAIT_OBJECT_0;
+    }
+
+    void stop() {
+        if (process_ != nullptr) {
+            if (::WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) {
+                ::TerminateProcess(process_, 1);
+                ::WaitForSingleObject(process_, 5000);
+            }
+            ::CloseHandle(process_);
+            process_ = nullptr;
+        }
+    }
+
+private:
+    HANDLE process_ = nullptr;
+};
+
+// 收掉隔离实例留下的两处痕迹：--state-dir 里的设置文件，以及隔离日志目录里的日志。
+// 两处都只在**变空之后**才删目录，所以不会误删别人的东西。
+void cleanup_isolated_instance(std::wstring const& scope, std::wstring const& state_dir) {
+    if (!state_dir.empty()) {
+        ::DeleteFileW((state_dir + L"\\settings.ini").c_str());
+        ::RemoveDirectoryW(state_dir.c_str());
+    }
+    std::wstring const log = deskfeed_log_path(scope);
+    if (!log.empty()) {
+        ::DeleteFileW(log.c_str());
+        std::size_t const slash = log.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            ::RemoveDirectoryW(log.substr(0, slash).c_str());
+        }
+    }
+}
+
+}  // namespace
+
+TEST(check_report_json_accept_path_is_strict_json) {
+    std::string error;
+    TempFile file;
+    CHECK(file.write(accept_body(), "accept.json", error));
+
+    CheckRun run;
+    CHECK(run.start({L"--file", file.path(), L"--report", L"json"}, CheckRun::Stdin::None, L"",
+                    error));
+    CheckResult result;
+    CHECK(run.finish(result, 30000));
+    CHECK_EQ(result.exit_code, static_cast<DWORD>(0));
+    CHECK_EQ(result.err, std::string(""));
+
+    // 关键断言：多余的那个 `}` 会让严格解析器整份拒绝。退出码本来就是 0，所以只看退出码
+    // 永远抓不到这个缺陷。
+    deskfeed::JsonValue parsed;
+    std::string parse_error;
+    CHECK(deskfeed::json_parse(result.out, parsed, parse_error));
+    CHECK(parsed.is_object());
+    deskfeed::JsonValue const* accept = parsed.member("accept");
+    CHECK(accept != nullptr && accept->is_bool() && accept->boolean);
+    deskfeed::JsonValue const* kind = parsed.member("kind");
+    CHECK(kind != nullptr && kind->is_string());
+    CHECK_EQ(kind->text, std::string("none"));
+    deskfeed::JsonValue const* items = parsed.member("items");
+    CHECK(items != nullptr && items->is_array());
+    CHECK_EQ(items->items.size(), static_cast<std::size_t>(1));
+}
+
+TEST(check_report_json_reject_path_is_strict_json) {
+    std::string error;
+    TempFile file;
+    CHECK(file.write("{\"version\":2,\"items\":[]}", "reject.json", error));
+
+    CheckRun run;
+    CHECK(run.start({L"--file", file.path(), L"--report", L"json"}, CheckRun::Stdin::None, L"",
+                    error));
+    CheckResult result;
+    CHECK(run.finish(result, 30000));
+    CHECK_EQ(result.exit_code, static_cast<DWORD>(2));
+
+    deskfeed::JsonValue parsed;
+    std::string parse_error;
+    CHECK(deskfeed::json_parse(result.out, parsed, parse_error));
+    deskfeed::JsonValue const* accept = parsed.member("accept");
+    CHECK(accept != nullptr && accept->is_bool() && !accept->boolean);
+    deskfeed::JsonValue const* kind = parsed.member("kind");
+    CHECK(kind != nullptr && kind->is_string());
+    CHECK_EQ(kind->text, std::string("version"));
+}
+
+TEST(check_stdin_accepts_a_pipe) {
+    // 程序化调用者（Node / Python 起子进程、任何 `... | deskfeed-check`）给的就是管道。
+    // 旧实现把管道写端关闭后的 ERROR_BROKEN_PIPE 当成读取失败，这里必须是 0 且输出可解析。
+    std::string error;
+    CheckRun run;
+    CHECK(run.start({L"--stdin", L"--report", L"json"}, CheckRun::Stdin::Pipe, L"", error));
+    CHECK(run.write_stdin(accept_body()));
+
+    CheckResult result;
+    CHECK(run.finish(result, 30000));
+    CHECK_EQ(result.exit_code, static_cast<DWORD>(0));
+    CHECK_EQ(result.err, std::string(""));
+
+    deskfeed::JsonValue parsed;
+    std::string parse_error;
+    CHECK(deskfeed::json_parse(result.out, parsed, parse_error));
+    deskfeed::JsonValue const* accept = parsed.member("accept");
+    CHECK(accept != nullptr && accept->is_bool() && accept->boolean);
+}
+
+TEST(check_stdin_accepts_a_file_handle) {
+    // 另一半：shell 的 `< file` 是文件句柄，不能因为修管道而弄坏它。
+    std::string error;
+    TempFile file;
+    CHECK(file.write(accept_body(), "stdin.json", error));
+
+    CheckRun run;
+    CHECK(run.start({L"--stdin", L"--report", L"json"}, CheckRun::Stdin::File, file.path(), error));
+    CheckResult result;
+    CHECK(run.finish(result, 30000));
+    CHECK_EQ(result.exit_code, static_cast<DWORD>(0));
+
+    deskfeed::JsonValue parsed;
+    std::string parse_error;
+    CHECK(deskfeed::json_parse(result.out, parsed, parse_error));
+    deskfeed::JsonValue const* accept = parsed.member("accept");
+    CHECK(accept != nullptr && accept->is_bool() && accept->boolean);
+}
+
+TEST(master_publishes_frames_into_a_scoped_mailbox) {
+    // “主进程 → 显示邮箱”这条 seam 的离线验收：真实 master 进程 + 隔离 scope + 回环 mock。
+    // 这正是 --frame-mailbox 存在的理由——不建窗口、不注入、不碰生产命名空间，也能验这条通道。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"mbframe-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/ok"), L"--poll-ms", L"1000"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    // 启动时 force 发布的那一帧是 waiting；回环取数回来之后必须变成内容帧。
+    Frame frame;
+    bool got_content = false;
+    for (int attempt = 0; attempt < 300 && !got_content; ++attempt) {
+        if (consumer.read(frame) && frame.kind == ViewKind::Content && !frame.items.empty()) {
+            got_content = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(got_content);
+    CHECK_EQ(frame.items.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(frame.items[0].id, std::string("cpu"));
+    CHECK(!frame.closed);
+
+    // 正常退出走控制通道。master 退出之后 read() 必须拒绝：已经死掉的生产者不再提供可绘制帧。
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    CHECK(!consumer.producer_running());
+    Frame after;
+    CHECK(!consumer.read(after));
+
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+// 读到一帧的**生产者时刻**（frame.produced_at_ms）——比“用例这边什么时候读到”更接近真实
+// 显示面看到它的时刻，也去掉了用例轮询间隔带来的抖动。
+long long produced_at_ms(Frame const& frame) { return frame.produced_at_ms; }
+
+// 显示面“已经整体失效”的判据：内容帧要求 alarm（有值且全红）；无内容的帧要求 kind == Error。
+bool frame_shows_alarm(Frame const& frame) {
+    if (frame.kind == ViewKind::Content) {
+        return frame.alarm;
+    }
+    if (frame.kind == ViewKind::Error) {
+        return true;
+    }
+    return false;
+}
+
+// 等到“显示面已经看到整体失效”，返回它被生产出来的时刻；超时报 -1。
+long long wait_for_alarm(DisplayFrameConsumer const& consumer, long long timeout_ms) {
+    long long const deadline = tick_ms() + timeout_ms;
+    Frame frame;
+    for (;;) {
+        if (consumer.read(frame) && frame_shows_alarm(frame)) {
+            return produced_at_ms(frame);
+        }
+        if (tick_ms() >= deadline) {
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// 等到第一帧“有条目的内容帧”，返回它被生产出来的时刻；超时报 -1。
+long long wait_for_content(DisplayFrameConsumer const& consumer, long long timeout_ms) {
+    long long const deadline = tick_ms() + timeout_ms;
+    Frame frame;
+    for (;;) {
+        if (consumer.read(frame) && frame.kind == ViewKind::Content && !frame.items.empty()) {
+            return produced_at_ms(frame);
+        }
+        if (tick_ms() >= deadline) {
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+TEST(master_publishes_expiry_into_the_mailbox_before_the_next_poll) {
+    // 到期是**主进程按绝对时间独立判定**的：一份很快到期的快照被接纳后，显示面必须在到期
+    // 那一刻看到整体失效，而不是等下一次轮询把主循环叫醒。
+    //
+    // 这条用例刻意不查 --inspect：那会往控制窗口投一条消息，等于替主循环“帮它把状态转换泵出来”，
+    // 正好掩盖了这里要抓的缺陷。主循环只被到期自己唤醒。
+    //
+    // 抓的是发布时机，不是 HealthState 的内部标志：帧从邮箱里读出来，读端只认自己看到的那一帧。
+    // 轮询给 30 s，所以“下一次轮询”远在到期之后——旧实现（只在循环末尾发布）要等它才会把
+    // 到期发布出去，本用例的 1.5 s 上限会立刻失败。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"mbexpire-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/expires-soon"), L"--poll-ms",
+                        L"30000", L"--timeout-ms", L"10000"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    long long const content_produced = wait_for_content(consumer, 15000);
+    CHECK(content_produced > 0);  // 首份快照已经被接纳：显示面看到的是有值的内容帧
+
+    Frame content;
+    CHECK(consumer.read(content));
+    CHECK(content.kind == ViewKind::Content);
+    CHECK(!content.alarm);  // 收到时还没到期：这一帧是正常色
+
+    long long const alarm_produced = wait_for_alarm(consumer, 4000);
+    CHECK(alarm_produced > 0);  // 到期必须被发布出来，而不是只在内存里翻了标志
+    CHECK(alarm_produced - content_produced <= 1500);
+
+    Frame alarm;
+    CHECK(consumer.read(alarm));
+    CHECK(frame_shows_alarm(alarm));
+    CHECK_EQ(alarm.items.size(), content.items.size());  // 有效期到期不清内容：保留值、整体染红
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
+    // 整次取数的墙钟截止由主进程守。到点宣布失败的那一刻，显示面也必须立刻失效——旧实现把它
+    // 压到循环末尾，与下一次重试（默认 5 s）之间隔着一整个阻塞等待。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"mbtimeout-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/hang"), L"--poll-ms", L"30000",
+                        L"--retry-ms", L"10000", L"--timeout-ms", L"1500"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    // 启动时那帧是 waiting（没有配置好之前不露空窗）；挂着的请求到点之后必须变成整体失效。
+    long long const started = tick_ms();
+    long long const alarm_produced = wait_for_alarm(consumer, 6000);
+    CHECK(alarm_produced > 0);
+    CHECK(alarm_produced - started <= 3000);  // 约等于 1500 ms 预算 + 调度与用例轮询的余量
+
+    Frame alarm;
+    CHECK(consumer.read(alarm));
+    CHECK(alarm.kind == ViewKind::Error);  // 从没取到过数：没有可保留的值，显示红 ERROR
+    CHECK(alarm.failure == FailureKind::Timeout);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
 
 int wmain(int argc, wchar_t** argv) {
+    // 子模式：本程序被自己再起一份，充当“另一个生产者进程”（见显示邮箱的身份用例）。
+    // 必须在跑用例之前返回，否则子进程会把整套用例再递归跑一遍。
+    if (argc >= 3 && std::wstring(argv[1]) == L"--mailbox-owner") {
+        std::wstring const scope = argv[2];
+        unsigned hold_ms = 30000;
+        for (int index = 3; index + 1 < argc; ++index) {
+            if (std::wstring(argv[index]) == L"--hold-ms") {
+                hold_ms = static_cast<unsigned>(std::wcstoul(argv[index + 1], nullptr, 10));
+            }
+        }
+        return mailbox_owner_child(scope, hold_ms);
+    }
+
     std::string filter;
     for (int index = 1; index < argc; ++index) {
         std::wstring const arg(argv[index]);

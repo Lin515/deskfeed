@@ -119,13 +119,23 @@ deskfeed.exe                             无参数：已有实例不接管；否
  "hasSnapshot":true,"expired":false,"receivedAtMs":1791825410342,"expiresAtMs":1791825470339}
 ```
 
-- `view.kind`：`waiting` / `content` / `error`；`view.items` 只在 `content` 下非空。
+- `view.kind`：`waiting` / `content` / `error`。`content` 表示**已经接纳一份快照**；`view.items`
+  在 `waiting` / `error` 下恒为空数组，而合法的 `items: []` 仍然是 `content`（清空内容不算失败）。
+- `view.alarm`：整个视图处于失效/红色呈现时为 `true`，即 `view.failure != "none"` 或
+  `expired == true`；健康时为 `false`。
 - `view.failure`：`none` / `no-url` / `transport` / `timeout` / `http-status` / `redirect` /
-  `too-large` / `encoding` / `parse` / `validation` / `internal`。
+  `too-large` / `encoding` / `parse` / `validation` / `internal`。它**不是**检查器输出的 `kind`：
+  检查器按取数层的原因分类（`invalid-url` / `connect` / `send` / `receive` / `empty` /
+  `aborted` …，表见 [http.md](http.md)），两者按下面的规则对应——
+  `invalid-url` / `connect` / `send` / `receive` → `transport`；`timeout` → `timeout`；
+  `redirect` → `redirect`；`http-status` → `http-status`；`too-large` → `too-large`；
+  `empty` → `validation`；`aborted` → `none`（主动取消不算失败）；
+  校验类原因 `encoding` / `parse` / `too-large` 原样保留，其余归到 `validation`。
 - `boundPid`、`receivedAtMs`、`expiresAtMs` 不适用时为 `null`。
 - **地址一律脱敏**：去掉 userinfo、查询串与片段；`runtimeUrlRedacted` 记录是否删过东西。
   实际保存与请求的地址保持原样。
-- `--inspect` 的退出码：0 收到应答；5 IPC 超时/没有实例；6 请求被拒绝；1 用法或内部错误。
+- `--inspect` 的退出码：0 收到应答；2 用法错误；5 IPC 超时/没有实例；6 请求被拒绝；7 内部错误。
+  `deskfeed.exe` 本身**不使用**退出码 1；`deskfeed-check.exe` 用 1 表示用法/内部错误。
 
 ## 崩溃与收尾
 

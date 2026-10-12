@@ -28,12 +28,12 @@ node minimal-producer.mjs --port 8099
 
 ```powershell
 # 只量一次 HTTP 取数（不建互斥体、不开窗口、不注入）
-.\build\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --report json
+.\.agent\build\debug\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --report json
 
 # 用隔离实例启动主进程（不碰生产实例、不碰任务栏）
-.\build\bin\deskfeed.exe --scope demo --headless --url "http://127.0.0.1:8099/snapshot"
-.\build\bin\deskfeed.exe --scope demo --inspect
-.\build\bin\deskfeed.exe --scope demo --quit
+.\.agent\build\debug\bin\deskfeed.exe --scope demo --headless --url "http://127.0.0.1:8099/snapshot"
+.\.agent\build\debug\bin\deskfeed.exe --scope demo --inspect
+.\.agent\build\debug\bin\deskfeed.exe --scope demo --quit
 ```
 
 `--inspect` 需要 `Start-Process -Wait` 才拿得到真实退出码与输出，见

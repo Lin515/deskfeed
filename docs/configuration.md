@@ -9,9 +9,10 @@
 | 日志 | `%LOCALAPPDATA%\DeskFeed\deskfeed.log` |
 | 日志（隔离实例） | `%LOCALAPPDATA%\DeskFeed\test-<scope>\deskfeed.log` |
 | `--inspect` 转交文件 | `%LOCALAPPDATA%\DeskFeed[\test-<scope>]\inspect-<发送方 PID>.json`（读完即删） |
-| 建议部署位置 | `%LOCALAPPDATA%\DeskFeed\deskfeed.exe`（构建产物在 `build\bin`） |
+| 建议部署位置 | `%LOCALAPPDATA%\DeskFeed\deskfeed.exe`（构建产物在 `.agent\build\debug\bin`） |
 
-`--state-dir <目录>` 只覆盖设置文件所在目录，文件名仍是 `settings.ini`。
+`--state-dir <目录>` **只**覆盖设置文件所在目录（文件名仍是 `settings.ini`）。日志与
+`--inspect` 转交文件不受它影响，仍在上面 `%LOCALAPPDATA%\DeskFeed[\test-<scope>]` 的隔离目录下。
 
 ## 键
 

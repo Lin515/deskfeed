@@ -13,6 +13,8 @@
 #include "core/schedule.h"
 #include "core/snapshot.h"
 #include "core/utf8.h"
+#include "display/frame.h"
+#include "display/mailbox.h"
 #include "ipc/binding.h"
 #include "ipc/command.h"
 #include "ipc/control_channel.h"
@@ -147,6 +149,27 @@ FailureKind failure_from_validation(ValidationKind kind) {
     }
 }
 
+// View → Frame：显示面要的是同一份模型，只是换成能跨进程传的有界线格式。
+// 只搬字段，不做任何解释——负载 DLL 也照这份线格式读，两边不可能对同一份快照有两种读法。
+Frame frame_from_view(View const& view) {
+    Frame frame;
+    frame.kind = view.kind;
+    frame.alarm = view.alarm;
+    frame.failure = view.failure;
+    frame.reason = view.reason;
+    frame.items.reserve(view.items.size());
+    for (ViewItem const& item : view.items) {
+        FrameItem out;
+        out.id = item.id;
+        out.label = item.label;
+        out.value = item.value;
+        out.state = item.state;
+        out.detail = item.detail;
+        frame.items.push_back(std::move(out));
+    }
+    return frame;
+}
+
 class Master {
 public:
     Master(Command command, std::wstring scope)
@@ -177,6 +200,9 @@ private:
     Job* find_job(std::uint64_t id);
     void on_fetch_done(std::unique_ptr<FetchOutcome> outcome);
     void on_binding_exit(std::uint64_t generation);
+    // 把当前显示模型发布进显示邮箱。force 用于“模型没变但读端需要一帧”的场合
+    // （启动时、任务栏组件被重新打开/重新注入时）。
+    void publish_display_frame(bool force);
     void shutdown();
     std::string inspect_json() const;
 
@@ -211,6 +237,11 @@ private:
     bool quit_requested_ = false;
     bool no_taskbar_ = false;
     bool hidden_ = false;
+
+    // 显示邮箱：只有显式要求（--frame-mailbox）时才建。建起来之后它是主进程 → 显示面
+    // 唯一的输出通道；发布失败只记日志，绝不影响取数。
+    DisplayFrameProducer frame_producer_;
+    std::uint64_t published_revision_ = 0;
 };
 
 Master::~Master() {
@@ -266,8 +297,40 @@ bool Master::initialize() {
     if (hidden_) {
         log_line(L"deskfeed: --hidden 生效：本次运行悬浮窗保持隐藏");
     }
-    log_line(L"deskfeed: 任务栏组件尚未实现（Phase 2），主进程当前只做取数与状态机");
+    if (command_.frame_mailbox) {
+        // 显式要求了这条 seam，建不起来就是失败：静默继续会让离线验收“跑通了但什么也没验”。
+        // 它只建一块按 scope 命名的共享内存与一个通知事件，不碰界面、不注入。
+        UserSecurity security;
+        if (!security.build()) {
+            log_line(L"display: 建不了用户安全描述符，显示邮箱改用系统默认 ACL");
+        }
+        std::string mailbox_error;
+        if (!frame_producer_.create(scope_, &security, mailbox_error)) {
+            std::wstring const message = wide_from_utf8(mailbox_error);
+            console_write_stderr(L"deskfeed: 建不了显示邮箱：" + message + L"\n");
+            log_line(L"display: 建不了显示邮箱：" + message);
+            return false;
+        }
+        log_line(L"display: 显示邮箱已建立（--frame-mailbox：只建隔离的命名对象，不碰界面）");
+    }
+    log_line(L"deskfeed: 任务栏负载尚未实现（Phase 2）；主进程当前做取数、状态机与显示帧发布");
     return true;
+}
+
+void Master::publish_display_frame(bool force) {
+    if (!frame_producer_.created()) {
+        return;
+    }
+    std::uint64_t const revision = health_.revision();
+    if (!force && revision == published_revision_) {
+        return;  // 模型没变：不往跨进程 seqlock 里白写一帧（一次一兆多字节）
+    }
+    Frame const frame = frame_from_view(health_.view());
+    if (frame_producer_.publish(frame, wall_ms())) {
+        published_revision_ = revision;
+    } else {
+        log_line(L"display: 发布显示帧失败（不影响取数）");
+    }
 }
 
 ControlReply Master::on_control(ControlRequest const& request) {
@@ -587,6 +650,11 @@ void Master::shutdown() {
     }
     jobs_.clear();
     binding_.clear();
+    // 正常收尾：保留最后一帧内容并置 closed，叫醒读端去清理任务栏组件。放在关控制窗口之前，
+    // 让读端尽早知道主进程要走了。
+    if (frame_producer_.created()) {
+        frame_producer_.publish_closed(wall_ms());
+    }
     server_.destroy();
 }
 
@@ -635,6 +703,10 @@ int Master::run() {
         }
     }
 
+    // 启动时先发布一帧（force）：读端一挂上就该有东西可读，不必等第一次取数回来。
+    // 这也是“任务栏组件被打开/重新注入时立刻给一帧缓存”的同一条路径。
+    publish_display_frame(true);
+
     for (;;) {
         if (quit_requested_) {
             break;
@@ -659,6 +731,13 @@ int Master::run() {
             scheduler_.on_result(false, now);
             log_format(L"fetch: 超过 %lld ms 墙钟预算，放弃这一次", schedule_.timeout_ms);
         }
+
+        // 在阻塞等待之前发布：本轮顶部的状态转换（到期 tick 与整次取数的墙钟截止）已经把
+        // 显示模型改掉了，而下面的 MsgWaitForMultipleObjects 可能要睡到下一个轮询点。只在循环
+        // 末尾发布会让显示面在“模型已过期”之后继续显示正常色，直到下一次取数或别的消息把它
+        // 叫醒——到期由主进程按绝对时间独立判定，这一刻起就必须是读端看到的那一刻。
+        // revision 没变时这里是空操作，不会多写一帧。
+        publish_display_frame(false);
 
         std::size_t live_jobs = 0;
         for (Job const& job : jobs_) {
@@ -735,6 +814,12 @@ int Master::run() {
 
         // 消息先处理完再回收线程：取数结果正是通过消息投递的，先回收会把结果误判成迟到。
         reap_jobs();
+
+        // 一次循环统一发布：到期 tick、截止失败、取数结果、命令换源都在这一轮里改过模型。
+        // revision 只在模型真的变了时才变，所以空转的循环不会白写一帧。
+        // 顶部那次（阻塞等待之前）保证“模型变了就立刻可见”；这一次保证消息处理阶段
+        // （取数结果、控制命令）引起的变化同样在本轮内落地。
+        publish_display_frame(false);
     }
 
     shutdown();

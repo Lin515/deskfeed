@@ -26,6 +26,11 @@
 //   * 命名对象都带当前用户 SID 短哈希并只授权给当前用户，与 Phase 1 的控制通道一致。
 namespace deskfeed {
 
+// 这个 scope 对应的命名对象名。生产者、消费者与验收 harness 都从这里取，
+// 免得同一条命名规则在两处各写一遍。
+std::wstring display_frame_map_name(std::wstring const& scope);
+std::wstring display_frame_ready_name(std::wstring const& scope);
+
 // 共享内存里的帧头。只用定长整型；同一架构的同一份代码写、读，布局不会有两套解释。
 struct FrameSharedHeader {
     std::uint32_t magic;
@@ -117,7 +122,15 @@ public:
     bool producer_running() const;
 
     // 读最新一帧。读到合法且完整的一帧返回 true，out 被填好。
-    // 序号一直不稳定、或任何检查不过时返回 false（调用方应当沿用上一次成功的帧）。
+    //
+    // **每一次读都重新校验整份帧头**，不是只在 attach 时校验一次：同一个 section 在 attach 之后
+    // 仍可能被改写（旧生产者没退干净、或者同一个名字被新生产者重新建起来）。校验内容包括
+    // 不可变字段（magic/version/header_bytes/capacity/payload_capacity）、全部已知枚举与标志位、
+    // 以及帧头里那几份**重复元数据**（item_count/kind/alarm/failure）与解码出来的帧体是否一致。
+    //
+    // 绑定的生产者一旦退出（那个活动句柄已触发），这里一律返回 false：**绝不**再把最后一帧当成
+    // 活的数据交出去。调用方据此清理任务栏组件，而不是继续画一份陈旧读数。
+    // 序号一直不稳定、身份对不上、或任何检查不过时同样返回 false。
     bool read(Frame& out) const;
 
 private:
@@ -126,6 +139,10 @@ private:
     HANDLE producer_ = nullptr;
     unsigned char const* view_ = nullptr;
     std::size_t capacity_ = 0;
+    // attach 时从**活动句柄**记下的生产者身份。每次读都要拿帧头里的身份跟它比：帧头换了主人
+    // （同名 section 被重建）时不能继续读。
+    std::uint64_t owner_pid_ = 0;
+    std::uint64_t owner_start_time_ = 0;
 };
 
 }  // namespace deskfeed

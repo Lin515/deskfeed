@@ -107,6 +107,11 @@ bool parse_options(std::vector<std::wstring> const& args, Options& out, std::str
     return true;
 }
 
+// 按**字节流**读标准输入：不区分 stdin 是文件重定向还是管道。
+//
+// 管道那条路径有个坑：写端关闭之后 ReadFile 会以 ERROR_BROKEN_PIPE 失败，而那是正常的
+// 流结束，不是读取错误。把它当成失败会让所有程序化调用者（Node / Python 起子进程、任何
+// `... | deskfeed-check` 的用法）拿不到结果——只有 shell 的 `< file` 能用。
 bool read_stdin(std::string& bytes, std::string& error) {
     HANDLE const handle = ::GetStdHandle(STD_INPUT_HANDLE);
     if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
@@ -117,6 +122,10 @@ bool read_stdin(std::string& bytes, std::string& error) {
     for (;;) {
         DWORD read = 0;
         if (::ReadFile(handle, buffer, sizeof(buffer), &read, nullptr) == FALSE) {
+            DWORD const code = ::GetLastError();
+            if (code == ERROR_BROKEN_PIPE || code == ERROR_HANDLE_EOF) {
+                break;  // 管道写端/文件末尾：正常的流结束
+            }
             error = "读标准输入失败";
             return false;
         }
@@ -183,7 +192,7 @@ std::string report_json(bool accept, char const* kind, std::string const& messag
                    ",\"state\":" + quote(deskfeed::item_state_name(item.state)) +
                    ",\"detail\":" + quote(item.detail) + "}";
         }
-        out += "]}";
+        out += "]";
     } else {
         out += ",\"version\":null,\"expiresAtMs\":null,\"items\":[]";
     }

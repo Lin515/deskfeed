@@ -267,6 +267,10 @@ target_compile_definitions(deskfeed-native-tests PRIVATE DESKFEED_NATIVE_TESTS=1
 add_library(deskfeed-reg-hook-caller SHARED
     tests/reg_hook_caller.cpp
 )
+# 这个夹具按名字导入 SDK 的注册表入口并**不**链本工程任何库，但编译口径必须与全仓一致：
+# 少了 `deskfeed_base` 就没有 /utf-8 与 UNICODE/_UNICODE，源码里的宽字符字面量与 Win32 原型
+# 在默认代码页下会报不成对引号/未声明标识符（真实 C2059/C1004）。
+target_link_libraries(deskfeed-reg-hook-caller PRIVATE deskfeed_base)
 set_target_properties(deskfeed-reg-hook-caller PROPERTIES
     OUTPUT_NAME "deskfeed-reg-hook-caller"
     PREFIX ""
@@ -282,6 +286,9 @@ add_test(NAME deskfeed-native-tests COMMAND deskfeed-native-tests)
 add_executable(deskfeed-fake-injector
     tests/fake_injector.cpp
 )
+# 与仓库其余部分同一编译口径（/utf-8、UNICODE、/permissive-、基础 Win32 库）：没有
+# `deskfeed_base` 时宽字符字面量与 Win32 原型在默认代码页下直接报 C2059/C1004。
+target_link_libraries(deskfeed-fake-injector PRIVATE deskfeed_base)
 add_executable(deskfeed-supervisor-tests
     tests/master_supervisor_tests.cpp
     src/master/taskbar_supervisor.cpp
@@ -295,6 +302,58 @@ add_test(NAME deskfeed-supervisor-tests COMMAND deskfeed-supervisor-tests)
 add_test(NAME deskfeed-payload-audit
     COMMAND deskfeed-native-tests --audit $<TARGET_FILE:deskfeed_payload>
 )
+
+# ---------------------------------------------------------------------------
+# 工具侧：注入器、自测探针与工具用例（源码在 src/inject、src/probe）。
+#
+# `deskfeed_inject_support` 是注入器与探针共用的静态库（目标解析、远程调用、PE 导出解析、
+# 动作与状态探询）。探针也要链它：`src/probe/main.cpp` 用的是 `inject/target.h` 的
+# `resolve_scope`，它是 target.cpp 里的非内联定义，少了这份实现就是 LNK2019。
+add_library(deskfeed_inject_support STATIC
+    src/inject/actions.cpp
+    src/inject/payload_status.cpp
+    src/inject/pe_export.cpp
+    src/inject/remote.cpp
+    src/inject/target.cpp
+)
+target_link_libraries(deskfeed_inject_support PUBLIC deskfeed_display deskfeed_platform)
+
+add_executable(deskfeed-inject
+    src/inject/main.cpp
+)
+target_link_libraries(deskfeed-inject PRIVATE deskfeed_inject_support)
+
+# 自测探针：自带 Win32 窗口与系统 XAML 岛，绝不注入 explorer。清单作为**源文件**（与负载和
+# 悬浮窗窗口用例同样的做法：/MANIFESTINPUT 单独用会 LNK1220，/MANIFEST:EMBED 会与它重复）。
+# 探针 EXE 可以链 JSON/core（离线量具要解析严格快照并跑健康状态机），负载 DLL 不行。
+add_executable(deskfeed-probe
+    src/probe/main.cpp
+    src/probe/host.cpp
+    src/probe/offline.cpp
+    src/probe/mock_producer.cpp
+    src/probe/probe_hooks.cpp
+    src/probe/deskfeed-probe.manifest
+)
+target_link_libraries(deskfeed-probe PRIVATE
+    deskfeed_inject_support
+    deskfeed_display
+    deskfeed_core
+    deskfeed_platform
+    # 探针自己起宿主：系统 XAML 岛、调度队列与 WinRT 单元都在它这边。
+    windowsapp.lib
+    runtimeobject.lib
+    coremessaging.lib
+    comctl32.lib
+)
+# 探针会走真实的负载探针入口与 XAML 路径，与负载一样开 CFG（编译 + 链接）。
+target_compile_options(deskfeed-probe PRIVATE /guard:cf)
+target_link_options(deskfeed-probe PRIVATE /guard:cf)
+
+add_executable(deskfeed-tools-tests
+    tests/tools_tests.cpp
+)
+target_link_libraries(deskfeed-tools-tests PRIVATE deskfeed_inject_support)
+add_test(NAME deskfeed-tools-tests COMMAND deskfeed-tools-tests)
 
 # ---------------------------------------------------------------------------
 # 桌面悬浮窗（Phase 3）。

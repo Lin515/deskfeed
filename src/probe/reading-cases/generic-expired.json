@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "expiresAtMs": 1000,
+  "items": [
+    { "id": "cpu", "label": "CPU", "value": "54C", "state": "ok", "detail": "already past its expiry" }
+  ]
+}

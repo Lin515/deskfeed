@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "expiresAtMs": 4102444800000,
+  "items": [
+    { "id": "cpu", "label": "CPU", "value": "54C", "state": "ok", "detail": "last sample" },
+    { "id": "mem", "label": "MEM", "value": "61%", "state": "warn", "detail": "above the soft limit" },
+    { "id": "disk", "label": "DISK", "value": "12 GB free", "state": "ok", "detail": "system volume" }
+  ]
+}

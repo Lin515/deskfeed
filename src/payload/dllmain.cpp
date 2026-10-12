@@ -14,6 +14,7 @@
 // 超时值按 `uintptr_t` 编码在参数指针本身里（不解引用），这样注入器不必在目标进程里再写一个 DWORD。
 #include "display/reading.h"
 #include "payload/action_worker.h"
+#include "payload/guard_keeper.h"
 #include "payload/payload_flavor.h"
 #include "payload/hook_post.h"
 #include "payload/host.h"
@@ -253,6 +254,17 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
 
 extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStop(void* timeout_param) {
     try {
+        // **第一道门**（在 `payload_request_stop()` 之前）：不可证就保留映射。
+        //   * 粘性未知（DllMain 没拿到/验不过那三个内核对象，或视图不可读）；
+        //   * 粘性不确定事件已置位（actor 在不可证的事实下置的，Native **永不**替它清）；
+        //   * 记录不可变头（size/version）不认。
+        // 这里**不读** actor 快照：actor 自己发起这次 Stop 之前按写序已经写下 `Pending*`，那正是要
+        // 允许走到结论的那次调用。事件等待的结论也必须显式区分 WAIT_TIMEOUT——"不是已置位"不等于
+        // "干净"，WAIT_FAILED 同样不可证。
+        if (!deskfeed::payload::payload_guard_stop_allowed()) {
+            return 0;
+        }
+
         unsigned timeout = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(timeout_param));
         if (timeout == 0 || timeout > 60000) {
             timeout = 10000;
@@ -607,6 +619,14 @@ BOOL APIENTRY DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         g_module = instance;
         ::DisableThreadLibraryCalls(instance);
         deskfeed::payload::payload_prepare();
+        // 进程守卫对象（租约 mutex / 粘性不确定 event / 入口记录 mapping）在**加载器锁**里一次性
+        // 拿到引用：只 kernel32 + 栈上定长缓冲，不等待、不分配。失败只让 Stop 永久 fail closed，
+        // 不影响加载语义。契约见 payload/guard_record.h 与 docs/native-safety.md。
+        deskfeed::payload::payload_guard_prepare();
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // 只归还本模块自己那 3 个引用 + 只读视图，**不等待**、不分配。healthy actor 自己持着这些
+        // 命名对象跨过 `FreeLibrary`，所以记录不会因为这里归还而消失。
+        deskfeed::payload::payload_guard_release();
     }
     return TRUE;
 }

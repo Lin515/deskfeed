@@ -8,9 +8,14 @@
 - `CMakeLists.txt` — 全部构建目标：`deskfeed_base`、`deskfeed_core`（含只做 UTF-8 转换的
   `deskfeed_core_text`）、`deskfeed_platform`、`deskfeed_symbols`、`deskfeed_net`、`deskfeed_ipc`
   （含控制通道线格式的 `deskfeed_control_wire` / `deskfeed_control_wire_send`）、`deskfeed_display`、
-  `deskfeed_payload`（`deskfeed-payload.dll`，注入 `explorer.exe`）、`deskfeed`（主进程）、
-  `deskfeed-check`、`deskfeed-tests`。Windows / MSVC / x64、C++20、静态 CRT；CTest 注册
-  `deskfeed-tests`。
+  `deskfeed_payload`（`deskfeed-payload.dll`，注入 `explorer.exe`）与 `deskfeed_payload_test`
+  （`deskfeed-payload-test.dll`，同源、只多 `DESKFEED_DLL_TEST_API`）、`deskfeed`（主进程）、
+  `deskfeed-check`、`deskfeed_inject_support` / `deskfeed-inject`、`deskfeed-probe`、
+  `deskfeed_widget`。测试与夹具目标：`deskfeed-tests`、`deskfeed-native-tests`、
+  `deskfeed-tools-tests`、`deskfeed-supervisor-tests`、`deskfeed-widget-tests`、
+  `deskfeed-widget-window-tests`、`deskfeed-reg-hook-caller`、`deskfeed-test-remote-writer`、
+  `deskfeed-fake-injector`。Windows / MSVC / x64、C++20、静态 CRT；CTest 注册 8 条用例
+  （含生产/测试两条成品 DLL 审计）。
 - `README.md` — 面向用户的说明：当前阶段、快速开始、安全边界、许可。
 - `AGENTS.md` — 本文件。
 - `LICENSE` — MIT，版权署名 Lin515。
@@ -48,6 +53,11 @@
      排除**。不要宣称注入绝对安全；导入表改写那一层还有一个明确接受的残余窗口（见
      `docs/native-safety.md`）。
 7. 健康/到期用**墙钟 Unix 毫秒**（快照里的绝对时间），调度与超时用**单调时钟**，两者不得混用。
+8. **负载的进程守卫只有一个出处**：`src/payload/guard_record.h`（40 字节记录布局、状态值、对象名
+   格式、恢复判定）。工具侧只 `include` 它并用别名，**不得**复制布局或常量。`DeskFeedStop` 返回 0 时
+   注入器**必须保留映射**（不得 `FreeLibrary`、不得按镜像名杀进程）；负载侧永不置、永不清那个粘性
+   不确定事件，也永不读 actor 快照（`[8,40)`）。这套门只对本协议的合作参与者成立，**不要**据此宣称
+   "整进程任意第三方线程都安全"。
 
 ## 目录
 
@@ -55,5 +65,5 @@
 - `examples/` — 见 `examples/README.md`。
 - `schema/` — `snapshot-v1.schema.json`，协议约束的机器可读版本。
 - `src/` — 见 `src/README.md`（在 `src/` 下按 `core` / `platform` / `net` / `ipc` / `display` /
-  `payload` / `master` / `tools` 分层）。
+  `payload` / `master` / `tools` / `inject` / `probe` / `widget` 分层）。
 - `tests/` — 见 `tests/README.md`。

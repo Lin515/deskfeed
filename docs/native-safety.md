@@ -67,6 +67,83 @@ DeskFeedStop (void* timeout_ms)    -> DWORD   1 可以卸载 / 0 未退休（保
 `payload stays loaded (not retired: …)`，`--status` 要能表达"已加载但未退休"。这个门禁是硬性的：
 先前的实现等一个清理事件、`Sleep` 一小段就无条件卸载，UI 线程一挂住就必然强卸。
 
+## 进程守卫：租约 + 入口记录 + 粘性不确定事件
+
+`DeskFeedStop` 的第一道门不是负载内部的任何标志位，而是**内核对象事实**：注入器（actor）与负载
+（Native）共用三个按目标进程命名的对象，名字由唯一的格式化函数生成：
+
+```text
+Local\DeskFeed-payload-guard-<pid>-<创建时间 16 位小写 hex>-{mutex,event,record}
+```
+
+| 对象 | 用途 |
+| --- | --- |
+| mutex | 每个动作的**租约**：同一次动作只有一个 actor；崩掉的 actor 让锁变成 abandoned，事实留在内核对象里 |
+| event | **手动复位、粘性**的不确定信号：只有 actor 会置，只有能证明干净的 actor 会清；**Native 永不置、永不清** |
+| record（4096 字节 mapping） | 40 字节记录：`size/version`（不可变头，一次写入）+ `state/reserved/tid/seq/checksum/reserved2`（actor 快照） |
+
+记录布局、状态值、对象名格式与全部纯函数只有一处定义：`src/payload/guard_record.h`；工具侧只
+`include` 它并用别名，不复制布局或常量。两套校验刻意分开：
+
+- **不可变头 `[0,8)`（`size`/`version`）**：Native 每次 `DeskFeedStop` 都只看这一段；
+- **actor 快照 `[8,40)`**：整体 FNV-1a + `state` 合法 + `reserved` 归零 + `state` 与 `tid` 自洽，
+  由**持租约的 actor** 校验。
+
+Native **不读快照、不读 `checksum`、不要求记录回到 Idle**。理由是自我卸载那条调用：actor 发起
+`--stop` 之前按写序已经写下 `PendingNoTid` / `PendingTid{它自己的 Stop 远程线程}`；如果 Native 拿
+快照当门，就会把**正在执行的这一次** Stop 判成"有入口在飞"而拒绝——而那正是必须允许走到结论的调用。
+
+`DeskFeedStop` 的门次序（全部在 `payload_request_stop()` **之前**）：
+
+1. `DllMain` 那次拿到的三个内核对象有任何一个没建起来、类型不对、或视图不可读 ⇒ 粘性未知 ⇒ 返回 0；
+2. 粘性事件**已置位** ⇒ 返回 0（Native 永不替它清）；
+3. 不可变头不认（`size != 40 || version != 1`）⇒ 返回 0；
+4. 之后才走原有的门禁（真实线程句柄 + 回收门位）。
+
+"事件没有置位"必须显式区分 `WAIT_TIMEOUT`：`WAIT_FAILED` 是"问不出来"，同样按不可证返回 0。
+
+### Native 只做一次性初始化，之后结构上不是写者
+
+`DllMain(DLL_PROCESS_ATTACH)` 跑在加载器锁里，只允许 kernel32 与栈上定长缓冲：取 `pid` 与进程创建
+时间，用唯一的 `guard_format_object_name` 在栈上拼三个名字，然后 `CreateMutexW`（不 own、不 Wait）、
+`CreateEventW(TRUE, FALSE)`（不置、不清）、`CreateFileMappingW(PAGE_READWRITE, 4096)`。
+
+- **只有** `CreateFileMappingW` 没有返回 `ERROR_ALREADY_EXISTS`（确实由本进程创建）时才做一次
+  `guard_init_new_record`，随后立刻 `UnmapViewOfFile` + 重新 `MapViewOfFile(FILE_MAP_READ)` ——
+  之后写它就是访问违例，所以 Native **结构上**不再是记录的写者；
+- 对象已存在（协议要求 actor 先 create + init 再 `LoadLibraryW`）时直接拿只读视图；
+- 任何 `Create*`/`Map*` 失败、或视图上不可变头不认（含全零）⇒ 粘性未知，**绝不覆盖/复置**那份记录；
+  `DllMain` 仍返回 TRUE（不改变加载语义）。零 header 的自愈路径是"最后一个持有者关掉引用之后，
+  下一位正常 init 的 actor 重新创建它"。
+
+`DLL_PROCESS_DETACH` 只关本模块自己那 3 个句柄与只读视图，**不等待、不分配、不碰文件/COM/user32**。
+这不是"引用泄漏"：唯一合法的卸载路径是 `DeskFeedStop` 返回 1 之后的 `FreeLibrary`，而健康的 actor
+自己持着同样的命名对象句柄与视图跨过 `FreeLibrary`，所以记录不会因为本模块归还引用而消失；actor 在
+`conclude_clean` 后成对关掉，对象随之消失。
+
+### actor 侧恢复（`WAIT_ABANDONED`）
+
+下一位 actor 拿到 `WAIT_ABANDONED`（上一位带锁退出）时**持锁**读快照，只有能证干净才清事件：
+
+| 快照 | 动作 |
+| --- | --- |
+| Idle | 清事件 + 重写 Idle(seq+1)，继续 |
+| PendingTid{tid}，Toolhelp 确认该 TID 已不在目标进程里 | 清事件 + 重写 Idle，继续 |
+| PendingTid{tid}，TID 仍在 / 查询失败 | 保持事件（TID 复用只会 false-retain） |
+| PendingNoTid / 头或 checksum 不认 | 保持事件（跨事务的旧 pending 永久保留） |
+
+Toolhelp 只在 actor 侧使用，负载的导入表不新增它。
+
+### 范围限定（不要夸大）
+
+- 本协议只对**本协议版本的 cooperating 参与者**成立：本仓库的 `deskfeed-inject.exe`（含主进程派生）
+  与负载 DLL。**不**成立于旧版/第三方工具、调试器、手工 `FreeLibrary`、以及任何不拿租约就卸载的调用方。
+- **外部线程入口**（`DllGetClassObject`、XAML tap 回调、探针入口）也不在这套门里：它们不是
+  `CreateRemoteThread` 造出来的、起始地址不在本模块。因此**不能**据此宣称"整进程任意第三方线程都安全"。
+- 租约按目标 `pid` + 创建时间命名 ⇒ 跨 explorer 不互斥；`Local\` ⇒ 跨会话天然隔离。
+- `DeskFeedStop` 返回 1 仍然只表示"既定回收门禁全部通过"，**不是**形式化安全证明；导入表改写那一层
+  的残余窗口（下一节）不受这套守卫影响，也不因为有了守卫就可以淡化。
+
 ## 导入表改写（composition 诊断规避）的**已接受残余**
 
 `reg_hook` 通过改写各模块导入地址表，让 XAML 读到 `DisableCompositionDiag=1`，从而不去建那套会在

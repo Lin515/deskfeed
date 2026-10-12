@@ -12,9 +12,12 @@
 //   deskfeed-native-tests --audit <dll>       只跑成品审计（CTest 注册两条：生产侧与测试侧）
 //   deskfeed-native-tests --filter glue       只跑"测试 DLL 上某条回收门真失败"的粘合回归
 //   deskfeed-native-tests --filter failclosed 只跑 GetStatus 的坏指针/不认 ABI 失败路径
+//   deskfeed-native-tests --filter guard      只跑进程守卫（纯函数/名字/校验和/恢复表 + 子进程场景）
+//   deskfeed-native-tests --guard-child <场景> 内部用法：父进程把自己当**新进程**起出来跑一个守卫场景
 #include "display/mailbox.h"
 #include "payload/action_worker.h"
 #include "payload/feed.h"
+#include "payload/guard_record.h"
 #include "payload/hook_post.h"
 #include "payload/reg_hook.h"
 #include "payload/retire_gates.h"
@@ -22,11 +25,13 @@
 #include "platform/log.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -923,16 +928,772 @@ void test_retire_glue() {
     producer.close();
 }
 
+// ---------------------------------------------------------------- 进程守卫（E）
+//
+// 这一组咬的是"内核对象事实"这条门，而不是任何标量：
+//   * **进程内**：`payload/guard_record.h` 的纯函数、对象名格式、校验和向量，以及
+//     `guard_classify`/`guard_recovery` 的分支表（TID 在场/离场用**真线程** + 官方 Toolhelp 制造，
+//     不 mock 一个布尔出来）；
+//   * **子进程**：守卫对象名 = 目标 pid + 创建时间，而 `DllMain` 每个进程只 attach 一次，所以
+//     "Native 自己 init / actor 先 init / 事件已置位 / 坏 header / 错类型对象 / 只读零 header /
+//     abandoned 恢复 / 引用跨 FreeLibrary / 每轮 reload 不泄漏"这些场景**必须各自在新进程里**跑。
+//     父进程用 `CreateProcessW` 把自己起出来（`--guard-child <场景>`）并断言退出码；子进程里
+//     的检查行照样打到同一个控制台，所以红的时候能看到是哪一条。
+//
+// 用例自己就是 cooperating actor：它用唯一的 `guard_record.h` 建对象、持租约、写记录——**不复制**
+// 任何布局或常量，也不 mock Native 的结论。actor 侧允许做的（置事件、在能证干净时清事件）在用例里
+// 都显式写出来，Native 侧"永不置、永不清、永不读快照"则用真 DLL 的 Stop 返回值与事件状态咬住。
+
+namespace gp = deskfeed::payload;
+using GuardRecord = gp::GuardRecord;
+
+std::uint64_t current_process_creation() {
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user) == FALSE) {
+        return 0;
+    }
+    ULARGE_INTEGER stamp{};
+    stamp.LowPart = created.dwLowDateTime;
+    stamp.HighPart = created.dwHighDateTime;
+    return stamp.QuadPart;
+}
+
+// 本进程那三个守卫对象名（与 Native 用的是同一个格式化函数）。
+bool format_guard_names(wchar_t names[3][gp::kGuardNameCapacity]) {
+    std::uint64_t const creation = current_process_creation();
+    if (creation == 0) {
+        return false;
+    }
+    auto const pid = static_cast<std::uint32_t>(::GetCurrentProcessId());
+    return gp::guard_format_object_name(names[0], gp::kGuardNameCapacity, gp::kGuardSuffixMutex, pid,
+                                        creation) &&
+           gp::guard_format_object_name(names[1], gp::kGuardNameCapacity, gp::kGuardSuffixEvent, pid,
+                                        creation) &&
+           gp::guard_format_object_name(names[2], gp::kGuardNameCapacity, gp::kGuardSuffixRecord, pid,
+                                        creation);
+}
+
+// 三个命名对象里**还有任何一个**活着吗。不能拼出名字时按"还在"（不可证 ⇒ fail closed）。
+bool guard_objects_exist() {
+    wchar_t names[3][gp::kGuardNameCapacity]{};
+    if (!format_guard_names(names)) {
+        return true;
+    }
+    HANDLE const mutex = ::OpenMutexW(SYNCHRONIZE, FALSE, names[0]);
+    HANDLE const event = ::OpenEventW(SYNCHRONIZE, FALSE, names[1]);
+    HANDLE const mapping = ::OpenFileMappingW(FILE_MAP_READ, FALSE, names[2]);
+    bool const any = mutex != nullptr || event != nullptr || mapping != nullptr;
+    if (mutex != nullptr) {
+        ::CloseHandle(mutex);
+    }
+    if (event != nullptr) {
+        ::CloseHandle(event);
+    }
+    if (mapping != nullptr) {
+        ::CloseHandle(mapping);
+    }
+    return any;
+}
+
+// 用例侧的 cooperating actor：建/开那三个命名对象、持租约、按写序写记录。
+struct GuardActor {
+    HANDLE mutex = nullptr;
+    HANDLE event = nullptr;
+    HANDLE mapping = nullptr;
+    GuardRecord* record = nullptr;
+    bool owns_lease = false;
+
+    bool setup(bool write_header) {
+        wchar_t names[3][gp::kGuardNameCapacity]{};
+        if (!format_guard_names(names)) {
+            return false;
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        mutex = ::CreateMutexW(nullptr, FALSE, names[0]);
+        event = ::CreateEventW(nullptr, TRUE, FALSE, names[1]);
+        ::SetLastError(ERROR_SUCCESS);
+        mapping =
+            ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 4096, names[2]);
+        DWORD const mapping_error = ::GetLastError();
+        if (mutex == nullptr || event == nullptr || mapping == nullptr) {
+            close();
+            return false;
+        }
+        record = static_cast<GuardRecord*>(
+            ::MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(GuardRecord)));
+        if (record == nullptr) {
+            close();
+            return false;
+        }
+        // 协议规约：actor 先 create + init 再 LoadLibraryW。
+        if (write_header && mapping_error != ERROR_ALREADY_EXISTS) {
+            gp::guard_init_new_record(*record, 1);
+        }
+        return true;
+    }
+
+    DWORD acquire_raw(unsigned timeout_ms) {
+        DWORD const wait = ::WaitForSingleObject(mutex, timeout_ms);
+        owns_lease = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+        return wait;
+    }
+    bool release_lease() {
+        if (!owns_lease) {
+            return false;
+        }
+        owns_lease = false;
+        return ::ReleaseMutex(mutex) != FALSE;
+    }
+    bool header_ok() const { return record != nullptr && gp::guard_header_ok(*record); }
+    bool write_idle(std::uint64_t seq) {
+        if (record == nullptr) return false;
+        gp::guard_make_idle(*record, seq);
+        return true;
+    }
+    bool write_pending_no_tid(std::uint64_t seq) {
+        if (record == nullptr) return false;
+        gp::guard_make_pending_no_tid(*record, seq);
+        return true;
+    }
+    bool write_pending_tid(std::uint64_t tid, std::uint64_t seq) {
+        if (record == nullptr) return false;
+        gp::guard_make_pending_tid(*record, tid, seq);
+        return true;
+    }
+    // 对抗性 setup（用例专用）：写一个坏 header，验证 Native 永不覆盖/复置它。
+    bool write_bad_header(std::uint32_t size, std::uint32_t version) {
+        if (record == nullptr) return false;
+        *record = GuardRecord{};
+        record->size = size;
+        record->version = version;
+        return true;
+    }
+    bool set_event_now() { return ::SetEvent(event) != FALSE; }
+    bool clear_event_now() { return ::ResetEvent(event) != FALSE; }
+    bool event_signaled() const {
+        return event != nullptr && ::WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    }
+    void close() {
+        if (owns_lease && mutex != nullptr) {
+            ::ReleaseMutex(mutex);
+            owns_lease = false;
+        }
+        if (record != nullptr) {
+            ::UnmapViewOfFile(record);
+            record = nullptr;
+        }
+        if (mapping != nullptr) {
+            ::CloseHandle(mapping);
+            mapping = nullptr;
+        }
+        if (event != nullptr) {
+            ::CloseHandle(event);
+            event = nullptr;
+        }
+        if (mutex != nullptr) {
+            ::CloseHandle(mutex);
+            mutex = nullptr;
+        }
+    }
+};
+
+// 载入成品负载并取三个导出。子进程场景用**测试 DLL**（它同时导出 Start/Stop/GetStatus）。
+struct PayloadApi {
+    HMODULE module = nullptr;
+    StatusStartFn start = nullptr;
+    StatusStopFn stop = nullptr;
+    StatusGetFn get = nullptr;
+
+    bool load(wchar_t const* file_name) {
+        module = ::LoadLibraryW(sibling_file_path(file_name).c_str());
+        if (module == nullptr) {
+            return false;
+        }
+        start = reinterpret_cast<StatusStartFn>(::GetProcAddress(module, "DeskFeedStart"));
+        stop = reinterpret_cast<StatusStopFn>(::GetProcAddress(module, "DeskFeedStop"));
+        get = reinterpret_cast<StatusGetFn>(::GetProcAddress(module, "DeskFeedGetStatus"));
+        return start != nullptr && stop != nullptr && get != nullptr;
+    }
+    DWORD stop_ms(unsigned ms) const {
+        return stop(reinterpret_cast<void*>(static_cast<std::uintptr_t>(ms)));
+    }
+    bool status(deskfeed::payload::PayloadStatusPod& pod) const { return query_status(get, pod); }
+    bool unload_safe() const {
+        deskfeed::payload::PayloadStatusPod pod{};
+        return status(pod) && pod.unload_safe == 1;
+    }
+    bool unload() {
+        if (module == nullptr) {
+            return false;
+        }
+        bool const ok = ::FreeLibrary(module) != FALSE;
+        module = nullptr;
+        return ok;
+    }
+};
+
+int child_result(char const* scenario) {
+    std::printf("guard-child %s: %d checks, %d failed\n", scenario, g_checks, g_failures);
+    return g_failures == 0 ? 0 : 1;
+}
+
+// --- 子进程场景 ---------------------------------------------------------------
+
+// 没有任何 actor：`DllMain` 是本进程的创建者，走一次性 init（header + Idle）后降级只读视图。
+int child_native_create() {
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "native-create: the self-test payload loads");
+    if (api.module == nullptr) {
+        return child_result("native-create");
+    }
+    check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "native-create: Start accepts");
+    check(api.stop_ms(5000) == 1,
+          "native-create: Stop retires when Native created and initialised the record itself");
+    check(api.unload_safe(), "native-create: unload_safe derives 1");
+    check(api.unload(), "native-create: FreeLibrary succeeds after a retired Stop");
+    return child_result("native-create");
+}
+
+// actor 先 create + init 再 Load；记录写成 PendingTid{自己} 且事件**未置位** ⇒ 仍必须走正常门禁并
+// 返回 1。这正是"Native 不读 actor 快照"的反例：拿快照当门会把这次 SelfStop 拒掉。
+int child_actor_inited_self_pending() {
+    GuardActor actor;
+    check(actor.setup(true), "actor-inited: the actor creates and initialises the record");
+    check(actor.header_ok(), "actor-inited: the immutable header is valid");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "actor-inited: the self-test payload loads");
+    if (api.module == nullptr) {
+        actor.close();
+        return child_result("actor-inited");
+    }
+    check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "actor-inited: Start accepts");
+    check(actor.acquire_raw(2000) == WAIT_OBJECT_0, "actor-inited: the actor holds the lease");
+    check(actor.write_pending_tid(::GetCurrentThreadId(), 2),
+          "actor-inited: the actor records PendingTid{this thread}");
+    check(gp::guard_classify(*actor.record) == gp::GuardSnapshot::PendingTid,
+          "actor-inited: the snapshot is a valid PendingTid (the actor's own pending Stop)");
+    check(actor.release_lease(), "actor-inited: the actor concludes and releases the lease");
+    check(api.stop_ms(5000) == 1,
+          "actor-inited: a valid header + PendingTid{self} + event clear still retires (SelfStop)");
+    check(actor.write_idle(3), "actor-inited: the actor settles the record back to Idle");
+    check(api.unload(), "actor-inited: FreeLibrary succeeds after a retired Stop");
+    actor.close();
+    return child_result("actor-inited");
+}
+
+// 粘性不确定事件已置位：Stop 必须拒绝，而且**重试仍然拒绝**、事件仍被 Native 留着（永不替它清）。
+int child_event_signaled() {
+    GuardActor actor;
+    check(actor.setup(true), "event-signaled: the actor creates and initialises the record");
+    check(actor.set_event_now(), "event-signaled: the actor sets the sticky uncertainty event");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "event-signaled: the self-test payload loads");
+    if (api.module == nullptr) {
+        actor.close();
+        return child_result("event-signaled");
+    }
+    check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "event-signaled: Start accepts");
+    check(api.stop_ms(5000) == 0, "event-signaled: a signalled uncertainty event refuses retirement");
+    check(api.stop_ms(5000) == 0, "event-signaled: the refusal is sticky across retries");
+    check(actor.event_signaled(), "event-signaled: Native never clears the sticky event");
+    check(!api.unload_safe(), "event-signaled: unload_safe stays 0");
+    // Stop 说未退休 ⇒ 映射必须保留：这里**不** FreeLibrary（子进程退出时自然收场）。
+    check(api.module != nullptr, "event-signaled: the module stays mapped after a refused Stop");
+    actor.close();
+    return child_result("event-signaled");
+}
+
+// 不可变头坏（version 不认）：Native 必须 fail closed，而且**永不覆盖/复置**这个坏 header。
+int child_bad_header() {
+    GuardActor actor;
+    check(actor.setup(false), "bad-header: the actor creates the record without a valid header");
+    check(actor.write_bad_header(gp::kGuardRecordSize, gp::kGuardRecordVersion + 1),
+          "bad-header: the actor writes an unrecognised version");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "bad-header: the self-test payload loads");
+    if (api.module == nullptr) {
+        actor.close();
+        return child_result("bad-header");
+    }
+    check(api.stop_ms(5000) == 0, "bad-header: an unrecognised header refuses retirement");
+    check(api.stop_ms(5000) == 0, "bad-header: the refusal is sticky");
+    check(actor.record->size == gp::kGuardRecordSize &&
+              actor.record->version == gp::kGuardRecordVersion + 1,
+          "bad-header: Native never overwrites or resets a bad header");
+    actor.close();
+    return child_result("bad-header");
+}
+
+// record 名下是一个**错类型**的内核对象（event 而不是 file mapping）：Native 的 CreateFileMappingW
+// 必然失败 ⇒ 粘性未知 ⇒ Stop 恒 0。
+int child_wrong_object_type() {
+    wchar_t names[3][gp::kGuardNameCapacity]{};
+    check(format_guard_names(names), "wrong-type: the guard object names can be formatted");
+    HANDLE const wrong = ::CreateEventW(nullptr, TRUE, FALSE, names[2]);
+    check(wrong != nullptr, "wrong-type: an event exists under the record name");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "wrong-type: the self-test payload loads");
+    if (api.module != nullptr) {
+        check(api.stop_ms(5000) == 0, "wrong-type: a wrong kernel object type refuses retirement");
+        check(api.stop_ms(5000) == 0, "wrong-type: the refusal is sticky");
+    }
+    if (wrong != nullptr) {
+        ::CloseHandle(wrong);
+    }
+    return child_result("wrong-type");
+}
+
+// 只读 section + 全零 header：Native 既写不进去、header 也不认 ⇒ fail closed，且零 header 原样保留。
+int child_readonly_zero_header() {
+    wchar_t names[3][gp::kGuardNameCapacity]{};
+    check(format_guard_names(names), "readonly-zero: the guard object names can be formatted");
+    HANDLE const mutex = ::CreateMutexW(nullptr, FALSE, names[0]);
+    HANDLE const event = ::CreateEventW(nullptr, TRUE, FALSE, names[1]);
+    HANDLE const section =
+        ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READONLY, 0, 4096, names[2]);
+    check(mutex != nullptr && event != nullptr && section != nullptr,
+          "readonly-zero: the actor creates a read-only section under the record name");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "readonly-zero: the self-test payload loads");
+    if (api.module != nullptr) {
+        check(api.stop_ms(5000) == 0, "readonly-zero: a zero header refuses retirement");
+        check(api.stop_ms(5000) == 0, "readonly-zero: the refusal is sticky");
+    }
+    if (section != nullptr) {
+        auto const* const view = static_cast<GuardRecord const*>(
+            ::MapViewOfFile(section, FILE_MAP_READ, 0, 0, sizeof(GuardRecord)));
+        check(view != nullptr && view->size == 0 && view->version == 0,
+              "readonly-zero: Native never writes the zero header");
+        if (view != nullptr) {
+            ::UnmapViewOfFile(view);
+        }
+    }
+    if (section != nullptr) ::CloseHandle(section);
+    if (event != nullptr) ::CloseHandle(event);
+    if (mutex != nullptr) ::CloseHandle(mutex);
+    return child_result("readonly-zero");
+}
+
+// 上一位 actor 在写下 PendingNoTid 之后崩掉（线程带锁退出 ⇒ WAIT_ABANDONED）。这个形状**不可证**：
+// 演员必须置粘性事件并收场，Native 随后必须拒绝卸载。
+int child_abandoned_pending_no_tid() {
+    GuardActor actor;
+    check(actor.setup(true), "abandoned-pending: the actor creates and initialises the record");
+    HANDLE const helper = ::CreateThread(
+        nullptr, 0,
+        [](void* parameter) -> DWORD {
+            auto* const self = static_cast<GuardActor*>(parameter);
+            if (self->acquire_raw(2000) != WAIT_OBJECT_0) {
+                return 1;
+            }
+            self->write_pending_no_tid(2);
+            return 0;  // ExitThread：**不** ReleaseMutex ⇒ abandoned
+        },
+        &actor, 0, nullptr);
+    check(helper != nullptr, "abandoned-pending: the crashing helper thread starts");
+    if (helper != nullptr) {
+        ::WaitForSingleObject(helper, 5000);
+        ::CloseHandle(helper);
+    }
+    check(actor.acquire_raw(2000) == WAIT_ABANDONED,
+          "abandoned-pending: the next actor sees WAIT_ABANDONED");
+    check(actor.record != nullptr && gp::guard_classify(*actor.record) == gp::GuardSnapshot::PendingNoTid,
+          "abandoned-pending: the record really says PendingNoTid");
+    check(gp::guard_recovery(gp::GuardSnapshot::PendingNoTid, gp::GuardTidProbe::Absent) ==
+              gp::GuardRecovery::KeepUncertain,
+          "abandoned-pending: PendingNoTid is never provable");
+    check(actor.set_event_now(), "abandoned-pending: the actor sets the sticky event");
+    // 按 actor 纪律：结论是 Unknown ⇒ **不释放**租约，事实留在内核对象里（本线程随即结束）。
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "abandoned-pending: the self-test payload loads");
+    if (api.module != nullptr) {
+        check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "abandoned-pending: Start accepts");
+        check(api.stop_ms(5000) == 0, "abandoned-pending: Native refuses retirement");
+        check(actor.event_signaled(), "abandoned-pending: the sticky event is still set");
+    }
+    return child_result("abandoned-pending");
+}
+
+// 上一位 actor 崩掉时记录是 Idle ⇒ **能证干净**：只有演员可以清事件并重写 Idle，之后 Native 的
+// Stop 必须走正常门禁并返回 1（Native 自己永不清、永不置）。
+int child_abandoned_idle_recovered() {
+    GuardActor actor;
+    check(actor.setup(true), "abandoned-idle: the actor creates and initialises the record");
+    HANDLE const helper = ::CreateThread(
+        nullptr, 0,
+        [](void* parameter) -> DWORD {
+            auto* const self = static_cast<GuardActor*>(parameter);
+            if (self->acquire_raw(2000) != WAIT_OBJECT_0) {
+                return 1;
+            }
+            self->write_idle(2);
+            return 0;  // ExitThread：**不** ReleaseMutex ⇒ abandoned
+        },
+        &actor, 0, nullptr);
+    check(helper != nullptr, "abandoned-idle: the crashing helper thread starts");
+    if (helper != nullptr) {
+        ::WaitForSingleObject(helper, 5000);
+        ::CloseHandle(helper);
+    }
+    check(actor.acquire_raw(2000) == WAIT_ABANDONED,
+          "abandoned-idle: the next actor sees WAIT_ABANDONED");
+    check(actor.record != nullptr && gp::guard_classify(*actor.record) == gp::GuardSnapshot::Idle,
+          "abandoned-idle: the record proves Idle");
+    check(gp::guard_recovery(gp::GuardSnapshot::Idle, gp::GuardTidProbe::NotQueried) ==
+              gp::GuardRecovery::ClearAndContinue,
+          "abandoned-idle: Idle is provable");
+    check(actor.clear_event_now(), "abandoned-idle: only the actor clears the sticky event");
+    check(actor.write_idle(3), "abandoned-idle: the actor rewrites Idle(seq+1)");
+    check(actor.release_lease(), "abandoned-idle: the actor concludes and releases the lease");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "abandoned-idle: the self-test payload loads");
+    if (api.module != nullptr) {
+        check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "abandoned-idle: Start accepts");
+        check(api.stop_ms(5000) == 1,
+              "abandoned-idle: after the actor proved it clean, Native retires normally");
+        check(api.unload(), "abandoned-idle: FreeLibrary succeeds after a retired Stop");
+    }
+    actor.close();
+    return child_result("abandoned-idle");
+}
+
+// 引用语义：actor 先建对象再 Load。healthy FreeLibrary 之后本模块归还自己那 3 个引用，但 actor
+// 还持着 ⇒ 记录**不消失**；actor 最后关掉 ⇒ 三个对象消失。若本模块把引用泄漏成"永远活着"，
+// 最后那条断言必红。
+//
+// 口径限定：这条"对象消失"只在本 fixture 里可证——对象名按**本进程 pid+creation** 命名，而这个
+// 子进程里除了本用例这个 actor 没有任何其它 cooperating 持有者（也没有第三方拿租约）。真实机器上
+// 若同一进程里还有别的合作者持引用，对象当然会继续活着，那时不能据此断言"引用泄漏"。
+int child_actor_held_references() {
+    GuardActor actor;
+    check(actor.setup(true), "actor-refs: the actor creates and initialises the record");
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), "actor-refs: the self-test payload loads");
+    if (api.module == nullptr) {
+        actor.close();
+        return child_result("actor-refs");
+    }
+    check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "actor-refs: Start accepts");
+    check(api.stop_ms(5000) == 1, "actor-refs: Stop retires");
+    check(api.unload(), "actor-refs: FreeLibrary succeeds after a retired Stop");
+    check(actor.header_ok(), "actor-refs: the record survives FreeLibrary while the actor holds it");
+    check(guard_objects_exist(), "actor-refs: the three named objects are still alive");
+    actor.close();
+    check(!guard_objects_exist(), "actor-refs: after the last reference closes the objects disappear");
+    return child_result("actor-refs");
+}
+
+// 每轮 Load/Start/Stop/FreeLibrary 之后三个守卫对象都必须消失：这就是"本模块不每 reload 泄漏 3 个
+// 引用"的机械证据（只要泄漏一个，Open* 就还能成功）。句柄计数只作辅助：本模块还有两条与守卫无关的
+// 既有 per-load 归属（清理事件与负载线程句柄），所以这里给一个有界余量而不是要求逐轮零增长。
+int child_reload_objects_gone() {
+    constexpr int kCycles = 6;
+    DWORD first_handles = 0;
+    DWORD last_handles = 0;
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        PayloadApi api;
+        check(api.load(L"deskfeed-payload-test.dll"), "reload: the self-test payload loads");
+        if (api.module == nullptr) {
+            break;
+        }
+        check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "reload: Start accepts");
+        check(api.stop_ms(5000) == 1, "reload: Stop retires");
+        check(api.unload(), "reload: FreeLibrary succeeds after a retired Stop");
+        check(!guard_objects_exist(), "reload: every keeper reference is released on FreeLibrary");
+        DWORD handles = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &handles);
+        if (cycle == 0) {
+            first_handles = handles;
+        }
+        last_handles = handles;
+    }
+    std::printf("reload: handles first=%lu last=%lu over %d cycles\n",
+                static_cast<unsigned long>(first_handles), static_cast<unsigned long>(last_handles),
+                kCycles);
+    // 每轮允许的既有归属：清理事件（`payload_prepare`）与负载线程句柄（`DeskFeedStart` 登记后
+    // "模块卸载前不关"），实测 2/轮；守卫那 3 个引用若真的每轮泄漏，这里的增长会变成 5/轮。
+    check(last_handles >= first_handles &&
+              last_handles - first_handles <= static_cast<DWORD>(kCycles - 1) * 3u,
+          "reload: handle growth across the cycles stays bounded (no 3-refs-per-reload leak)");
+    return child_result("reload");
+}
+
+// 父进程侧的驱动器：每个场景一个**新进程**（守卫对象名按 pid+creation，DllMain 每进程只跑一次）。
+bool run_guard_child(wchar_t const* scenario, char const* label) {
+    wchar_t exe[MAX_PATH]{};
+    DWORD const length = ::GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+    if (length == 0 || length >= std::size(exe)) {
+        check(false, label);
+        return false;
+    }
+    std::wstring command = L"\"" + std::wstring(exe, length) + L"\" --guard-child " + scenario;
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+                         &startup, &process) == FALSE) {
+        check(false, label);
+        return false;
+    }
+    ::CloseHandle(process.hThread);
+    DWORD const wait = ::WaitForSingleObject(process.hProcess, 60000);
+    DWORD code = 1;
+    if (wait == WAIT_OBJECT_0) {
+        ::GetExitCodeProcess(process.hProcess, &code);
+    }
+    ::CloseHandle(process.hProcess);
+    bool const ok = wait == WAIT_OBJECT_0 && code == 0;
+    check(ok, label);
+    return ok;
+}
+
+void test_guard_child_scenarios() {
+    if (!name_matches("guardchild")) {
+        return;
+    }
+    struct Case {
+        wchar_t const* scenario;
+        char const* label;
+    };
+    Case const cases[] = {
+        {L"native-create", "guard-child native-create: Native's one-time init retires normally"},
+        {L"actor-inited", "guard-child actor-inited: a valid header + PendingTid{self} retires"},
+        {L"event-signaled", "guard-child event-signaled: the sticky event refuses retirement"},
+        {L"bad-header", "guard-child bad-header: an unrecognised header refuses retirement"},
+        {L"wrong-type", "guard-child wrong-type: a wrong kernel object type refuses retirement"},
+        {L"readonly-zero", "guard-child readonly-zero: a zero header refuses retirement"},
+        {L"abandoned-pending", "guard-child abandoned-pending: PendingNoTid stays uncertain"},
+        {L"abandoned-idle", "guard-child abandoned-idle: the actor's provable clear works"},
+        {L"actor-refs", "guard-child actor-refs: references survive FreeLibrary until the actor closes"},
+        {L"reload", "guard-child reload: no keeper reference leaks per reload"},
+    };
+    for (Case const& item : cases) {
+        run_guard_child(item.scenario, item.label);
+    }
+}
+
+int run_guard_child_scenario(char const* scenario) {
+    struct Entry {
+        char const* name;
+        int (*run)();
+    };
+    Entry const entries[] = {
+        {"native-create", &child_native_create},
+        {"actor-inited", &child_actor_inited_self_pending},
+        {"event-signaled", &child_event_signaled},
+        {"bad-header", &child_bad_header},
+        {"wrong-type", &child_wrong_object_type},
+        {"readonly-zero", &child_readonly_zero_header},
+        {"abandoned-pending", &child_abandoned_pending_no_tid},
+        {"abandoned-idle", &child_abandoned_idle_recovered},
+        {"actor-refs", &child_actor_held_references},
+        {"reload", &child_reload_objects_gone},
+    };
+    for (Entry const& entry : entries) {
+        if (std::strcmp(entry.name, scenario) == 0) {
+            return entry.run();
+        }
+    }
+    std::printf("guard-child: unknown scenario %s\n", scenario);
+    return 2;
+}
+
+// --- 进程内：纯函数、对象名、校验和向量 ---------------------------------------
+
+void test_guard_record_contract() {
+    if (!name_matches("guardrecord")) {
+        return;
+    }
+    check(sizeof(GuardRecord) == gp::kGuardRecordSize, "guard: the record is exactly 40 bytes");
+    check(gp::kGuardRecordVersion == 1, "guard: the record version is frozen at 1");
+
+    // 对象名：唯一格式化函数、完整 16 位小写 hex、容量不足绝不截断。
+    wchar_t name[gp::kGuardNameCapacity]{};
+    check(gp::guard_format_object_name(name, std::size(name), gp::kGuardSuffixRecord, 4321,
+                                       0x0123456789ABCDEFull),
+          "guard: the object name can be formatted");
+    check(std::wstring(name) == L"Local\\DeskFeed-payload-guard-4321-0123456789abcdef-record",
+          "guard: the name is pid + 16 lowercase hex + suffix");
+    wchar_t tiny[16]{};
+    check(!gp::guard_format_object_name(tiny, std::size(tiny), gp::kGuardSuffixRecord, 4321, 1),
+          "guard: a too-small buffer is refused instead of truncated");
+    check(!gp::guard_format_object_name(nullptr, 128, gp::kGuardSuffixRecord, 1, 1),
+          "guard: a null buffer is refused");
+    check(!gp::guard_format_object_name(name, std::size(name), nullptr, 1, 1),
+          "guard: a null suffix is refused");
+    // 恰好 kGuardNameCapacity 个字符且没有 NUL 时，长度必须停在容量上（不许读到缓冲之外）。
+    wchar_t full[gp::kGuardNameCapacity];
+    for (std::size_t index = 0; index < std::size(full); ++index) {
+        full[index] = L'x';
+    }
+    check(gp::guard_name_length(full) == gp::kGuardNameCapacity,
+          "guard: name length stops at the capacity boundary");
+
+    // 校验和向量（冻结）：init(seq=1) / PendingNoTid(seq=2) / PendingTid(0x1234, seq=3)。
+    GuardRecord record{};
+    gp::guard_init_new_record(record, 1);
+    check(record.size == gp::kGuardRecordSize && record.version == gp::kGuardRecordVersion,
+          "guard: init writes the immutable header");
+    check(gp::guard_header_ok(record), "guard: init leaves a valid header");
+    check(gp::guard_snapshot_ok(record), "guard: init leaves a valid snapshot");
+    check(record.checksum == 3603915268u, "guard: init(seq=1) checksum vector");
+    check(gp::guard_classify(record) == gp::GuardSnapshot::Idle, "guard: init classifies as Idle");
+
+    gp::guard_make_pending_no_tid(record, 2);
+    check(record.checksum == 795202630u, "guard: PendingNoTid(seq=2) checksum vector");
+    check(gp::guard_classify(record) == gp::GuardSnapshot::PendingNoTid,
+          "guard: PendingNoTid classifies as itself");
+    check(record.size == gp::kGuardRecordSize && record.version == gp::kGuardRecordVersion,
+          "guard: writing the snapshot never touches the immutable header");
+
+    gp::guard_make_pending_tid(record, 0x1234, 3);
+    check(record.checksum == 1666159386u, "guard: PendingTid(0x1234, seq=3) checksum vector");
+    check(gp::guard_classify(record) == gp::GuardSnapshot::PendingTid,
+          "guard: PendingTid classifies as itself");
+
+    gp::guard_make_idle(record, 4);
+    check(record.tid == 0 && gp::guard_classify(record) == gp::GuardSnapshot::Idle,
+          "guard: Idle clears the tid");
+
+    // 负例：任何一处不认都必须归 Unknown（Native 只认 header，actor 认整体快照）。
+    GuardRecord broken = record;
+    broken.version = gp::kGuardRecordVersion + 1;
+    check(!gp::guard_header_ok(broken), "guard: a wrong version fails the header");
+    check(gp::guard_classify(broken) == gp::GuardSnapshot::Unknown,
+          "guard: a wrong version classifies as Unknown");
+    broken = record;
+    broken.size = 0;
+    check(!gp::guard_header_ok(broken), "guard: a zero size fails the header");
+    broken = record;
+    broken.checksum ^= 0x1u;
+    check(!gp::guard_snapshot_ok(broken), "guard: a wrong checksum fails the snapshot");
+    check(gp::guard_header_ok(broken), "guard: the header is still fine with a wrong checksum");
+    broken = record;
+    broken.reserved = 1;
+    check(!gp::guard_snapshot_ok(broken), "guard: a non-zero reserved fails the snapshot");
+    broken = record;
+    broken.reserved2 = 1;
+    check(!gp::guard_snapshot_ok(broken), "guard: a non-zero reserved2 fails the snapshot");
+    broken = record;
+    broken.state = gp::kGuardStatePendingTid + 1;
+    check(!gp::guard_snapshot_ok(broken), "guard: an unknown state fails the snapshot");
+    broken = record;
+    gp::guard_make_pending_tid(broken, 0, 5);
+    check(!gp::guard_snapshot_ok(broken), "guard: PendingTid without a tid fails the snapshot");
+    broken = record;
+    gp::guard_make_pending_tid(broken, gp::kGuardMaxTid + 1, 5);
+    check(!gp::guard_snapshot_ok(broken), "guard: a tid beyond 32 bits fails the snapshot");
+    broken = record;
+    gp::guard_make_idle(broken, 5);
+    broken.tid = 7;
+    broken.checksum = gp::guard_snapshot_fnv(broken);
+    check(!gp::guard_snapshot_ok(broken), "guard: Idle with a tid fails the snapshot");
+}
+
+// --- 进程内：恢复分支表（真线程 + 官方 Toolhelp，不 mock） ---------------------
+
+bool test_tid_present(std::uint32_t process_id, std::uint32_t thread_id) {
+    HANDLE const snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return true;  // 查不出来按"仍在"（fail closed）
+    }
+    bool found = false;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (::Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID == process_id && entry.th32ThreadID == thread_id) {
+                found = true;
+                break;
+            }
+        } while (::Thread32Next(snapshot, &entry));
+    }
+    ::CloseHandle(snapshot);
+    return found;
+}
+
+void test_guard_recovery_table() {
+    if (!name_matches("guardrecovery")) {
+        return;
+    }
+    // 真线程制造"TID 在场/离场"：线程等在事件上 ⇒ 在场；置位并等它退出 ⇒ 离场。
+    HANDLE const gate = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE const thread =
+        ::CreateThread(nullptr, 0, [](void* parameter) -> DWORD {
+            ::WaitForSingleObject(static_cast<HANDLE>(parameter), 5000);
+            return 0;
+        }, gate, 0, nullptr);
+    check(gate != nullptr && thread != nullptr, "guard: a real thread exists for the tid probe");
+    if (gate != nullptr && thread != nullptr) {
+        DWORD const tid = ::GetThreadId(thread);
+        bool const present = test_tid_present(::GetCurrentProcessId(), tid);
+        check(present, "guard: Toolhelp really sees the live thread in this process");
+
+        GuardRecord pending{};
+        gp::guard_init_new_record(pending, 1);
+        gp::guard_make_pending_tid(pending, tid, 2);
+        check(gp::guard_recovery(gp::guard_classify(pending), gp::GuardTidProbe::Present) ==
+                  gp::GuardRecovery::KeepUncertain,
+              "guard: PendingTid with a live tid stays uncertain");
+
+        ::SetEvent(gate);
+        ::WaitForSingleObject(thread, 5000);
+        ::CloseHandle(thread);
+        bool const absent = !test_tid_present(::GetCurrentProcessId(), tid);
+        check(absent, "guard: Toolhelp really stops seeing the exited thread");
+        check(gp::guard_recovery(gp::guard_classify(pending),
+                                 absent ? gp::GuardTidProbe::Absent : gp::GuardTidProbe::Present) ==
+                  gp::GuardRecovery::ClearAndContinue,
+              "guard: PendingTid with an absent tid is provable");
+    }
+    if (gate != nullptr) {
+        ::CloseHandle(gate);
+    }
+
+    GuardRecord idle{};
+    gp::guard_init_new_record(idle, 1);
+    check(gp::guard_recovery(gp::GuardSnapshot::Idle, gp::GuardTidProbe::NotQueried) ==
+              gp::GuardRecovery::ClearAndContinue,
+          "guard: Idle is provable without a tid lookup");
+
+    GuardRecord pending_no_tid{};
+    gp::guard_init_new_record(pending_no_tid, 1);
+    gp::guard_make_pending_no_tid(pending_no_tid, 2);
+    check(gp::guard_recovery(gp::GuardSnapshot::PendingNoTid, gp::GuardTidProbe::Absent) ==
+              gp::GuardRecovery::KeepUncertain,
+          "guard: PendingNoTid stays uncertain even with an absent probe");
+    check(gp::guard_recovery(gp::GuardSnapshot::PendingTid, gp::GuardTidProbe::LookupFailed) ==
+              gp::GuardRecovery::KeepUncertain,
+          "guard: a failed tid lookup stays uncertain");
+    check(gp::guard_recovery(gp::GuardSnapshot::Unknown, gp::GuardTidProbe::Absent) ==
+              gp::GuardRecovery::KeepUncertain,
+          "guard: an unknown snapshot stays uncertain");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::wstring audit_path;
+    char const* guard_child = nullptr;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--filter") == 0 && index + 1 < argc) {
             g_filter = argv[++index];
         } else if (std::strcmp(argv[index], "--audit") == 0 && index + 1 < argc) {
             audit_path = widen(argv[++index]);
+        } else if (std::strcmp(argv[index], "--guard-child") == 0 && index + 1 < argc) {
+            guard_child = argv[++index];
         }
+    }
+
+    // 守卫场景必须在**新进程**里跑：对象名按 pid+creation 命名，`DllMain` 每个进程只 attach 一次。
+    if (guard_child != nullptr) {
+        return run_guard_child_scenario(guard_child);
     }
 
     if (!audit_path.empty()) {
@@ -946,6 +1707,9 @@ int main(int argc, char** argv) {
         test_status_abi();
         test_status_fail_closed();
         test_retire_glue();
+        test_guard_record_contract();
+        test_guard_recovery_table();
+        test_guard_child_scenarios();
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

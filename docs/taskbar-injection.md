@@ -1,10 +1,12 @@
 # 任务栏真嵌入与显示邮箱（Phase 2）
 
-> **部分实现。** 显示邮箱（主进程发布“最新完整帧”）已经落地，并有一条按 scope 隔离的离线验收
-> 通道 `--frame-mailbox`；负载 `deskfeed-payload.dll` 已经实现（只读最新显示帧、渲染进任务栏
-> XAML 树、收尾门禁见 [native-safety.md](native-safety.md)），`deskfeed-inject.exe`、
-> `deskfeed-probe.exe` 尚未实现**。当前版本没有任何注入工具，任务栏上不显示任何东西。本文记录
-> 计划与硬性约束，供接手实现的人使用。
+> **离线侧已实现，真机侧尚未验收。** 显示邮箱（主进程发布“最新完整帧”）已经落地，并有一条按 scope
+> 隔离的离线验收通道 `--frame-mailbox`；负载 `deskfeed-payload.dll`（生产）与
+> `deskfeed-payload-test.dll`（同源自测）已经实现（只读最新显示帧、渲染进任务栏 XAML 树、收尾门禁
+> 与进程守卫见 [native-safety.md](native-safety.md)），注入/卸载工具 `deskfeed-inject.exe` 与自测宿主
+> `deskfeed-probe.exe` 也已经实现并有离线用例。**真机那条路**（真 `explorer.exe`、真 XAML 走查、
+> `--cores 1/2/3` 矩阵）**尚未**验收；没有任何默认开关会触发注入，真实注入只在用户明确授权下按
+> [native-safety.md](native-safety.md) 的纪律逐轮做。本文记录设计、硬性约束与已知风险。
 
 ## 目标
 

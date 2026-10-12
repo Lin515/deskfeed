@@ -15,8 +15,32 @@ ctest --test-dir .agent/build/debug --output-on-failure
 单行/空白判据、完整替换、失效与恢复、独立到期与不续期、首份即过期、调度夹取、命令行解析、
 实例名白名单、控制通道线格式、地址解析/脱敏/点段合并、设置文件保留其它键、进程绑定的“已退出”拒绝、
 回环 HTTP 的整次墙钟预算与取消、显示帧编解码与显示邮箱（每次读的帧头校验、生产者退出后不再交出
-陈旧帧、消费者始终绑定原生产者身份）、检查器输出的严格 JSON 与 `--stdin` 的管道输入。
+陈旧帧、消费者始终绑定原生产者身份）、检查器输出的严格 JSON 与 `--stdin` 的管道输入、
+以及条件退出与 `--wait-exit-ms` 的“等到实例真的退出 / 拿不到证据就返回 5 且不发 IPC”两条路径。
 全部离线：不读凭据、不连外网、不注入、不碰用户正在跑的实例（回环用例只连 `127.0.0.1`）。
+
+CTest 注册 8 条：
+
+| 用例 | 内容 |
+| --- | --- |
+| `deskfeed-tests` | 协议/状态机/帧/邮箱/检查器/主进程事务与条件退出 |
+| `deskfeed-native-tests` | 负载侧：显示帧消费策略、钩子门收尾协议、C++/SEH 边界、导入表改写、回收门位、真 DLL 的 `status` / `glue` / `failclosed` / 进程守卫 |
+| `deskfeed-supervisor-tests` | 主进程侧任务栏编排，配 `deskfeed-fake-injector`（**不注入任何进程**的假注入器） |
+| `deskfeed-tools-tests` | 注入器工具：目标解析、远程调用超时与迟到写者、per-target 租约 |
+| `deskfeed-payload-audit` | 成品**生产** DLL 的导入表 / 导出名 / map 审计 |
+| `deskfeed-payload-test-audit` | 成品**自测** DLL 的同款审计（探针入口必须仍在） |
+| `deskfeed-widget-tests` | 悬浮窗纯逻辑与偏好 |
+| `deskfeed-widget-window-tests` | 悬浮窗隐藏窗口门禁（真的建窗口，但强制隐藏） |
+
+一律带 `--no-tests=error`，避免“没有注册用例”被当成绿。
+
+`deskfeed-native-tests` 的过滤器：`--filter feed` / `seh` / `retire` / `status` / `glue` / `failclosed` /
+`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十条进程守卫场景各自在**新子进程**里跑
+（父进程用 `CreateProcessW` 起自己，`--guard-child <场景>`，断言退出码）：守卫对象名按目标
+pid + 创建时间命名、`DllMain` 每个进程只 attach 一次，所以“Native 自己 init / actor 先 init /
+粘性事件已置位 / 坏 header / 错类型对象 / 只读零 header / abandoned 恢复 / 引用跨 FreeLibrary /
+每轮 reload 不泄漏”必须分别是新进程。这些用例只碰**用例自己的进程**：`LoadLibrary` 成品 DLL、
+建自己的命名对象与线程，不注入 explorer、不起可见 GUI、不碰任务栏与光标。
 
 ## 离线检查器
 
@@ -90,7 +114,9 @@ Get-Content inspect.json
 
 ## 验收时不得做的事
 
-- 不注入 `explorer.exe`，不调用任何注入/卸载工具（当前版本根本没有这些能力）。
+- 不注入 `explorer.exe`，也不运行 `deskfeed-inject.exe` 的真实注入路径：工具已经构建，但真实注入必须
+  由用户明确授权，并按 [native-safety.md](native-safety.md) 的纪律逐轮做。离线用例只在自己的进程里
+  `LoadLibrary` 成品 DLL（`deskfeed-native-tests`），不碰别人的进程。
 - 不用镜像名批量结束进程（`taskkill /IM`），不因为 IPC 超时就重开或强杀实例。
 - 不用默认（生产）命名空间做验收；一律带 `--scope <名字>`。
 - 不在验收脚本里改动 `%APPDATA%\DeskFeed\settings.ini`（生产实例的设置）；隔离开关会把它换到
@@ -108,4 +134,4 @@ Get-Content inspect.json
 | HTTP | 本地/远程 HTTP(S)、仅 200 接纳、204/304 不代替清空、有界 redirect、禁 TLS 降级、手动刷新不改 URL |
 | 配置事务 | URL 落盘/重启独立、PID 不落盘、无 URL、不同字符串换源清缓存、同 URL 重绑；非法 PID/保存失败整条无副作用 |
 | 命令与竞态 | 无参不接管、`--url` 单独解绑、并发短命客户端、就绪/发送超时、迟到旧 HTTP、旧绑定退出不影响新绑定 |
-| 显示与任务栏 | Phase 2/3：一个主进程、两面同态、邮箱只读最新完整帧、DLL 重新加载、explorer 重启、主进程正常/异常退出清理 |
+| 显示与任务栏 | 显示帧/邮箱与负载侧收尾协议在**离线与自测宿主**范围内已验证（含进程守卫与两侧 DLL 审计）；真机 `explorer.exe`、真 XAML 走查与 `--cores 1/2/3` 矩阵**尚未**验收 |

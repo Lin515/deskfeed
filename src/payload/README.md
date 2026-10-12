@@ -3,17 +3,29 @@
 任务栏负载 DLL（`deskfeed-payload.dll`）的源码。它被注入 `explorer.exe`，只做一件事：读主进程发布的
 **最新显示帧**，把通用读数渲染进任务栏托盘的 XAML 树，并在主进程退出或崩溃时把一切拆干净。
 
+**两个产物、一份源**：生产 `deskfeed-payload.dll` 与自测 `deskfeed-payload-test.dll` 用同一份源列表、
+同一清单、同一 CFG/MAP，唯一差异是后者多一个 `DESKFEED_DLL_TEST_API`（见 `payload_flavor.h`）。
+探针 ABI 与全部对抗开关只在自测构建里编译；生产 DLL 的导出表只有 `DeskFeedStart` / `DeskFeedStop` /
+`DeskFeedGetStatus` 与两个 COM 入口，**没有**任何 `DeskFeedProbe*` / `DeskFeedTest*`。这条由
+`deskfeed-native-tests --audit <dll>` 两侧各一条 CTest 断言。
+
 硬边界（验收判据见 [docs/native-safety.md](../../docs/native-safety.md) 与
 [docs/taskbar-injection.md](../../docs/taskbar-injection.md)）：
 
 - **不解析任何协议、不发任何网络请求、不判断业务语义**。唯一输入是 `display/mailbox.h` 的
   `DisplayFrameConsumer` 读到的一帧；渲染口径来自 `display/reading.h` 的纯格式化器。
 - 映射文件（`deskfeed-payload.map`）与导入表是这条边界的机器可读证据：模块里没有 WinHTTP、没有
-  DbHelp、没有 JSON/快照/协议校验器，`core/` 里只有 `utf8_convert.cpp`（纯转换）被拉进来。
+  DbgHelp、没有 JSON/快照/协议校验器，`core/` 里只有 `utf8_convert.cpp`（纯转换）被拉进来。
 
 | 文件 | 作用 |
 | --- | --- |
-| `dllmain.cpp` | 入口与导出。`DllMain` 只记模块句柄、`DisableThreadLibraryCalls`、建清理事件；`DeskFeedStart(void* scope)` / `DeskFeedStop(void* timeout_ms)` 都是 `DWORD WINAPI f(void*)`（给 `CreateRemoteThread` 用），外加 COM 的 `DllGetClassObject` / `DllCanUnloadNow` 与自测宿主用的 `DeskFeedProbe*` 一组导出。 |
+| `dllmain.cpp` | 入口与导出。`DllMain` 只记模块句柄、`DisableThreadLibraryCalls`、建清理事件、拿进程守卫对象的引用；`DeskFeedStart(void* scope)` / `DeskFeedStop(void* timeout_ms)` 都是 `DWORD WINAPI f(void*)`（给 `CreateRemoteThread` 用），外加 COM 的 `DllGetClassObject` / `DllCanUnloadNow`；`DeskFeedProbe*` 一组与两个 `DeskFeedTest*` 只在自测/测试 DLL 构建里存在。 |
+| `payload_flavor.h` | **唯一**构建风味开关：`DESKFEED_DLL_TEST_API \|\| DESKFEED_NATIVE_TESTS` ⇒ `DESKFEED_PAYLOAD_PROBE_BUILD`。生产两个都不定义，所以探针入口与全部对抗开关**根本不编译**（不是"启动时复位成正常"）。 |
+| `guard_record.h` | 进程守卫的**唯一**共同定义：40 字节记录布局、状态值、对象名格式、FNV-1a、`guard_header_ok` / `guard_snapshot_ok` / `guard_classify` / `guard_recovery` 等纯函数。工具侧（`src/inject/guard.*`）只 `include` 它并用别名，**不复制**布局或常量。 |
+| `guard_keeper.h` / `guard_keeper.cpp` | Native 侧持有那三个命名内核对象（租约 mutex / 粘性 event / 记录 mapping）的引用：`DllMain` 里一次性 prepare（只 kernel32 + 栈；只有创建者才做一次 init 后降级只读视图）、`DeskFeedStop` 的第一道 fail-closed 门、DETACH 时只归还自己的引用。 |
+| `retire_gates.h` | 回收门位与 `unload_safe` 的**唯一**推导处（纯逻辑，负载与离线用例共用同一份）。 |
+| `status_pod.h` | 状态 ABI（定长 POD，无指针跨进程）：`thread_alive` / `unload_safe` / `dangling` / `mailbox_attached` / `producer_*` / `scope` 等。 |
+| `probe_api.h` | 自测宿主用的探针 ABI（POD 定义）。只在自测构建里被 include。 |
 | `host.h` / `host.cpp` | 负载生命周期：日志、DPI 感知、**先**建调度队列**再**初始化 WinRT 单元、起动作工作线程、挂邮箱、把第一帧渲染进任务栏、消息循环（等通知事件与生产者进程句柄）、按 `feed` 的策略更新或摘块、以及带门禁的拆除顺序。 |
 | `feed.h` / `feed.cpp` | 显示帧的**消费策略**（纯逻辑，可离线测）：正常收尾与生产者死亡都摘块、生产者活着但帧坏了才沿用上一帧且有界。 |
 | `hook_post.h` / `hook_post.cpp` | 把动作编组到任务栏线程并给这条路径一个可证明的收尾：原子取走的单次卸钩、装钩前的非 PIN 自引用、"完成事件 + 非排队消息"两道证明、以及"超时不卸钩、不还引用、不报告可卸载"。协议说明见 docs/native-safety.md。 |

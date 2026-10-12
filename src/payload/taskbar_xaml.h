@@ -5,6 +5,7 @@
 #include <string>
 
 #include "display/reading.h"
+#include "payload/payload_flavor.h"
 
 // 把主进程算出来的**通用读数**插进任务栏的 XAML 树，并让任务栏按自己的布局给它腾地方。
 //
@@ -57,5 +58,16 @@ void taskbar_xaml_set_probe_inline(bool inline_mode);
 // 自测宿主专用：宿主自己的宿主窗口。它同时作为悬停提示的属主与钩子收尾那次
 // `SendMessageTimeout(WM_NULL)` 的确认窗口——必须是**属于同一条 UI 线程**的、user32 类的窗口。
 void taskbar_xaml_set_host_window(HWND window);
+
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+// 自测宿主专用：把宿主**自己的岛**登记成这一次 attach 的托盘目标（也就是 T）——`--feed` 那条路要的
+// 是"负载经真实 `WH_GETMESSAGE` 编组把帧渲染进宿主的岛"，所以这里换的是要做投递的那个窗口，而不是
+// `taskbar_xaml_set_host_window` 那个"悬停提示属主 + 钩子确认窗口"（那是 `--mock` inline 模式的语义，
+// 两种模式互斥，绝不互相顶替）。只在自测构建里存在，生产 DLL 里连这段代码都不编译。
+//
+// 登记之后（`hook_post_probe_armed()` 为真）`taskbar_xaml_attach` **只**认这个窗口：它不在了、不属于
+// 本进程、或登记的是空窗口，attach 一律直接失败，**绝不**回退去找真实的 `Shell_TrayWnd`。
+void taskbar_xaml_probe_set_tray_override(HWND window);
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 
 }  // namespace deskfeed::payload

@@ -35,14 +35,17 @@ CTest 注册 8 条：
 一律带 `--no-tests=error`，避免“没有注册用例”被当成绿。
 
 `deskfeed-native-tests` 的过滤器：`--filter feed` / `seh` / `retire` / `status` / `glue` / `failclosed` /
-`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十一条进程守卫场景各自在**新子进程**里跑
+`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十三条进程守卫场景各自在**新子进程**里跑
 （父进程用 `CreateProcessW` 起自己，`--guard-child <场景>`，断言退出码）：守卫对象名按目标
 pid + 创建时间命名、`DllMain` 每个进程只 attach 一次，所以“Native 自己 init / actor 先 init /
 粘性事件已置位 / 坏 header / 错类型对象 / 只读零 header / abandoned 恢复 / 引用跨 FreeLibrary /
 每轮 reload 不泄漏（含逐轮句柄数回到基线、命名清理事件在 `FreeLibrary` 后必须消失）/
-无名钩子事件在 DETACH 归还”必须分别是新进程。这些用例只碰**用例自己的进程**：`LoadLibrary` 成品 DLL、
-建自己的命名对象、线程与一条**隐藏**的合成 UI 线程（`hookevents` 用它把真实的 `WH_GETMESSAGE` 线程
-钩子装到自己的线程上；窗口是不可见的 STATIC，不注入 explorer、不起可见 GUI、不碰真实任务栏与光标）。
+无名钩子事件在 DETACH 归还 / R5 登记的托盘目标真的是这次 attach 的 T（`probtray`）以及登记之后它
+消失时绝不回退真实 `Shell_TrayWnd`（`probtraydead`）”必须分别是新进程。这些用例只碰**用例自己的
+进程**：`LoadLibrary` 成品 DLL、建自己的命名对象、线程、一条**隐藏**的合成 UI 线程（`hookevents` 与
+`probtray*` 用它把真实的 `WH_GETMESSAGE` 线程钩子装到自己的线程上）与一个自己的显示邮箱生产者
+（`probtray*` 用它让负载真的走到 attach）；窗口都是不可见的 STATIC，不注入 explorer、不起可见 GUI、
+不碰真实任务栏与光标。
 
 ## 离线检查器
 
@@ -133,7 +136,21 @@ Get-Content inspect.json
 | 校验与容量 | 未知字段忽略；类型/必填/版本/state/id/重复 id 整份拒绝；业务 `error` 不串项；所有容量临界值；UTF-8/BOM/null/单行/多行 |
 | 失效与恢复 | 第一次失败无值显示红 `ERROR`；有值立即全红且无保留截止；合法新值恢复各项 `state` |
 | 到期 | 未声明不推断年龄；声明后独立生效；反复 200 旧快照不续期；首份过期非空快照显示红值 |
-| HTTP | 本地/远程 HTTP(S)、仅 200 接纳、204/304 不代替清空、有界 redirect、禁 TLS 降级、手动刷新不改 URL |
+| HTTP | **单元层**（CTest 内的 `deskfeed-tests`，只连进程内 `127.0.0.1` 的 mock 生产端）：仅 200 接纳、204/304 不代替清空、有界 redirect、正文超限、慢头部/慢滴流、取消；**真实 HTTPS/TLS** 不在 CTest 里，见下面"独立 HTTPS 检查器验收" |
 | 配置事务 | URL 落盘/重启独立、PID 不落盘、无 URL、不同字符串换源清缓存、同 URL 重绑；非法 PID/保存失败整条无副作用 |
 | 命令与竞态 | 无参不接管、`--url` 单独解绑、并发短命客户端、就绪/发送超时、迟到旧 HTTP、旧绑定退出不影响新绑定 |
 | 显示与任务栏 | 显示帧/邮箱与负载侧收尾协议在**离线与自测宿主**范围内已验证（含进程守卫与两侧 DLL 审计）；真机 `explorer.exe`、真 XAML 走查与 `--cores 1/2/3` 矩阵**尚未**验收 |
+
+### 独立 HTTPS 检查器验收（2026-10-13）
+
+公开 CTest **不含**真实 HTTPS 用例（那需要外部网络与证书链），所以真实 TLS 这一层由一次**独立检查器
+验收**覆盖，结论按证据记录、不与单元用例混算：
+
+- 成功接纳 63 字节 JSON 正文，证书链校验按 WinHTTP 默认策略通过（无 `--insecure` 类开关）；
+- 故意坏证书组 3 次全部拒绝，`WinHTTP` 错误码 `12175 / 0x2F8F`（证书校验失败）；
+- 重定向 5 例通过，其中包含"第二跳试图降级到明文"的那一例（按禁降级拒绝，不是跟随）；
+- 语料 148/0 + 4 WARN、HTTP 32/0 + 5 WARN、预算 20 例无违例；全部 WARN 只是 `kind` 取值或报告里
+  未承诺字段的缺失，主控已明确批准保留、不掩盖合约。
+
+这一节只说明"独立检查器这一次验收看到了什么"；它不把 CTest 里的回环用例说成 TLS 单元测试，也不构成
+对任意第三方服务器的持续可用性承诺。

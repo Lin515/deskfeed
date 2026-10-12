@@ -14,7 +14,8 @@
 //   deskfeed-native-tests --filter failclosed 只跑 GetStatus 的坏指针/不认 ABI 失败路径
 //   deskfeed-native-tests --filter guard      只跑进程守卫（纯函数/名字/校验和/恢复表 + 子进程场景）
 //   deskfeed-native-tests --guard-child <场景> 内部用法：父进程把自己当**新进程**起出来跑一个守卫场景
-//                                              （含 reload 的句柄零增长与 hookevents 的无名钩子事件归还）
+//                                              （含 reload 的句柄零增长、hookevents 的无名钩子事件归还，
+//                                              以及 probtray 的 R5 托盘目标覆盖与失败关闭）
 #include "display/mailbox.h"
 #include "payload/action_worker.h"
 #include "payload/feed.h"
@@ -1464,25 +1465,47 @@ int child_reload_objects_gone() {
 struct SyntheticUiThread {
     std::atomic<bool> stop{false};
     std::atomic<HWND> window{nullptr};
+    // 第二个 own 窗口：给"覆盖窗口被销毁、确认窗口还活着"这种组合用（两个窗口都在这一条 UI 线程上，
+    // 所以钩子门那次身份复验看的是同一条线程）。
+    std::atomic<HWND> second{nullptr};
+    std::atomic<bool> destroy_second_requested{false};
     std::atomic<DWORD> thread_id{0};
     HANDLE thread = nullptr;
+
+    static HWND make_window() {
+        return ::CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+                                 ::GetModuleHandleW(nullptr), nullptr);
+    }
 
     static DWORD WINAPI entry(void* parameter) {
         auto* const self = static_cast<SyntheticUiThread*>(parameter);
         self->thread_id.store(::GetCurrentThreadId());
-        HWND const window = ::CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr,
-                                              nullptr, ::GetModuleHandleW(nullptr), nullptr);
+        HWND const window = make_window();
         self->window.store(window);
+        self->second.store(make_window());
         if (window == nullptr) {
             return 1;
         }
         MSG message{};
         while (!self->stop.load(std::memory_order_acquire)) {
+            // 窗口只能在它的属主线程上销毁，所以"销毁第二个窗口"是一次跨线程请求。
+            if (self->destroy_second_requested.exchange(false, std::memory_order_acq_rel)) {
+                HWND const target = self->second.load();
+                if (target != nullptr) {
+                    ::DestroyWindow(target);
+                    self->second.store(nullptr);
+                }
+            }
             while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                 ::TranslateMessage(&message);
                 ::DispatchMessageW(&message);
             }
             ::MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        HWND const leftover = self->second.load();
+        if (leftover != nullptr) {
+            ::DestroyWindow(leftover);
+            self->second.store(nullptr);
         }
         ::DestroyWindow(window);
         self->window.store(nullptr);
@@ -1494,7 +1517,20 @@ struct SyntheticUiThread {
         for (int attempt = 0; attempt < 500 && window.load() == nullptr; ++attempt) {
             ::Sleep(10);
         }
-        return thread != nullptr && window.load() != nullptr;
+        return thread != nullptr && window.load() != nullptr && second.load() != nullptr;
+    }
+
+    // 让 UI 线程销毁第二个窗口，并有界地等它真的消失。
+    bool destroy_second_window() {
+        if (second.load() == nullptr) {
+            return false;
+        }
+        destroy_second_requested.store(true, std::memory_order_release);
+        ::PostThreadMessageW(thread_id.load(), WM_NULL, 0, 0);
+        for (int attempt = 0; attempt < 300 && second.load() != nullptr; ++attempt) {
+            ::Sleep(10);
+        }
+        return second.load() == nullptr;
     }
 
     void shutdown() {
@@ -1606,6 +1642,191 @@ int child_hook_events_released() {
     return child_result("hookevents");
 }
 
+// ---------------------------------------------------------------------------
+// R5 的托盘目标覆盖（`--feed` 那条路）
+// ---------------------------------------------------------------------------
+//
+// `DeskFeedProbeSetTrayWindow` 登记的是"负载要把帧投进哪个窗口"的那个 T；attach 必须真的认它，而且
+// 登记之后**绝不**回退去找真实的 `Shell_TrayWnd`。两个子用例都在**本进程**里给机械判据（不查、不碰
+// 真实托盘窗口，不起可见 GUI，不动光标）：
+//
+//   * 判据不是某个标志位，而是收尾那次 `WM_NULL` 的身份复验：`hook_post_retire` 要求**确认窗口的
+//     属主线程 == 这次选定的 T 的线程**。子用例先在目标线程上真装一次钩子（`DeskFeedProbePostApply`
+//     加 `DeskFeedProbeHookStatus` 证明真的走过、门是开的），再 `DeskFeedStop`：
+//       - 覆盖被消费 ⇒ T 就是那个岛 ⇒ 线程一致 ⇒ Stop 1；
+//       - 覆盖没被消费（回退真实 `Shell_TrayWnd`）⇒ T 是 explorer 的线程、确认窗口是自己的 ⇒ Stop 0。
+//   * 负例：登记之后把岛销毁再 Start ⇒ attach 必须直接失败（不回退）；确认窗口换成另一个**还活着**
+//     的 own 窗口，再照上面装一次钩子 ⇒ Stop 仍必须是 1（回退那条路会选成真实托盘 ⇒ 0）。
+//
+// 这一个子用例返回 Stop 的返回值；-1 表示前置步骤没走到（调用方据此判红）。
+DWORD probe_target_round(SyntheticUiThread& ui, deskfeed::DisplayFrameProducer& producer, HWND island,
+                         bool destroy_island, HWND live_ack, std::wstring const& scope,
+                         std::string const& tag) {
+    using SetTrayFn = int(__stdcall*)(HWND);
+    using SetHostFn = void(__stdcall*)(HWND);
+    using PostFn = int(__stdcall*)(unsigned, unsigned);
+    using StatusFn = int(__stdcall*)(gp::HookProbeStatus*, unsigned);
+
+    PayloadApi api;
+    check(api.load(L"deskfeed-payload-test.dll"), (tag + ": the self-test payload loads").c_str());
+    if (api.module == nullptr) {
+        return static_cast<DWORD>(-1);
+    }
+    auto const set_tray =
+        reinterpret_cast<SetTrayFn>(::GetProcAddress(api.module, "DeskFeedProbeSetTrayWindow"));
+    auto const set_host =
+        reinterpret_cast<SetHostFn>(::GetProcAddress(api.module, "DeskFeedProbeSetHost"));
+    auto const post =
+        reinterpret_cast<PostFn>(::GetProcAddress(api.module, "DeskFeedProbePostApply"));
+    auto const hook_status =
+        reinterpret_cast<StatusFn>(::GetProcAddress(api.module, "DeskFeedProbeHookStatus"));
+
+    bool ok = set_tray != nullptr && set_host != nullptr && post != nullptr && hook_status != nullptr;
+    check(ok, (tag + ": the probe entries resolve").c_str());
+    if (ok) {
+        ok = set_tray(island) == 1;
+        check(ok, (tag + ": R5 accepts this process's own island window").c_str());
+    }
+    if (ok && destroy_island) {
+        ok = ui.destroy_second_window();
+        check(ok, (tag + ": the registered island is really gone before Start").c_str());
+    }
+    if (ok && live_ack != nullptr) {
+        // 把"帧已弹掉"的确认窗口挪到另一个**还活着**的 own 窗口上：负例要单独咬"T 没有被选错"。
+        set_host(live_ack);
+    }
+    if (ok) {
+        DWORD const started = api.start(const_cast<wchar_t*>(scope.c_str()));
+        std::printf("%s: Start -> %lu\n", tag.c_str(), static_cast<unsigned long>(started));
+        ok = started == 1;
+        check(ok, (tag + ": Start accepts").c_str());
+    }
+    if (ok) {
+        // **必须**让生产者发一帧有效快照：没有可读帧时负载的 `feed_decide` 会立刻判 Remove 并退出
+        // 消息循环（负载线程会在我们装钩子之前就自己退休，那这条用例就变成空转的假绿）。
+        deskfeed::Frame frame;
+        frame.generation = 1;
+        frame.produced_at_ms = ::GetTickCount64();
+        frame.kind = deskfeed::ViewKind::Content;
+        deskfeed::FrameItem item;
+        item.id = "probe";
+        item.label = "probe";
+        item.value = "1";
+        item.state = deskfeed::ItemState::Ok;
+        frame.items.push_back(item);
+        bool const published = producer.publish(frame, static_cast<long long>(::GetTickCount64()));
+        check(published, (tag + ": the producer published a complete frame").c_str());
+        if (ok) {
+            ok = published;
+        }
+    }
+    if (ok) {
+        bool attached = false;
+        for (int attempt = 0; attempt < 500 && !attached; ++attempt) {
+            deskfeed::payload::PayloadStatusPod pod{};
+            attached = query_status(api.get, pod) && pod.mailbox_attached == 1;
+            if (!attached) {
+                ::Sleep(10);
+            }
+        }
+        check(attached, (tag + ": the payload attached the display mailbox").c_str());
+        ok = attached;
+    }
+
+    DWORD stop_code = static_cast<DWORD>(-1);
+    if (ok) {
+        // attach 的 T 选择就发生在邮箱挂上之后的同一条线程上；给它一点时间走完这一步。
+        ::Sleep(300);
+        post(ui.thread_id.load(), 3000);
+        gp::HookProbeStatus gate{};
+        gate.size = gp::kProbeStatusSize;
+        gate.version = gp::kProbeStatusVersion;
+        bool const gate_open = hook_status(&gate, gp::kProbeStatusSize) == 1 && gate.retired == 1 &&
+                               gate.hook_installed == 0 && gate.in_flight == 0 &&
+                               gate.completion_expected == 1 && gate.dangling == 0;
+        check(gate_open, (tag + ": a real hook went in on the target thread and the gate is open")
+                             .c_str());
+        if (gate_open) {
+            stop_code = api.stop_ms(5000);
+        }
+    }
+    if (api.module != nullptr) {
+        // 与探针宿主同一口径：把这一轮剩下的加载器引用逐个还回去并计数（子进程随即退出，所以把
+        // 别人的引用也一起还掉是安全的），同时如实打印模块是否真的从映射表里消失。
+        int references = 0;
+        while (::FreeLibrary(api.module)) {
+            ++references;
+        }
+        api.module = nullptr;
+        std::printf("%s: module references at the end: %d (%s)\n", tag.c_str(), references,
+                    ::GetModuleHandleW(sibling_file_path(L"deskfeed-payload-test.dll").c_str()) ==
+                            nullptr
+                        ? "fully unloaded"
+                        : "still mapped");
+    }
+    return stop_code;
+}
+
+int child_probe_tray_target() {
+    SyntheticUiThread ui;
+    check(ui.start(), "probtray: the hidden synthetic UI thread owns its own windows");
+    if (ui.window.load() == nullptr || ui.second.load() == nullptr) {
+        ui.shutdown();
+        return child_result("probtray");
+    }
+
+    std::wstring const scope = L"nativeprobtray";
+    deskfeed::DisplayFrameProducer producer;
+    std::string producer_error;
+    check(producer.create(scope, nullptr, producer_error),
+          "probtray: the test process owns a display mailbox producer");
+    if (!producer.created()) {
+        std::printf("      producer error: %s\n", producer_error.c_str());
+        ui.shutdown();
+        return child_result("probtray");
+    }
+
+    DWORD const consumed = probe_target_round(ui, producer, ui.window.load(), /*destroy_island=*/false,
+                                              /*live_ack=*/nullptr, scope, "probtray");
+    check(consumed == 1,
+          "probtray: Stop retires, so the T attach chose is the registered own island");
+
+    producer.close();
+    ui.shutdown();
+    return child_result("probtray");
+}
+
+// 负例：登记之后岛没了 ⇒ attach 必须失败关闭，**绝不**回退真实 `Shell_TrayWnd`。确认窗口换成另一个
+// 还活着的 own 窗口，再装一次钩子，所以回退那条路会因为"T 的线程 != 确认窗口的线程"而让 Stop 返回 0。
+int child_probe_tray_target_dead() {
+    SyntheticUiThread ui;
+    check(ui.start(), "probtraydead: the hidden synthetic UI thread owns its own windows");
+    if (ui.window.load() == nullptr || ui.second.load() == nullptr) {
+        ui.shutdown();
+        return child_result("probtraydead");
+    }
+
+    std::wstring const scope = L"nativeprobtraydead";
+    deskfeed::DisplayFrameProducer producer;
+    std::string producer_error;
+    check(producer.create(scope, nullptr, producer_error),
+          "probtraydead: the test process owns a display mailbox producer");
+    if (!producer.created()) {
+        std::printf("      producer error: %s\n", producer_error.c_str());
+        ui.shutdown();
+        return child_result("probtraydead");
+    }
+
+    DWORD const no_fallback = probe_target_round(ui, producer, ui.second.load(), /*destroy_island=*/true,
+                                                 /*live_ack=*/ui.window.load(), scope, "probtraydead");
+    check(no_fallback == 1,
+          "probtraydead: a dead registration never falls back to the real tray");
+
+    producer.close();
+    ui.shutdown();
+    return child_result("probtraydead");
+}
+
 // 父进程侧的驱动器：每个场景一个**新进程**（守卫对象名按 pid+creation，DllMain 每进程只跑一次）。
 bool run_guard_child(wchar_t const* scenario, char const* label) {
     wchar_t exe[MAX_PATH]{};
@@ -1658,6 +1879,10 @@ void test_guard_child_scenarios() {
         {L"actor-refs", "guard-child actor-refs: references survive FreeLibrary until the actor closes"},
         {L"reload", "guard-child reload: no keeper reference leaks per reload"},
         {L"hookevents", "guard-child hookevents: the unnamed hook events are returned on DETACH"},
+        {L"probtray",
+         "guard-child probtray: the R5 registered island really is the T attach chose"},
+        {L"probtraydead",
+         "guard-child probtraydead: a dead R5 registration never falls back to the real tray"},
     };
     for (Case const& item : cases) {
         run_guard_child(item.scenario, item.label);
@@ -1681,6 +1906,8 @@ int run_guard_child_scenario(char const* scenario) {
         {"actor-refs", &child_actor_held_references},
         {"reload", &child_reload_objects_gone},
         {"hookevents", &child_hook_events_released},
+        {"probtray", &child_probe_tray_target},
+        {"probtraydead", &child_probe_tray_target_dead},
     };
     for (Entry const& entry : entries) {
         if (std::strcmp(entry.name, scenario) == 0) {

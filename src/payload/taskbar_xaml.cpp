@@ -132,6 +132,13 @@ std::atomic<bool> g_probe_ack_window_used{false};
 HWND g_tooltip = nullptr;
 HWND g_ack_window_override = nullptr;
 
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+// 自测宿主登记的本进程托盘目标（见 taskbar_xaml.h 的 `taskbar_xaml_probe_set_tray_override`）。
+// 只有它非空、并且 `hook_post_probe_armed()` 为真时，`taskbar_xaml_attach` 才走"只认这个窗口"那条
+// 分支；生产构建里这个变量与那条分支都不存在。
+std::atomic<HWND> g_probe_tray_override{nullptr};
+#endif
+
 std::wstring to_wide(std::string const& text) { return deskfeed::wide_from_utf8(text); }
 
 // 深浅色与取色：XAML 自己的判定优先（ActualTheme 天然跟随系统深浅色切换），拿不到再退回系统设置。
@@ -1027,13 +1034,40 @@ bool taskbar_xaml_watch(std::wstring& error) {
 bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
     (void)scope;
     hook_post_set_executor(&execute_hook_action, nullptr);
-    g_state.tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (g_state.tray == nullptr) {
-        g_state.tray = ::FindWindowW(L"Shell_SecondaryTrayWnd", nullptr);
-    }
-    if (g_state.tray == nullptr) {
-        error = L"找不到 Shell_TrayWnd";
-        return false;
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+    // 自测宿主登记过托盘目标（`DeskFeedProbeSetTrayWindow`，`--feed` 那条路）时**只认**它：
+    //   * 登记过但窗口已经不在 / 不属于本进程 / 线程号为零 ⇒ 直接失败，**绝不**回退 FindWindow；
+    //   * `armed` 为真而覆盖窗口是空的（例如只有 armed 没有窗口这种坏状态）⇒ 同样直接失败，
+    //     绝不让这条回退把帧投到真实的 Shell_TrayWnd 上去。
+    // 生产构建里整段不编译：`attach` 还是那条 `FindWindowW(Shell_TrayWnd/Shell_SecondaryTrayWnd)` 链。
+    if (hook_post_probe_armed()) {
+        HWND const override_window = g_probe_tray_override.load(std::memory_order_acquire);
+        if (override_window == nullptr) {
+            error = L"自测宿主已经登记过托盘目标，当前没有可用的覆盖窗口";
+            return false;
+        }
+        if (::IsWindow(override_window) == FALSE) {
+            error = L"自测宿主指定的托盘窗口已经不在了";
+            return false;
+        }
+        DWORD owner_pid = 0;
+        DWORD const owner_thread = ::GetWindowThreadProcessId(override_window, &owner_pid);
+        if (owner_pid != ::GetCurrentProcessId() || owner_thread == 0) {
+            error = L"自测宿主指定的托盘窗口不属于本进程";
+            return false;
+        }
+        g_state.tray = override_window;
+    } else
+#endif
+    {
+        g_state.tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (g_state.tray == nullptr) {
+            g_state.tray = ::FindWindowW(L"Shell_SecondaryTrayWnd", nullptr);
+        }
+        if (g_state.tray == nullptr) {
+            error = L"找不到 Shell_TrayWnd";
+            return false;
+        }
     }
     DWORD const tray_thread = ::GetWindowThreadProcessId(g_state.tray, nullptr);
     if (tray_thread == 0) {
@@ -1245,5 +1279,11 @@ void taskbar_xaml_set_host_window(HWND window) {
     // 绝不能用本模块自己的窗口过程当确认目标。
     hook_post_set_ack_window(window);
 }
+
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+void taskbar_xaml_probe_set_tray_override(HWND window) {
+    g_probe_tray_override.store(window, std::memory_order_release);
+}
+#endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 
 }  // namespace deskfeed::payload

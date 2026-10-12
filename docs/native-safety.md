@@ -54,6 +54,20 @@ XAML 元素有线程亲和性：只有拥有任务栏那棵树的那条线程（
 - 不按镜像名杀进程，不强行卸载。卸载只有一条路：`DeskFeedStop` 返回"可以卸载"，而且调用它的远程
   线程已经退出。
 
+### 自测宿主的托盘目标（只存在于自测构建）
+
+真实注入里 T 恒为 `Shell_TrayWnd` 的线程。**自测宿主**（`deskfeed-probe.exe --feed`）要在自己的进程里
+走同一条"投递到 UI 线程"的路，所以 `DeskFeedProbeSetTrayWindow(<宿主自己的岛>)` 会把这个窗口登记成
+这一次 attach 的托盘目标，并同时置"已布防"：
+
+- `taskbar_xaml_attach` 在布防状态下**只认**这个窗口：它不在了、不属于本进程、或登记的是空窗口，
+  attach 直接失败，**绝不**回退去找真实的 `Shell_TrayWnd`（这条回退正是"往真实任务栏投递"这件事本身，
+  而自测宿主的存在意义就是不碰它）；
+- `update` 与 `detach` 沿同一次选定的 `g_state.tray` 走，不会中途换目标；
+- `DeskFeedProbeSetTrayWindow(nullptr)` 与"没有布防的 `DeskFeedStart`"都会把这个登记清干净，之后
+  `attach` 回到与生产完全相同的 `FindWindow` 链；
+- 生产 DLL 里这段代码（含登记用的原子变量）**根本不编译**，`attach` 只有 `FindWindow` 那条链。
+
 ## `DeskFeedStop` 的返回值与"绝不强卸"
 
 ```
@@ -146,7 +160,7 @@ actor 还会再查一次状态，提前关就是拿一个已关闭、可能被�
 主人之后才清掉它。这不是拿"钩子句柄为空"或"在途为零"冒充收尾——那两条在回调开头就成立。"完成事件
 被提前置位"这种变异会走 `dangling` 分支，一律保留句柄（fail closed）。
 
-进程退出时的 DETACH（`lpReserved != NULL`）走同一段代码：系统本来就回收整张句柄表，那里关掉同样
+进程退出时的 DETACH 走同一段代码：系统本来就回收整张句柄表，那里关掉同样
 无害。它不是"平常卸载"的借口，也不改变任何结论——可卸载与否只由 `DeskFeedStop` 给出。
 
 ### actor 侧恢复（`WAIT_ABANDONED`）

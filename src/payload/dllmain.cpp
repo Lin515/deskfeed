@@ -201,6 +201,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
                 deskfeed::payload::CompletionMutation::Normal);
             deskfeed::payload::hook_post_probe_set_observer(false);
             deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
+            // 没有布防过就也把"自测宿主自己的托盘目标"清掉：`attach` 只有在这个覆盖存在**并且**
+            // 布防为真时才认它，所以这里清干净就能保证一次普通的 `DeskFeedStart` 与生产路径同形
+            // （FindWindow 那条链），不会因为上一次探针遗留的窗口把 T 换掉。
+            deskfeed::payload::taskbar_xaml_probe_set_tray_override(nullptr);
         }
 #endif
 
@@ -520,12 +524,15 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetCompletionMutatio
 
 // R5：自测宿主自己的托盘窗口。必须属于**本进程**、并且是**同一条** UI 线程（探针随后就用它的
 // 线程 id 走真实钩子门）。校验不过就拒绝，绝不把动作投到别的进程/别的线程上。
-// 置位后**同时**把探针标记为"已布防"，让这个目标活过随后的真实 `DeskFeedStart`。
+// 置位后**同时**把探针标记为"已布防"，让这个目标活过随后的真实 `DeskFeedStart`；同一个窗口也登记成
+// `taskbar_xaml` 这一次 attach 的托盘目标（`--feed` 要的是"负载经真实 WH_GETMESSAGE 编组把帧渲染进
+// 宿主的岛"，所以 attach 必须认它而不是去找真实的 Shell_TrayWnd）。传 nullptr 三者一起清。
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetTrayWindow(HWND window) {
     try {
         if (window == nullptr) {
             deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
             deskfeed::payload::hook_post_probe_set_armed(false);
+            deskfeed::payload::taskbar_xaml_probe_set_tray_override(nullptr);
             return 1;
         }
         if (::IsWindow(window) == FALSE) {
@@ -538,6 +545,7 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetTrayWindow(HWND w
         }
         deskfeed::payload::hook_post_probe_set_tray_window(window);
         deskfeed::payload::hook_post_probe_set_armed(true);
+        deskfeed::payload::taskbar_xaml_probe_set_tray_override(window);
         return 1;
     } catch (...) {
         return 0;
@@ -633,8 +641,8 @@ BOOL APIENTRY DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         // `WM_NULL` ack）才归还，否则一个都不关（fail closed）。两个 helper 都只做 kernel32 调用与
         // 栈上判断：不等待、不分配、不加锁、不日志。
         //
-        // 进程退出时的 DETACH（`lpReserved != NULL`）走同一段代码：系统本来就回收整张句柄表，这里
-        // 关掉同样无害。那不是"平常卸载"的借口，也不改变任何结论——结论只由 `DeskFeedStop` 给出。
+        // 进程退出时的 DETACH 走同一段代码：系统本来就回收整张句柄表，这里关掉同样无害。那不是
+        // "平常卸载"的借口，也不改变任何结论——结论只由 `DeskFeedStop` 给出。
         deskfeed::payload::payload_release_owned_handles();
         deskfeed::payload::hook_post_release_owned_handles();
     }

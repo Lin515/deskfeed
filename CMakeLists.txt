@@ -4,16 +4,16 @@ project(deskfeed LANGUAGES CXX)
 
 # DeskFeed：通用 Windows 桌面信息显示。
 #
-# 当前阶段（Phase 1）：协议/校验/状态机 + 单主进程 + 离线检查器 + 离线用例。
-# 任务栏负载 DLL（deskfeed-payload.dll）与桌面悬浮窗属于 Phase 2/3，尚未实现；
-# 见 docs/architecture.md 的路线表。
+# 当前阶段：协议/校验/状态机 + 单主进程 + 离线检查器、离线用例、任务栏负载 DLL
+# （deskfeed-payload.dll，注入 explorer.exe）、注入器/探针工具与桌面悬浮窗都已实现；
+# 真实注入的验收范围与安全边界见 docs/native-safety.md 与 docs/architecture.md 的路线表。
 #
 # 目标：
 #   deskfeed          deskfeed.exe        主进程（单一取数、状态机、命令通道）
 #   deskfeed-check    deskfeed-check.exe  离线协议检查器 / HTTP 量具
 #   deskfeed-tests    deskfeed-tests.exe  离线用例
 #
-# x64 only：Phase 2 的负载要与 64 位 explorer.exe 同位数，主进程与它保持一致。
+# x64 only：负载要与 64 位 explorer.exe 同位数，主进程与它保持一致。
 
 if(NOT WIN32)
     message(FATAL_ERROR "DeskFeed is Windows-only.")

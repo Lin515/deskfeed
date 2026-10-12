@@ -1,0 +1,77 @@
+# DeskFeed
+
+DeskFeed 是一个通用的 Windows 桌面信息显示工具：它从**一个**只读 HTTP 端点轮询 JSON 快照，
+把其中的条目按生产端给定的顺序与状态显示出来。桌面悬浮窗与任务栏真嵌入组件属于它的显示面。
+
+DeskFeed 不解释业务数值。温度、百分比、币种、剩余量都只是生产端写好的文本，桌面端只负责
+布局、主题、字号与失效呈现。
+
+## 当前实现状态
+
+| 能力 | 状态 |
+| --- | --- |
+| 快照协议 v1、严格校验、容量边界 | 已实现 |
+| 健康、缓存、到期状态机 | 已实现 |
+| 单主进程 `deskfeed.exe`：单实例、命令通道、URL/PID 事务、生产者绑定 | 已实现 |
+| 取数：HTTP GET、200 才接纳、重定向与超时规则 | 已实现 |
+| 离线检查器 `deskfeed-check.exe` 与离线用例 `deskfeed-tests.exe` | 已实现 |
+| 任务栏真嵌入组件（`deskfeed-payload.dll`、显示邮箱） | **尚未实现**（Phase 2） |
+| 桌面悬浮窗 | **尚未实现**（Phase 3） |
+| `deskfeed-inject.exe`、`deskfeed-probe.exe` | **尚未实现**（Phase 2） |
+
+主进程目前是无界面后台进程：它取数、校验、维护状态机，并提供命令行控制与状态查询。
+任务栏与悬浮窗的路线与安全约束见 [任务栏注入计划](<docs/taskbar-injection.md>)。
+
+## 快速开始
+
+前提：Windows 10/11 x64；生产端提供一个返回快照 JSON 的 HTTP 端点（可先用
+[示例生产端](<examples/producer/README.md>)，只需要 Node.js，无第三方依赖）。
+
+```
+:: 1. 启动示例生产端
+node examples\producer\minimal-producer.mjs --port 8099
+
+:: 2. 启动主进程（首个实例，指定地址）
+build\bin\deskfeed.exe --url "http://127.0.0.1:8099/snapshot"
+
+:: 3. 另开一个终端查看运行状态
+build\bin\deskfeed.exe --inspect
+
+:: 4. 正常退出
+build\bin\deskfeed.exe --quit
+```
+
+离线校验一份快照文件、或直接量一次 HTTP 取数：
+
+```
+build\bin\deskfeed-check.exe --file snapshot.json --report json
+build\bin\deskfeed-check.exe --url "http://127.0.0.1:8099/snapshot" --report json
+```
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/protocol.md](<docs/protocol.md>) | 快照协议 v1：字段、容量边界、严格校验、完整替换、失效与到期 |
+| [docs/lifecycle.md](<docs/lifecycle.md>) | 命令行、单实例、控制通道、配置事务、绑定与代次、退出码、`--inspect` |
+| [docs/http.md](<docs/http.md>) | 取数规则：墙钟预算、有界重定向、200 才接纳、正文上限、错误分类 |
+| [docs/configuration.md](<docs/configuration.md>) | 设置文件、键、默认值与上下限、脱敏策略、隔离开关 |
+| [docs/testing.md](<docs/testing.md>) | 构建与测试、离线检查器用法、**安全验收流程**（隔离实例、不碰 explorer） |
+| [docs/building.md](<docs/building.md>) | 工具链要求与构建命令 |
+| [docs/architecture.md](<docs/architecture.md>) | 四条 seam、模块划分、阶段路线 |
+| [docs/taskbar-injection.md](<docs/taskbar-injection.md>) | Phase 2 任务栏真嵌入计划与硬性安全约束（尚未实现） |
+| [schema/snapshot-v1.schema.json](<schema/snapshot-v1.schema.json>) | 机器可读的协议约束 |
+| [examples/producer/](<examples/producer/README.md>) | 不依赖任何私有生产端的最小生产端示例 |
+
+## 安全边界
+
+- Phase 2 的任务栏组件会**向 `explorer.exe` 注入代码**，风险与限制见
+  [docs/taskbar-injection.md](<docs/taskbar-injection.md>)。当前版本不做任何注入。
+- 命令确认不等于取数成功；IPC 超时只说明没收到确认，**不能**据此认为命令没有执行
+  （见 [docs/lifecycle.md](<docs/lifecycle.md) 的“不确定性与返回值”）。
+- 地址里可能带上游密钥：日志与 `--inspect` 输出一律去掉 userinfo、查询串与片段；
+  实际保存与请求的地址保持原样（见 [docs/configuration.md](<docs/configuration.md>)）。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。

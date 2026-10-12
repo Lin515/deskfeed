@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskfeed.invalid/schema/snapshot-v1.schema.json",
+  "title": "DeskFeed snapshot v1",
+  "description": "DeskFeed 只消费一个端点返回的完整快照。未知字段在各层都被忽略；已知字段非法、必填缺失、版本不支持、id 重复或超出容量边界时整份拒绝，不做部分接纳。Schema 只能表达字段类型、state 枚举、条目数与 expiresAtMs 的数值范围；UTF-8 字节上限（id 128 / label 256 / value 1024 / detail 16384）、正文 1 MiB、JSON 嵌套深度 32、id 唯一、重复成员拒绝、BOM 与完整替换/失效/到期状态机见 docs/protocol.md 与 deskfeed-check。",
+  "type": "object",
+  "required": ["version", "items"],
+  "additionalProperties": true,
+  "properties": {
+    "version": {
+      "description": "必须等于数值 1。按数值判断：1、1.0、1e0 都是同一个数值；字符串或布尔值不是数字，拒绝。",
+      "type": "number",
+      "const": 1
+    },
+    "items": {
+      "description": "完整内容列表，数组顺序即显示顺序，最多 64 项；允许空数组，表示立即清空内容（不是失败）。",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "value"],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "description": "非空字符串；UTF-8 解码后不超过 128 字节；同一快照内唯一。",
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "description": "字符串，UTF-8 解码后不超过 256 字节，单行（不含 U+000A/U+000B/U+000C/U+000D/U+0085/U+2028/U+2029），可为空。",
+            "type": "string"
+          },
+          "value": {
+            "description": "字符串，UTF-8 解码后不超过 1024 字节，单行（不含 U+000A/U+000B/U+000C/U+000D/U+0085/U+2028/U+2029），可为空；label 与 value 不能同时为空白（Unicode White_Space）。",
+            "type": "string"
+          },
+          "state": {
+            "description": "可选；省略即 ok。合法值只有这三个：error 是业务状态，不是结构错误，也不影响其它条目。",
+            "type": "string",
+            "enum": ["ok", "warn", "error"]
+          },
+          "detail": {
+            "description": "可选，纯文本，允许换行；UTF-8 解码后不超过 16384 字节。",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "expiresAtMs": {
+      "description": "可选。整个快照的绝对到期时间，Unix 毫秒。非负安全整数，按数值判断：1000、1000.0、1e3、9.007199254740991e15 都合法（最后一个等于 9007199254740991）；1e-3、1.5、9007199254740992、负值与 null 都拒绝。可选字段可以省略，但不能用 null 代替。",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    }
+  }
+}

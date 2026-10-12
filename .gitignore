@@ -1,0 +1,17 @@
+# 构建产物与开发期临时文件
+build/
+build-*/
+.agent/
+out/
+*.user
+CMakeUserPresets.json
+.vs/
+.vscode/
+*.suo
+*.ncb
+*.aps
+*.pdb
+*.ilk
+*.log
+Thumbs.db
+desktop.ini

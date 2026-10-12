@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="deskfeed-widget" version="1.0.0.0"/>
+
+  <!-- 悬浮窗的悬停提示是 comctl32 的 tooltip 控件（TOOLTIPS_CLASS）。任务栏那一侧的提示跑在
+       explorer 里，那边由 shell 自己的清单加载 comctl32 6.0；这里声明同一个依赖，两个界面的
+       悬停提示才是同一套控件、同一套外观与字体。没有这一段时进程加载的是 5.82 那一份
+       （WinSxS 目录名 5.82 与 6.0 就是判据，见 window.cpp 里随登记一起记下的那行日志）。
+
+       只声明这一个依赖，不带 dpiAwareness / supportedOS：窗口落位坐标存的是物理像素
+       （settings.ini 的 `[window] right/bottom`），加进来会改变多显示器与缩放下的坐标口径。
+
+       这个文件要作为**源文件**交给 CMake（加进 deskfeed 目标的源文件列表），CMake 会把它合并
+       进自己生成的那份清单里，trustInfo 不会丢。单独用 /MANIFESTINPUT 会被链接器拒绝
+       （LNK1220），再加 /MANIFEST:EMBED 会与 CMake 自己的 manifest.res 撞成重复资源
+       （CVTRES: CVT1100）。 -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+                        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>

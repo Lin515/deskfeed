@@ -84,6 +84,9 @@ ReadingTone reading_tone_of(ItemState state) {
 ReadingContent reading_from_frame(Frame const& frame) {
     ReadingContent content;
     content.reason = frame.reason;
+    // alarm 是一条独立信息：有值时表示“整帧失效但值还在”，没有值时它与 failure 同时成立。
+    // 绝不把它折进 failure——折进去就会让人以为没有值，从而丢掉数据。
+    content.alarm = frame.alarm;
 
     if (frame.kind == ViewKind::Waiting) {
         // 首次请求等待中：一行都不给。窗口据此不出现，也不会先露一个空窗。
@@ -102,8 +105,8 @@ ReadingContent reading_from_frame(Frame const& frame) {
         return content;
     }
 
-    // ViewKind::Content：每条目一行。整体失效（alarm）时保留值、整行标红，
-    // 并把原因并进 tip/detail，而不是把生产端的原文换成原因。
+    // ViewKind::Content：每条目一行。整体失效（alarm）时保留值、整行标红，把原因并进 tip；
+    // detail 保留**生产端原文**——原因在展开详情里由 reading_detail_text 在顶层说一次。
     for (FrameItem const& item : frame.items) {
         ReadingRow row;
         row.label = item.label;
@@ -111,7 +114,7 @@ ReadingContent reading_from_frame(Frame const& frame) {
         row.state = item.state;
         row.tone = frame.alarm ? ReadingTone::Error : reading_tone_of(item.state);
         row.tip = frame.alarm ? failure_text_with_detail(frame.reason, item.detail) : item.detail;
-        row.detail = row.tip;
+        row.detail = item.detail;
         content.rows.push_back(std::move(row));
     }
     return content;
@@ -145,6 +148,18 @@ std::vector<ReadingLine> reading_pack(ReadingContent const& content, std::size_t
             // 折掉的 value 就再也看不到了。
             ReadingRow marker;
             marker.value = "…（另有 " + std::to_string(line.hidden) + " 项）";
+            // 颜色取被折掉那些条目里最重的一档：有错误就红、否则有警告就琥珀、否则正常色。
+            // 折掉的里面有 error/warn 时，这件事必须在行上就看得出来，不能只藏在悬停提示里。
+            for (std::size_t at = shown_end; at < group_end; ++at) {
+                ReadingTone const tone = content.rows[at].tone;
+                if (tone == ReadingTone::Error) {
+                    marker.tone = ReadingTone::Error;
+                    break;
+                }
+                if (tone == ReadingTone::Warn) {
+                    marker.tone = ReadingTone::Warn;
+                }
+            }
             for (std::size_t at = shown_end; at < group_end; ++at) {
                 if (!marker.tip.empty()) {
                     marker.tip += '\n';
@@ -196,6 +211,12 @@ std::string reading_line_tip(ReadingLine const& line) {
 
 std::string reading_detail_text(ReadingContent const& content) {
     std::string text;
+    // 有值但整体失效：原因在**顶层说一次**（后面空一行），不在每个条目下面重复。
+    // failure（没有值）那一支不在这里加：那一行本身就只有 ERROR，原因跟在它下面。
+    if (content.alarm && !content.failure && !content.reason.empty()) {
+        text += content.reason;
+        text += "\n\n";
+    }
     for (ReadingRow const& row : content.rows) {
         // 标题就是这一条的行文本：value 一定在里面，不依赖生产端写 detail。
         // 只列 detail 非空的条目会让“有 value、没 detail”的条目（协议允许）整个消失，
@@ -227,6 +248,11 @@ std::string reading_rows_text(ReadingContent const& content, long long poll_ms) 
     text += " stale=no failed=";
     text += content.failure ? "yes" : "no";
     text += " refresh_ms=" + std::to_string(poll_ms);
+    if (content.alarm) {
+        // 整体失效必须标出来：只印 failed=no 会让人以为这一份是新鲜的。
+        // 只在真失效时追加，正常帧的头部因此与旧量具逐字一致（冻结基线比对靠这一点）。
+        text += " alarm=yes";
+    }
     text += '\n';
 
     for (std::size_t index = 0; index < content.rows.size(); ++index) {

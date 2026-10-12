@@ -32,19 +32,34 @@ struct WindowPreferences {
 };
 
 // 窗口要往外做的四件事。窗口只管把动作交出去，节奏与持久化都不属于窗口。
+//
+// **重入与生命周期契约（硬约束）**：这些回调都是**同步**调用的，而且窗口在回调返回之后还会
+// 继续用自己那份状态。所以回调实现里：
+//   * 不得销毁窗口（不要调 `WidgetWindow::destroy()`，也不要 `DestroyWindow` 那个句柄）；
+//   * 不得重入 `apply()` / `show_from_request()`；
+//   * 不得让主进程的 `SettingsFile` 或回调上下文失效——它们必须活到
+//     `WidgetWindow::destroy()` **返回之后**（收尾时还会同步调一次 `save_preferences`，
+//     用于补写还没落盘的锚点）。
+// 违反其中任何一条，回调返回后就是 use-after-free。
 struct WidgetCallbacks {
     // 菜单「刷新」：请求主进程立刻取一次数。**不得**改地址、调度配置或绑定。
     void (*refresh)(void* context) = nullptr;
     // 菜单「退出」/ Alt+F4：正常退出。窗口自己不会重生，也不负责让主进程重生。
+    // 实现里请**只投递一个退出请求**（例如 PostMessage 一条消息），不要在这个回调里同步销毁
+    // 窗口：那会在窗口过程还压在栈上的时候把窗口对象拆掉。
     void (*quit)(void* context) = nullptr;
     // 菜单「任务栏组件」：把意图交给主进程，返回**切换之后**的实际状态
     // （true = 任务栏组件开着）。主进程在这个动作里落盘并驱动注入/守护。
+    // 返回后窗口还会读自己的偏好与菜单句柄，所以这里同样不得销毁窗口或重入。
     bool (*set_taskbar_component)(void* context, bool enabled) = nullptr;
     // 界面偏好落盘：主进程用它**自己那一份** SettingsFile 改 `[window]` 再原子保存。
     //
     // 返回 false 表示没有落盘（设置文件不可用或写失败）；窗口会把内存里的值回滚到落盘前
     // 的那一份，保证界面与磁盘不会各说各话。窗口绝不持有 SettingsFile——若它自己持有一份
     // 旧快照，一次切换就会把刚写进去的新地址覆盖回去。
+    //
+    // 它会被**多次**调用（每次切换一次，收尾时还可能有一次待落盘的锚点），所以必须是廉价、
+    // 无副作用的落盘动作，不能在里面做会改变窗口状态的事。
     bool (*save_preferences)(void* context, WindowPreferences const& preferences,
                              std::wstring* error) = nullptr;
     void* context = nullptr;

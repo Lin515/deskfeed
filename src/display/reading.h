@@ -69,8 +69,12 @@ struct ReadingLine {
 // 一帧换算出来的全部显示内容。
 struct ReadingContent {
     std::vector<ReadingRow> rows;  // 逻辑行，顺序 = 帧里的条目顺序
-    bool failure = false;          // 整体失效（没有可显示的值，只有一行 ERROR）
-    std::string reason;            // 整体失效的原因（状态行与悬停用）
+    // 没有可显示的值：rows 里只有一行 ERROR。**这不等于 alarm**。
+    bool failure = false;
+    // 整体失效（帧的 alarm）：有值时每行都按错误档渲染，没有值时就是 failure 那一行。
+    // 它是一条独立信息，不能被折进 failure——折进去就会让人以为“没有值”，从而丢掉值。
+    bool alarm = false;
+    std::string reason;  // 整体失效的原因（状态行与悬停用）
 };
 
 // 帧 → 显示内容（不折行）。
@@ -78,7 +82,8 @@ struct ReadingContent {
 //   * `ViewKind::Waiting`（首次请求等待中）给出 0 行：不显示读数，也不显示 ERROR；
 //   * `ViewKind::Error`（没有可显示的值）给出一行红色 `ERROR`，tip/detail 是 reason；
 //   * `ViewKind::Content` 每条目一行；`alarm` 为真时保留各条目的值但整行标成 Error，
-//     tip/detail 变成“失效原因 + 生产端 detail”（原因在前，不把生产端原文顶掉）。
+//     tip 变成“失效原因 + 生产端 detail”（原因在前），`detail` 保留生产端原文
+//     ——原因在展开详情里只在顶层说一次，不在每个条目下面重复。
 ReadingContent reading_from_frame(Frame const& frame);
 
 // 按条目数算出“每行几个条目”：让行数不超过 kMaxReadingLines 的最小值。
@@ -107,18 +112,24 @@ std::string reading_line_tip(ReadingLine const& line);
 // 这里刻意不以“有没有 detail”决定要不要出现：value 是条目唯一的主读数，生产端完全可能
 // 只给 value 不给 detail（协议允许 detail 省略）。若只列 detail 非空的条目，有界分组折掉的
 // 那些 value 就再也看不到了。也不要求生产端把 value 重复写进 detail——展开块自己带上它。
+//
+// 有值但整体失效（alarm 且非 failure）时，失效原因在**顶层说一次**（原因 + 空行），
+// 不在每个条目下面重复一遍。
 // 条目为空时返回空串。
 std::string reading_detail_text(ReadingContent const& content);
 
 // `--reading-rows` 的等价文本（UTF-8，行尾 '\n'）：
 //
-//   reading: rows=N stale=no failed=yes|no refresh_ms=<poll_ms>
+//   reading: rows=N stale=no failed=yes|no refresh_ms=<poll_ms> [alarm=yes]
 //   row K: error=0|1 prefix=<label> value=<value>
 //   lines: auto (per_line=P, max 3) -> K line(s)
 //     line K: <按 auto 折行后的行文本>
 //   lines: sources_per_line=1 -> K line(s)   （1..5 各一行）
 //
 // `stale` 恒为 no：v1 协议没有“沿用上一次读数”的宽限期，失败一发生就是整体失效。
+// `failed` 表示**没有可显示的值**（只有一行 ERROR）；`alarm` 是另一条信息（有值但整帧失效），
+// 为真时在头部**追加** `alarm=yes`——只印 `failed=no` 会让人以为这一份是新鲜的。
+// 追加只在真失效时发生，所以正常帧的头部与旧量具逐字一致（冻结基线比对靠这一点）。
 // `error` 只看 `ReadingTone::Error`（warn 与 normal 都印 0），与旧量具逐字一致。
 std::string reading_rows_text(ReadingContent const& content, long long poll_ms);
 

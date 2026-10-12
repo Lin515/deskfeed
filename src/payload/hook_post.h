@@ -1,5 +1,7 @@
 #pragma once
 
+#include "payload/probe_api.h"
+
 #include <windows.h>
 
 #include <string>
@@ -86,5 +88,30 @@ void hook_post_set_ack_window(HWND window);
 // 自测宿主专用：把"存好钩子句柄"这一步人为推迟若干毫秒，用来**确定性地**制造
 // "回调在安装发布之前就进入"这个对抗场景。0 = 关闭（默认）。
 void hook_post_set_install_delay_ms(unsigned delay_ms);
+
+// ---------------------------------------------------------------------------
+// 探针 ABI 的内部实现（导出的入口见 src/payload/dllmain.cpp 的 DeskFeedProbe* 一组，
+// 共享 POD 定义见 src/payload/probe_api.h）。这些入口只在自测宿主进程里被调用。
+// ---------------------------------------------------------------------------
+
+// 把钩子门的原子状态填进 POD。`out.size` 必须等于编译时的结构大小。
+bool hook_post_probe_status(HookProbeStatus& out);
+
+// 让负载记录"回调走到了哪个阶段"。返回 false 表示当前没有正在被观测的安装。
+bool hook_post_probe_observer_stage(HookProbeStage& out);
+
+// 打开/关闭阶段记录。关闭会把记录清干净（stage = None、sequence = 0）。
+void hook_post_probe_set_observer(bool enable);
+
+// 完成事件变异模式（**只**给探针的对抗用例；生产 `DeskFeedStart` 会把它复位成 Normal）。
+void hook_post_probe_set_completion_mutation(CompletionMutation mode);
+
+// 收尾时"帧已弹掉"的 ping 目标。
+void hook_post_probe_set_tray_window(HWND window);
+
+// 探针"已布防"：为真时 `DeskFeedStart` **不**复位探针开关（R5 指定的托盘窗口必须活过 Start，
+// 真实 mailbox 的 UI 投递才能落在自测宿主的线程上）。只有探针显式置位才生效；生产路径不置位。
+bool hook_post_probe_armed();
+void hook_post_probe_set_armed(bool armed);
 
 }  // namespace deskfeed::payload

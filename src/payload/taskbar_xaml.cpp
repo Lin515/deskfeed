@@ -598,26 +598,54 @@ DWORD WINAPI menu_thread_entry(LPVOID parameter) {
     return 0;
 }
 
+// 只找**本进程**、而且属于那个菜单线程的弹出菜单窗口。`FindWindowW(L"#32768")` 会拿到桌面上
+// 任意一个进程的菜单：打空自己的还算轻，把别人正开着的右键菜单关掉就是跨进程副作用。
+struct MenuSearch {
+    DWORD process_id = 0;
+    DWORD thread_id = 0;
+    HWND found = nullptr;
+};
+
+BOOL CALLBACK find_own_menu_window(HWND window, LPARAM param) {
+    auto* search = reinterpret_cast<MenuSearch*>(param);
+    DWORD owner_pid = 0;
+    DWORD const owner_thread = ::GetWindowThreadProcessId(window, &owner_pid);
+    if (owner_pid != search->process_id) {
+        return TRUE;
+    }
+    if (search->thread_id != 0 && owner_thread != search->thread_id) {
+        return TRUE;
+    }
+    search->found = window;
+    return FALSE;  // 找到了，停
+}
+
 // 收菜单：先把本进程的弹出菜单窗口用 ESC 请走，再等线程句柄。返回 false = 线程还没退出，
 // 调用方必须保留模块。
 bool close_menu(unsigned timeout_ms) {
     HANDLE thread = nullptr;
     HWND owner = nullptr;
+    DWORD menu_thread_id = 0;
     {
         std::lock_guard<std::mutex> guard(g_menu_mutex);
         thread = g_menu_thread;
         owner = g_menu_owner;
+        menu_thread_id = g_menu_thread_id;
     }
     if (thread == nullptr) {
         return true;
     }
     if (owner != nullptr) {
         // 菜单是负载自己线程上的模态 TrackPopupMenu：它只认键盘/点击，认不了窗口消息。所以找到
-        // 属于本进程的 Win32 弹出菜单窗口（类名 #32768）并给它 ESC；找不到就发 WM_CANCELMODE。
-        HWND menu_window = ::FindWindowW(L"#32768", nullptr);
-        if (menu_window != nullptr) {
-            ::PostMessageW(menu_window, WM_KEYDOWN, VK_ESCAPE, 0);
-            ::PostMessageW(menu_window, WM_KEYUP, VK_ESCAPE, 0);
+        // **属于本进程、且属于那个菜单线程**的 Win32 弹出菜单窗口（类名 #32768）并给它 ESC；
+        // 找不到就退回 owner 的 WM_CANCELMODE（那条本来就是我们自己的窗口）。
+        MenuSearch search;
+        search.process_id = ::GetCurrentProcessId();
+        search.thread_id = menu_thread_id;
+        ::EnumWindows(&find_own_menu_window, reinterpret_cast<LPARAM>(&search));
+        if (search.found != nullptr) {
+            ::PostMessageW(search.found, WM_KEYDOWN, VK_ESCAPE, 0);
+            ::PostMessageW(search.found, WM_KEYUP, VK_ESCAPE, 0);
         } else {
             ::PostMessageW(owner, WM_CANCELMODE, 0, 0);
         }

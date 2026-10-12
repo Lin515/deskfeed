@@ -55,4 +55,28 @@ std::wstring reg_hook_cfg_state();
 // 装钩子之前应当看到"键不存在"，装好之后应当看到 1——这一前一后就是钩子在起作用的证据。
 bool reg_hook_probe_read(std::wstring& detail);
 
+#ifdef DESKFEED_NATIVE_TESTS
+// 离线用例专用（把本文件再编译进 `deskfeed-native-tests`；成品 DLL 里没有这些符号）。
+// 装了钩子之后再补一次槽（新装载的模块会走这条路径）。
+bool reg_hook_self_test_rescan();
+// 让**本进程自己**去打开那条路径：替身起作用时返回 true（键是我们写的替身键），
+// 并且 `answered_by_stand_in` 为 true。这条同时是"替身没有自我递归"的反证——真递归的话这里会栈溢出。
+bool reg_hook_self_test_call(wchar_t const* sub_key, bool& answered_by_stand_in);
+// 把本用例可执行文件自己导入表里的 `RegOpenKeyExW` 槽换成替身，模拟"负载自己的槽也被改掉"。改到返回 true。
+bool reg_hook_self_test_patch_own_import();
+// 把上面那一步改回来（用例收尾必须调用；那只槽属于用例进程自己）。
+void reg_hook_self_test_restore_own_import();
+// 替身键的路径（用例用它断言恢复之后键已经删掉）。
+std::wstring reg_hook_self_test_stand_in_path();
+// 诊断：替身当前的转发指针与替身入口地址、已补槽数。
+std::wstring reg_hook_self_test_diag();
+// 用例可执行文件自己那条 `RegOpenKeyExW` 导入槽当前指向的地址。
+void* reg_hook_self_test_own_open_slot();
+// 直接对主模块跑一次补槽（返回本次补到的槽数），用来验证 caller 的槽能被补。
+unsigned reg_hook_self_test_patch_main_module();
+// 把用例可执行文件自己的 `RegQueryValueExW` 槽换成替身 / 换回去（自我递归反证用）。
+bool reg_hook_self_test_patch_own_query_import();
+void reg_hook_self_test_restore_own_query_import();
+#endif
+
 }  // namespace deskfeed::payload

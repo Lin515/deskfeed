@@ -12,7 +12,9 @@
 #include "payload/action_worker.h"
 #include "payload/hook_post.h"
 #include "payload/host.h"
+#include "payload/probe_api.h"
 #include "payload/reg_hook.h"
+#include "payload/status_pod.h"
 #include "payload/taskbar_xaml.h"
 #include "payload/xaml_tap.h"
 #include "platform/log.h"
@@ -21,6 +23,8 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstring>
+#include <exception>
 #include <string>
 
 namespace {
@@ -29,9 +33,17 @@ HINSTANCE g_module = nullptr;
 std::atomic<bool> g_started{false};
 
 DWORD WINAPI payload_thread_entry(LPVOID parameter) {
+    // 这是负载线程的最外层。`payload_run` 自己还有 C++/SEH 两层边界，这里再兜一次：连"复制
+    // scope 字符串"这种在边界之前发生的事也不能让异常穿回 kernel32（那就是 explorer 终止）。
     std::wstring const* scope = static_cast<std::wstring const*>(parameter);
-    deskfeed::payload::payload_run(g_module, scope != nullptr ? *scope : std::wstring());
-    delete scope;
+    try {
+        deskfeed::payload::payload_run(g_module, scope != nullptr ? *scope : std::wstring());
+    } catch (...) {
+    }
+    try {
+        delete scope;
+    } catch (...) {
+    }
     return 0;
 }
 
@@ -89,55 +101,160 @@ void probe_placeholder_reading() {
     deskfeed::payload::taskbar_xaml_probe_set_reading(content);
 }
 
+// 探针开关的统一复位。生产启动、探针拆除之后都必须回到这里的状态：完成事件变异关闭、阶段记录
+// 关闭、托盘窗口回退到 `FindWindow(Shell_TrayWnd)`。
+void reset_probe_state() {
+    deskfeed::payload::hook_post_probe_set_completion_mutation(
+        deskfeed::payload::CompletionMutation::Normal);
+    deskfeed::payload::hook_post_probe_set_observer(false);
+    deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
+}
+
+// 状态 POD 的受控拷贝（叶子，不携带析构局部对象）：坏指针由 SEH 吃掉。
+bool copy_payload_status_seh(deskfeed::payload::PayloadStatusPod const& source, void* destination,
+                             unsigned bytes) {
+    __try {
+        std::memcpy(destination, &source, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// 读调用方写好的两个头字段（坏指针由 SEH 吃掉）。`__try` 与 C++ 对象展开不能共存，所以这些
+// 都必须是小叶子。
+bool read_status_header_seh(void* destination, std::uint32_t& size, std::uint32_t& abi) {
+    __try {
+        auto* const pod = reinterpret_cast<deskfeed::payload::PayloadStatusPod*>(destination);
+        size = pod->size;
+        abi = pod->abi;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+void write_status_abi_zero_seh(void* destination) {
+    __try {
+        auto* const pod = reinterpret_cast<deskfeed::payload::PayloadStatusPod*>(destination);
+        pod->abi = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// 把负载内部状态写进探针给的 POD。**先**在这个不携带析构局部对象的叶子里做受控拷贝（坏指针由
+// SEH 吃掉），再把拷贝好的值交回去——绝不把内部地址/对象交给探针。
+bool copy_status_seh(deskfeed::payload::HookProbeStatus const& source, void* destination,
+                     unsigned bytes) {
+    __try {
+        std::memcpy(destination, &source, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+bool copy_stage_seh(deskfeed::payload::HookProbeStage const& source, void* destination,
+                    unsigned bytes) {
+    __try {
+        std::memcpy(destination, &source, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
-    bool scope_ok = false;
-    std::wstring const scope = read_scope(scope_param, scope_ok);
-    if (!scope_ok) {
+    try {
+        bool scope_ok = false;
+        std::wstring const scope = read_scope(scope_param, scope_ok);
+        if (!scope_ok) {
+            return 2;
+        }
+        if (g_module == nullptr) {
+            return 4;
+        }
+
+        // 生产路径：先把探针的开关全部复位，任何人都不该以为探针配置能改变生产行为。
+        // 例外：自测宿主显式"布防"过（R5 指定的托盘窗口必须活过 Start，真实 mailbox 的 UI 投递
+        // 才能落在它那条线程上）。布防只可能来自同一进程里的探针调用。
+        if (!deskfeed::payload::hook_post_probe_armed()) {
+            deskfeed::payload::hook_post_probe_set_completion_mutation(
+                deskfeed::payload::CompletionMutation::Normal);
+            deskfeed::payload::hook_post_probe_set_observer(false);
+            deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
+        }
+
+        bool expected = false;
+        if (!g_started.compare_exchange_strong(expected, true)) {
+            return 3;
+        }
+        auto* payload_scope = new (std::nothrow) std::wstring(scope);
+        if (payload_scope == nullptr) {
+            g_started.store(false);
+            return 4;
+        }
+        // CREATE_SUSPENDED + 先登记句柄 + 再 Resume：负载线程在句柄可见之前不许跑。
+        // 否则"刚 Start 就 Stop"会看到 nullptr 句柄 ⇒ 在一条本模块线程已经在跑的情况下报告
+        // "可以卸载"。句柄所有权登记之后归负载（见 payload_publish_thread），这里不关。
+        HANDLE const thread = ::CreateThread(nullptr, 0, payload_thread_entry, payload_scope,
+                                             CREATE_SUSPENDED, nullptr);
+        if (thread == nullptr) {
+            delete payload_scope;
+            g_started.store(false);
+            return 4;
+        }
+        if (!deskfeed::payload::payload_publish_thread(thread)) {
+            ::CloseHandle(thread);
+            delete payload_scope;
+            g_started.store(false);
+            return 4;
+        }
+        if (::ResumeThread(thread) == static_cast<DWORD>(-1)) {
+            // 登记成功但起不来：线程从未跑过，句柄还是我们自己的，关掉并退回失败。
+            ::CloseHandle(thread);
+            delete payload_scope;
+            g_started.store(false);
+            return 4;
+        }
+        return 1;
+    } catch (...) {
+        // 这条入口由注入器的 CreateRemoteThread 调用：异常穿出就是 explorer 终止。
+        // 语义保持三态：请求非法返回 2（不要返回"已启动"）。
         return 2;
     }
-    if (g_module == nullptr) {
-        return 4;
-    }
-    bool expected = false;
-    if (!g_started.compare_exchange_strong(expected, true)) {
-        return 3;
-    }
-    auto* payload_scope = new (std::nothrow) std::wstring(scope);
-    if (payload_scope == nullptr) {
-        g_started.store(false);
-        return 4;
-    }
-    HANDLE const thread = ::CreateThread(nullptr, 0, payload_thread_entry, payload_scope, 0, nullptr);
-    if (thread == nullptr) {
-        delete payload_scope;
-        g_started.store(false);
-        return 4;
-    }
-    ::CloseHandle(thread);
-    return 1;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStop(void* timeout_param) {
-    unsigned timeout = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(timeout_param));
-    if (timeout == 0 || timeout > 60000) {
-        timeout = 10000;
-    }
+    try {
+        unsigned timeout = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(timeout_param));
+        if (timeout == 0 || timeout > 60000) {
+            timeout = 10000;
+        }
 
-    deskfeed::payload::payload_request_stop();
+        deskfeed::payload::payload_request_stop();
 
-    // 卸载门是**线程已终止**，不是事件、不是标志位：事件之后线程入口还有一条 `return`，那也是
-    // 本模块的指令。
-    HANDLE const thread = deskfeed::payload::payload_thread_handle();
-    if (thread == nullptr) {
-        // 线程从未起过：没有任何本模块的线程代码在跑。
-        return 1;
-    }
-    if (::WaitForSingleObject(thread, timeout) != WAIT_OBJECT_0) {
+        // 卸载门是**线程已终止**，不是事件、不是标志位：事件之后线程入口还有一条 `return`，那也是
+        // 本模块的指令。
+        HANDLE const thread = deskfeed::payload::payload_thread_handle();
+        if (thread == nullptr) {
+            // 句柄没登记过。如果动作工作线程还在跑，那也是一条本模块的线程 ⇒ 绝不能报告可卸载。
+            if (deskfeed::payload::action_worker_running()) {
+                return 0;
+            }
+            // 线程从未起过：没有任何本模块的线程代码在跑。
+            return 1;
+        }
+        if (::WaitForSingleObject(thread, timeout) != WAIT_OBJECT_0) {
+            return 0;
+        }
+        return deskfeed::payload::payload_unload_safe() == 1 ? 1 : 0;
+    } catch (...) {
+        // 未退休：注入器必须保留映射（绝不在这里报告"可以卸载"）。
         return 0;
     }
-    return deskfeed::payload::payload_unload_safe() == 1 ? 1 : 0;
 }
 
 // 本模块同时充当 XAML 诊断的 TAP，所以 COM 的这两个入口也在它身上。
@@ -251,13 +368,21 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeHoverCells(long* out
 }
 
 // 走真实拆除路径。返回 1 = 所有既定门禁都拿到（可以卸载）；0 = 有一条没拿到（必须保留映射）。
+// 拆除之后探针开关一律回到正常：变异模式绝不允许跨过拆除留在进程里。
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeTeardown(unsigned timeout_ms) {
-    std::wstring detail;
-    if (!deskfeed::payload::taskbar_xaml_detach(timeout_ms, detail)) {
-        deskfeed::log_format(L"probe: teardown did not retire everything: %s", detail.c_str());
-        return 0;
+    int result = 0;
+    try {
+        std::wstring detail;
+        if (deskfeed::payload::taskbar_xaml_detach(timeout_ms, detail)) {
+            result = 1;
+        } else {
+            deskfeed::log_format(L"probe: teardown did not retire everything: %s", detail.c_str());
+        }
+    } catch (...) {
+        result = 0;
     }
-    return 1;
+    reset_probe_state();
+    return result;
 }
 
 extern "C" __declspec(dllexport) void __stdcall DeskFeedProbeStop() {
@@ -266,6 +391,142 @@ extern "C" __declspec(dllexport) void __stdcall DeskFeedProbeStop() {
 
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeDangling() {
     return deskfeed::payload::hook_post_dangling() ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// 探针 ABI（共享 POD 定义见 src/payload/probe_api.h；只有自测宿主进程会调用这些入口）。
+// 每个入口都自己吞异常：探针是外部线程进来的，异常穿出就是 explorer 终止。
+// ---------------------------------------------------------------------------
+
+// R1：把"存好钩子句柄"这一步人为推迟若干毫秒，确定性地制造"回调在安装发布之前进入"。
+extern "C" __declspec(dllexport) void __stdcall DeskFeedProbeSetInstallDelay(unsigned ms) {
+    try {
+        deskfeed::payload::hook_post_set_install_delay_ms(ms);
+    } catch (...) {
+    }
+}
+
+// R2：钩子门的当前状态。只输出 POD 数字，不输出任何指向负载的对象或句柄。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeHookStatus(
+    deskfeed::payload::HookProbeStatus* out, unsigned bytes) {
+    if (out == nullptr || bytes < deskfeed::payload::kProbeStatusSize) {
+        return 0;
+    }
+    try {
+        deskfeed::payload::HookProbeStatus status{};
+        status.size = deskfeed::payload::kProbeStatusSize;
+        status.version = deskfeed::payload::kProbeStatusVersion;
+        if (!deskfeed::payload::hook_post_probe_status(status)) {
+            return 0;
+        }
+        return copy_status_seh(status, out, deskfeed::payload::kProbeStatusSize) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// R3：回调阶段记录。`sequence` 让探针分清"看到的是哪一次回调"；`complete` 表示这一次已经走到
+// CallNextHookEx 返回之后。**没有**任何"回调已 return"的字段——done 之后不许再观测我们的 return。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetObserver(int enable) {
+    try {
+        deskfeed::payload::hook_post_probe_set_observer(enable != 0);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeObserverStage(
+    deskfeed::payload::HookProbeStage* out, unsigned bytes) {
+    if (out == nullptr || bytes < deskfeed::payload::kProbeStageSize) {
+        return 0;
+    }
+    try {
+        deskfeed::payload::HookProbeStage stage{};
+        stage.size = deskfeed::payload::kProbeStageSize;
+        stage.version = deskfeed::payload::kProbeStageVersion;
+        bool const observing = deskfeed::payload::hook_post_probe_observer_stage(stage);
+        if (!copy_stage_seh(stage, out, deskfeed::payload::kProbeStageSize)) {
+            return 0;
+        }
+        return observing ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// R4：完成事件变异。0 = 正常；1 = 提前到 CallNextHookEx 之前（只给对抗用例，生产启动会复位）。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetCompletionMutation(unsigned mode) {
+    try {
+        if (mode != 0 && mode != 1) {
+            return 0;
+        }
+        deskfeed::payload::hook_post_probe_set_completion_mutation(
+            static_cast<deskfeed::payload::CompletionMutation>(mode));
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// R5：自测宿主自己的托盘窗口。必须属于**本进程**、并且是**同一条** UI 线程（探针随后就用它的
+// 线程 id 走真实钩子门）。校验不过就拒绝，绝不把动作投到别的进程/别的线程上。
+// 置位后**同时**把探针标记为"已布防"，让这个目标活过随后的真实 `DeskFeedStart`。
+extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeSetTrayWindow(HWND window) {
+    try {
+        if (window == nullptr) {
+            deskfeed::payload::hook_post_probe_set_tray_window(nullptr);
+            deskfeed::payload::hook_post_probe_set_armed(false);
+            return 1;
+        }
+        if (::IsWindow(window) == FALSE) {
+            return 0;
+        }
+        DWORD owner_pid = 0;
+        DWORD const owner_thread = ::GetWindowThreadProcessId(window, &owner_pid);
+        if (owner_pid != ::GetCurrentProcessId() || owner_thread == 0) {
+            return 0;
+        }
+        deskfeed::payload::hook_post_probe_set_tray_window(window);
+        deskfeed::payload::hook_post_probe_set_armed(true);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 状态 ABI（见 src/payload/status_pod.h）：把负载生命周期状态写进调用方在**目标进程里**分配好的
+// 定长缓冲。没有指针跨进程传递，也没有字符串两侧传递。`size`/`abi` 不认就写回 `abi = 0`。
+extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedGetStatus(void* pod_buffer) {
+    try {
+        if (pod_buffer == nullptr) {
+            return 0;
+        }
+        auto* const pod = reinterpret_cast<deskfeed::payload::PayloadStatusPod*>(pod_buffer);
+        std::uint32_t size = 0;
+        std::uint32_t abi = 0;
+        if (!read_status_header_seh(pod_buffer, size, abi)) {
+            return 0;
+        }
+        if (size != deskfeed::payload::kPayloadStatusSize ||
+            abi != deskfeed::payload::kPayloadStatusAbi) {
+            write_status_abi_zero_seh(pod_buffer);  // 调用方据此报"没有状态 ABI"
+            return 0;
+        }
+
+        deskfeed::payload::PayloadStatusPod status{};
+        status.size = deskfeed::payload::kPayloadStatusSize;
+        status.abi = deskfeed::payload::kPayloadStatusAbi;
+        status.width = deskfeed::payload::kPayloadStatusWidth;
+        if (!deskfeed::payload::payload_get_status(status, std::wstring())) {
+            return 0;
+        }
+        return copy_payload_status_seh(status, pod_buffer, deskfeed::payload::kPayloadStatusSize) ? 1
+                                                                                                : 0;
+    } catch (...) {
+        // 这条入口由注入器的 CreateRemoteThread 调用：异常穿出就是 explorer 终止。
+        return 0;
+    }
 }
 
 BOOL APIENTRY DllMain(HINSTANCE instance, DWORD reason, LPVOID) {

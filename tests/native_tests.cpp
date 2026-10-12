@@ -12,6 +12,7 @@
 //   deskfeed-native-tests --audit <dll>       只跑成品审计（CTest 单独注册一条）
 #include "payload/feed.h"
 #include "payload/hook_post.h"
+#include "payload/reg_hook.h"
 #include "platform/log.h"
 
 #include <windows.h>
@@ -440,6 +441,145 @@ std::wstring widen(char const* text) {
     return result;
 }
 
+// ---------------------------------------------------------------- 导入表改写（reg_hook）
+//
+// 这一组是**真的在本进程里跑**的：装钩子、把用例可执行文件自己导入表里的 `RegOpenKeyExW` 槽换成
+// 替身（模拟"本模块自己的槽也被改掉"这个最坏情况）、再调一次真实注册表 API。如果替身还经
+// `::Reg*` 转发，这里会栈溢出；改成经安装前存下的真实入口转发之后，它必须正常返回。
+
+constexpr wchar_t kXamlDebugPath[] = L"Software\\Microsoft\\XAML\\Debug";
+constexpr wchar_t kXamlValueName[] = L"DisableCompositionDiag";
+
+constexpr wchar_t kCallerDllName[] = L"deskfeed-reg-hook-caller.dll";
+
+// 测试专用 fixture：与用例可执行文件同目录（CMake 把两者都放在 bin/）。相对文件名不参与
+// 默认搜索路径，所以这里按"用例自己的目录"拼绝对路径。
+std::wstring caller_dll_path() {
+    wchar_t buffer[MAX_PATH]{};
+    DWORD const length = ::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) {
+        return std::wstring(kCallerDllName);
+    }
+    std::wstring path(buffer, length);
+    std::size_t const separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return std::wstring(kCallerDllName);
+    }
+    return path.substr(0, separator + 1) + kCallerDllName;
+}
+
+using CallerOpenFn = LONG(WINAPI*)(HKEY, LPCWSTR, REGSAM, PHKEY);
+using CallerQueryFn = LONG(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPBYTE, LPDWORD);
+using CallerGetFn = LONG(WINAPI*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+using CallerCloseFn = LONG(WINAPI*)(HKEY);
+
+bool key_exists(HKEY root, wchar_t const* path) {
+    HKEY key = nullptr;
+    if (::RegOpenKeyExW(root, path, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    ::RegCloseKey(key);
+    return true;
+}
+
+void test_reg_hook() {
+    if (!name_matches("reghook")) {
+        return;
+    }
+
+    bool already_installed = deskfeed::payload::reg_hook_installed();
+
+    std::wstring detail;
+    bool const before = deskfeed::payload::reg_hook_probe_read(detail);
+    check(!before || already_installed,
+          "reghook: before install the real HKLM XAML debug key does not answer 1");
+
+    std::wstring error;
+    check(deskfeed::payload::reg_hook_install(error), "reghook: install succeeds");
+    if (!error.empty()) {
+        std::printf("      install said: %S\n", error.c_str());
+    }
+    check(deskfeed::payload::reg_hook_installed(), "reghook: installed flag is set");
+
+    // ---- P1 硬路径：真模块被补 → 替身答话 → 正向真实调用不递归 ----
+    // `deskfeed-reg-hook-caller.dll` 是**测试专用** fixture：它按名字导入这三个注册表入口，
+    // 所以 rescan 会补它的槽。经它的导出调用就走的是"caller → 替身 → 缓存真实入口"这条链。
+    HMODULE const caller = ::LoadLibraryW(caller_dll_path().c_str());
+    check(caller != nullptr, "reghook: the test-only caller DLL loads");
+    if (caller != nullptr) {
+        auto const call_open = reinterpret_cast<CallerOpenFn>(::GetProcAddress(caller, "CallerRegOpen"));
+        auto const call_query =
+            reinterpret_cast<CallerQueryFn>(::GetProcAddress(caller, "CallerRegQuery"));
+        auto const call_get = reinterpret_cast<CallerGetFn>(::GetProcAddress(caller, "CallerRegGet"));
+        auto const call_close =
+            reinterpret_cast<CallerCloseFn>(::GetProcAddress(caller, "CallerRegClose"));
+        check(call_open != nullptr && call_query != nullptr && call_get != nullptr &&
+                  call_close != nullptr,
+              "reghook: the caller DLL exports all four entry points");
+
+        // 新装载的模块要再补一次槽（这也是 rescan 的真实用途）。
+        bool const rescanned = deskfeed::payload::reg_hook_self_test_rescan();
+        check(rescanned, "reghook: rescan patches the freshly loaded caller module");
+
+        if (call_open != nullptr && call_query != nullptr && call_close != nullptr) {
+            // 正向：替身必须把这条 HKLM 路径答成"打开成功 + DisableCompositionDiag=1"，
+            // 而真实机器上那个键并不存在。
+            HKEY key = nullptr;
+            LONG const opened = call_open(HKEY_LOCAL_MACHINE, kXamlDebugPath, KEY_READ, &key);
+            check(opened == ERROR_SUCCESS, "reghook: the stand-in answers the caller's open");
+            DWORD value = 0;
+            DWORD size = sizeof(value);
+            DWORD type = 0;
+            LONG const queried =
+                key != nullptr ? call_query(key, kXamlValueName, &type,
+                                            reinterpret_cast<LPBYTE>(&value), &size)
+                               : ERROR_INVALID_HANDLE;
+            check(queried == ERROR_SUCCESS && type == REG_DWORD && value == 1,
+                  "reghook: the stand-in answers the caller's value read");
+            if (key != nullptr) {
+                call_close(key);
+            }
+
+            // 反向（不递归）：同一个模块去读一条**真实存在**的键，替身不答话，必须原样转发给
+            // 真实入口并拿到真实结果。替身如果还经 `::Reg*` 转发，这里就会栈溢出。
+            HKEY real = nullptr;
+            LONG const real_open =
+                call_open(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion",
+                          KEY_READ, &real);
+            check(real_open == ERROR_SUCCESS, "reghook: a real key still opens through the caller");
+            if (real != nullptr) {
+                call_close(real);
+            }
+        }
+
+        // ---- P2 硬路径：模块卸载之后再 restore，绝不能 AV ----
+        ::FreeLibrary(caller);
+        HKEY after_unload = nullptr;
+        check(::RegOpenKeyExW(HKEY_LOCAL_MACHINE, kXamlDebugPath, 0, KEY_READ, &after_unload) ==
+                  ERROR_FILE_NOT_FOUND,
+              "reghook: the caller module is really unloaded");
+        if (after_unload != nullptr) {
+            ::RegCloseKey(after_unload);
+        }
+    }
+
+    // 别人已经改过的槽不再被抢：第二次补槽不该覆盖已替换的槽。
+    bool const rescan_changed = deskfeed::payload::reg_hook_self_test_rescan();
+    check(!rescan_changed, "reghook: a rescan leaves an already-replaced slot alone");
+
+    // P2：恢复之后替身键必须被删掉，而且"已观测在途"必须归零。
+    check(deskfeed::payload::reg_hook_restore(error), "reghook: restore succeeds");
+    check(!key_exists(HKEY_CURRENT_USER, deskfeed::payload::reg_hook_self_test_stand_in_path().c_str()),
+          "reghook: the HKCU stand-in key is deleted on restore");
+
+    deskfeed::payload::HookProbeStatus status{};
+    status.size = deskfeed::payload::kProbeStatusSize;
+    status.version = deskfeed::payload::kProbeStatusVersion;
+    check(deskfeed::payload::hook_post_probe_status(status),
+          "reghook: the hook status POD can be filled");
+    check(status.in_flight == 0, "reghook: no replacement call is left in flight");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -458,6 +598,7 @@ int main(int argc, char** argv) {
         test_feed_policy();
         test_seh_boundary();
         test_hook_gate();
+        test_reg_hook();
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

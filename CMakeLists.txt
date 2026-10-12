@@ -209,11 +209,23 @@ target_sources(deskfeed_payload PRIVATE
 
 # 主进程。WIN32 子系统：常驻的桌面程序不该带一个控制台窗口；
 # 命令行用法（--help/--inspect/报错）在需要时挂到父进程控制台，见 platform/console.cpp。
+#
+# `taskbar_supervisor.cpp` 是任务栏组件的**主进程侧编排**（按有界命令行契约异步地请注入器干活），
+# 它属于主进程而不是负载。悬浮窗清单必须是**源文件**（与负载同样的做法）：/MANIFESTINPUT 单独用
+# 会 LNK1220，/MANIFEST:EMBED 又会和它重复（CVT1100）。链 `deskfeed_widget` 是因为主进程要显示
+# 那个窗口本体。
 add_executable(deskfeed WIN32
     src/master/main.cpp
     src/master/master.cpp
+    src/master/taskbar_supervisor.cpp
+    src/widget/deskfeed-widget.manifest
 )
-target_link_libraries(deskfeed PRIVATE deskfeed_ipc deskfeed_net deskfeed_display)
+target_link_libraries(deskfeed PRIVATE
+    deskfeed_ipc
+    deskfeed_net
+    deskfeed_display
+    deskfeed_widget
+)
 
 # 离线检查器与量具。
 add_executable(deskfeed-check
@@ -232,22 +244,106 @@ enable_testing()
 add_test(NAME deskfeed-tests COMMAND deskfeed-tests)
 
 # 原生侧的离线回归用例：显示帧消费策略、钩子门的收尾协议（真的起一条消息线程与一个 user32 类的
-# 确认窗口，但不注入 explorer）、C++/SEH 边界，以及成品负载 DLL 的自动审计。
+# 确认窗口，但不注入 explorer）、C++/SEH 边界、导入表改写的"不自我递归 / 模块卸载后仍能恢复"，
+# 以及成品负载 DLL 的自动审计。
 #
 # 它刻意与 tests/tests.cpp 分成两个可执行文件：那一份归主进程/帧/配置的作者，这一份只放任务栏负载
-# 这条路上的东西，两边互不踩。`src/payload/{feed,hook_post}.cpp` 在这里被**再编译一次**（它们不碰
-# XAML，只依赖 Win32 与平台日志），所以测试不依赖负载 DLL 的加载。
+# 这条路上的东西，两边互不踩。`src/payload/{feed,hook_post,reg_hook}.cpp` 在这里被**再编译一次**
+# （它们不碰 XAML，只依赖 Win32 与平台日志），所以测试不依赖负载 DLL 的加载；`reg_hook.cpp` 里
+# 那几个自测探针由 `DESKFEED_NATIVE_TESTS` 开关，成品 DLL 里没有它们。
 add_executable(deskfeed-native-tests
     tests/native_tests.cpp
     src/payload/feed.cpp
     src/payload/hook_post.cpp
+    src/payload/reg_hook.cpp
 )
 target_link_libraries(deskfeed-native-tests PRIVATE deskfeed_platform)
 target_include_directories(deskfeed-native-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(deskfeed-native-tests PRIVATE DESKFEED_NATIVE_TESTS=1)
+
+# **测试专用** fixture：一个只按名字导入 Reg* 三个入口、不链本工程任何库的小 DLL。用例把它
+# LoadLibrary 进来，让 `reg_hook` 真的去补它的导入槽——这样"替身答话"与"模块卸载后再 restore
+# 不崩"这两条硬路径才能被真的跑到。不部署、不安装，只是 CTest 的夹具。
+add_library(deskfeed-reg-hook-caller SHARED
+    tests/reg_hook_caller.cpp
+)
+set_target_properties(deskfeed-reg-hook-caller PROPERTIES
+    OUTPUT_NAME "deskfeed-reg-hook-caller"
+    PREFIX ""
+)
+add_dependencies(deskfeed-native-tests deskfeed-reg-hook-caller)
 
 add_test(NAME deskfeed-native-tests COMMAND deskfeed-native-tests)
+
+# 主进程侧编排（`TaskbarSupervisor`）的离线用例：`deskfeed-fake-injector` 是一个**不注入任何
+# 进程**的假注入器（只按命令行写 argv 日志、按参数延时、返回指定退出码），
+# `deskfeed-supervisor-tests` 用它跑完"装载/停止/状态/退避/收尾"那些场景。
+# 两个独立可执行文件，各有自己的 main 与用例，不并入 `deskfeed-tests`。
+add_executable(deskfeed-fake-injector
+    tests/fake_injector.cpp
+)
+add_executable(deskfeed-supervisor-tests
+    tests/master_supervisor_tests.cpp
+    src/master/taskbar_supervisor.cpp
+)
+target_link_libraries(deskfeed-supervisor-tests PRIVATE deskfeed_platform deskfeed_core_text)
+target_include_directories(deskfeed-supervisor-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_dependencies(deskfeed-supervisor-tests deskfeed-fake-injector)
+add_test(NAME deskfeed-supervisor-tests COMMAND deskfeed-supervisor-tests)
 
 # 成品导入表/map 审计：单独一条 CTest，失败就是"负载里混进了不该有的东西"。
 add_test(NAME deskfeed-payload-audit
     COMMAND deskfeed-native-tests --audit $<TARGET_FILE:deskfeed_payload>
 )
+
+# ---------------------------------------------------------------------------
+# 桌面悬浮窗（Phase 3）。
+#
+# `deskfeed_widget` 是**静态库**：主进程与两个测试目标都链它，绝不把它的实现直接编进负载 DLL
+# （负载只链 display/platform/core_text/control_wire_send，见上面的分层）。链 ipc 是因为界面偏好
+# 走设置文件那一层；链 display 是因为它渲染的就是显示帧格式化出来的读数。
+add_library(deskfeed_widget STATIC
+    src/widget/fullscreen.cpp
+    src/widget/preferences.cpp
+    src/widget/text_metrics.cpp
+    src/widget/theme.cpp
+    src/widget/window.cpp
+)
+target_link_libraries(deskfeed_widget PUBLIC
+    deskfeed_display
+    deskfeed_ipc
+    deskfeed_platform
+    deskfeed_core
+    # 悬浮窗自己的窗口、菜单与悬停提示。
+    comctl32.lib
+    dwmapi.lib
+    gdiplus.lib
+)
+
+# 两个悬浮窗用例目标都**直接链静态库**，不重复编译 widget 的源文件：重复编译会带来两份实现，
+# 链接期就会撞符号（duplicate symbol）。它们的 include 都从仓库根开始，所以只需要根做包含目录。
+add_executable(deskfeed-widget-tests
+    tests/widget_tests.cpp
+)
+target_link_libraries(deskfeed-widget-tests PRIVATE deskfeed_widget)
+target_include_directories(deskfeed-widget-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# 隐藏窗口门禁：真的建窗口（`force_hidden = true`，绝不出现在桌面上）与悬停提示，所以清单必须是
+# **源文件**（与负载同样的做法）：/MANIFESTINPUT 单独用会 LNK1220，/MANIFEST:EMBED 又会和它重复
+# （CVT1100）。作为源文件合进去，trustInfo 与 comctl32 v6 的依赖就都在了。
+add_executable(deskfeed-widget-window-tests
+    tests/widget_window_tests.cpp
+    src/widget/deskfeed-widget.manifest
+)
+target_link_libraries(deskfeed-widget-window-tests PRIVATE
+    deskfeed_widget
+    # 悬停提示与主题取色。
+    comctl32.lib
+    dwmapi.lib
+    gdiplus.lib
+    user32.lib
+)
+target_include_directories(deskfeed-widget-window-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_test(NAME deskfeed-widget-tests COMMAND deskfeed-widget-tests)
+add_test(NAME deskfeed-widget-window-tests COMMAND deskfeed-widget-window-tests)

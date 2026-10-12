@@ -18,10 +18,12 @@
 #include "display/mailbox.h"
 #include "display/reading.h"
 #include "inject/actions.h"
+#include "inject/payload_status.h"
 #include "inject/pe_export.h"
 #include "inject/remote.h"
 #include "inject/target.h"
 #include "platform/paths.h"
+#include "platform/win32_util.h"
 #include "probe/host_gate.h"
 
 #include <windows.h>
@@ -1187,6 +1189,191 @@ void run_identity_cases(std::wstring const& dir) {
     ::FreeLibrary(user32);
 }
 
+// 测试专用延迟写 DLL 与"自己的目录"：由构建把 DLL 放在与本可执行文件同一个目录。
+std::wstring test_writer_dll_path() {
+    std::wstring const self = deskfeed::module_self_path();
+    std::wstring::size_type const slash = self.find_last_of(L"\\/");
+    std::wstring const dir = slash == std::wstring::npos ? std::wstring() : self.substr(0, slash + 1);
+    return dir + L"deskfeed-test-remote-writer.dll";
+}
+
+// 子进程模式：只装载延迟写 DLL 并停在那里，供父进程制造真实的远程调用超时。
+int run_remote_writer_child() {
+    std::wstring const dll = test_writer_dll_path();
+    HMODULE const module = ::LoadLibraryW(dll.c_str());
+    if (module == nullptr) {
+        std::printf("child: cannot load %ls\n", dll.c_str());
+        return 3;
+    }
+    // 有界自毁：父进程正常会 TerminateProcess，这里只防止父进程崩溃时留下孤儿。
+    ::Sleep(20000);
+    ::FreeLibrary(module);
+    return 0;
+}
+
+// HARD2：远程线程超时之后仍在写调用方缓冲。用真子进程 + 真延迟写 DLL 制造这个窗口，断言
+// "超时后绝不释放"，并且迟到的 144 字节写入完整落地（没有被复用或破坏）。
+void run_remote_late_write_case() {
+    using namespace deskfeed::inject;
+    if (!wanted("remote/late-write")) {
+        return;
+    }
+
+    std::wstring const dll = test_writer_dll_path();
+    if (::GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        check(false, "remote/late-write the delayed-writer test DLL is missing");
+        return;
+    }
+
+    wchar_t self[MAX_PATH]{};
+    if (::GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) {
+        check(false, "remote/late-write self path");
+        return;
+    }
+    std::wstring command = L"\"" + std::wstring(self) + L"\" --remote-writer";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                         nullptr, &startup, &process) == FALSE) {
+        check(false, "remote/late-write spawn child");
+        return;
+    }
+    unsigned long const child_pid = process.dwProcessId;
+
+    unsigned long long dll_base = 0;
+    for (int attempt = 0; attempt < 100 && dll_base == 0; ++attempt) {
+        ::Sleep(50);
+        std::vector<ModuleEntry> modules;
+        std::wstring list_error;
+        if (list_modules(child_pid, modules, list_error)) {
+            for (ModuleEntry const& entry : modules) {
+                if (module_path_matches(entry.path, dll)) {
+                    dll_base = entry.base;
+                }
+            }
+        }
+    }
+    check(dll_base != 0, "remote/late-write the child loaded the writer DLL");
+
+    PeExportInfo info;
+    std::wstring error;
+    PeExportError kind = PeExportError::None;
+    bool const parsed =
+        dll_base != 0 && pe_export_rva(dll, "DeskFeedTestDelayedWrite", info, error, &kind);
+    check(parsed, "remote/late-write the delayed writer export was parsed");
+
+    if (parsed) {
+        RemoteBuffer buffer;
+        std::wstring buffer_error;
+        check(remote_alloc(child_pid, 144, buffer, buffer_error), "remote/late-write buffer allocated");
+
+        unsigned char header[144]{};
+        std::uint32_t size = 144;
+        std::uint32_t abi = 1;
+        std::uint32_t width = 64;
+        std::memcpy(header + 0, &size, 4);
+        std::memcpy(header + 4, &abi, 4);
+        std::memcpy(header + 8, &width, 4);
+        check(remote_write(child_pid, buffer.address, header, sizeof(header), buffer_error),
+              "remote/late-write POD header written");
+
+        // 真实的远程调用超时：线程已创建、250ms 内不退出，而写发生在 800ms 之后。
+        RemoteCall const call = call_remote_export(child_pid, dll_base, info.rva,
+                                                   reinterpret_cast<void*>(buffer.address), 250);
+        check(call.thread_created, "remote/late-write remote thread created");
+        check(!call.signaled, "remote/late-write the call really timed out");
+        check(!may_release_remote_buffer(call.thread_created, call.signaled),
+              "remote/late-write the condition policy retains the buffer after a timeout");
+
+        // 直接走被修的那个函数：短超时必须返回 false，并且如实报告"缓冲区保留"。
+        RemoteCall pod_call;
+        std::wstring pod_error;
+        check(!remote_fetch_pod(child_pid, dll_base, info.rva, header, sizeof(header), 250, pod_call,
+                                pod_error),
+              "remote/late-write remote_fetch_pod times out");
+        check(pod_error.find(L"stays allocated") != std::wstring::npos,
+              "remote/late-write remote_fetch_pod reports the retained buffer");
+
+        ::Sleep(1200);  // 让两个远程写者都完成它们那 144 字节
+        unsigned char read_back[144]{};
+        bool const read_ok =
+            remote_read(child_pid, buffer.address, read_back, sizeof(read_back), buffer_error);
+        check(read_ok, "remote/late-write the retained buffer is still readable after the late write");
+        unsigned char const magic[8] = {0x44, 0x46, 0x4C, 0x41, 0x54, 0x45, 0x01, 0x00};
+        bool const intact = read_ok && std::memcmp(read_back, magic, sizeof(magic)) == 0;
+        check(intact, "remote/late-write the late 144-byte write landed intact (no reuse/corruption)");
+        if (intact) {
+            std::printf("  late-write: retired=yes allocated=144 bytes pattern=intact\n");
+        }
+        if (read_ok) {
+            remote_free(child_pid, buffer);
+        }
+
+        // 写者返回之后再调一次：结论必须变成"成功"，证明没有留下半释放状态。
+        RemoteCall settled;
+        std::wstring settled_error;
+        check(remote_fetch_pod(child_pid, dll_base, info.rva, header, sizeof(header), 5000, settled,
+                               settled_error),
+              "remote/late-write remote_fetch_pod succeeds once the writer returns");
+    }
+
+    ::TerminateProcess(process.hProcess, 0);
+    ::WaitForSingleObject(process.hProcess, 5000);
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(process.hProcess);
+}
+
+// ---------------------------------------------------------------------------
+// 状态门禁（N2）：不可信的查询结论绝不允许流入 Stop / eject / 重装
+// ---------------------------------------------------------------------------
+
+void run_state_gate_cases() {
+    using namespace deskfeed::inject;
+    if (!wanted("stategate/")) {
+        return;
+    }
+
+    PayloadState const all[] = {PayloadState::NotMapped,       PayloadState::MappedUnknownAbi,
+                                PayloadState::MappedUnverifiable, PayloadState::MappedInactive,
+                                PayloadState::MappedActive,    PayloadState::MappedRetained};
+
+    // 结论不可信：任何状态都不允许 Stop，也不允许"先停再装"。
+    PayloadStatus status;
+    status.conclusive = false;
+    for (PayloadState const state : all) {
+        status.state = state;
+        check(!state_allows_stop(status), "stategate/inconclusive never allows stop");
+        check(!state_allows_reload_stop(status), "stategate/inconclusive never allows reload");
+    }
+
+    // 结论可信：只有 Inactive 允许"先停再装"；Inactive/Active/Retained 允许 Stop。
+    status.conclusive = true;
+    status.state = PayloadState::MappedInactive;
+    check(state_allows_stop(status), "stategate/inactive allows stop");
+    check(state_allows_reload_stop(status), "stategate/inactive allows reload");
+
+    status.state = PayloadState::MappedActive;
+    check(state_allows_stop(status), "stategate/active allows stop");
+    check(!state_allows_reload_stop(status), "stategate/active does not allow reload");
+
+    status.state = PayloadState::MappedRetained;
+    check(state_allows_stop(status), "stategate/retained allows a stop attempt");
+    check(!state_allows_reload_stop(status), "stategate/retained does not allow reload");
+
+    status.state = PayloadState::MappedUnverifiable;
+    check(!state_allows_stop(status), "stategate/unverifiable never allows stop");
+    check(!state_allows_reload_stop(status), "stategate/unverifiable never allows reload");
+
+    status.state = PayloadState::MappedUnknownAbi;
+    check(!state_allows_stop(status), "stategate/unknown-abi never allows stop");
+    check(!state_allows_reload_stop(status), "stategate/unknown-abi never allows reload");
+
+    // 新状态的名字要能被日志如实读出来。
+    check_eq(std::string(payload_state_name(PayloadState::MappedUnverifiable)),
+             std::string("mapped-unverifiable"), "stategate/unverifiable name");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1202,6 +1389,9 @@ int main(int argc, char** argv) {
                 scope.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
             }
             return run_mailbox_owner_child(scope);
+        } else if (std::strcmp(argv[index], "--remote-writer") == 0) {
+            // 子进程模式：只装载延迟写 DLL 并停在那里，给父用例制造真实的远程调用超时。
+            return run_remote_writer_child();
         }
     }
 
@@ -1213,6 +1403,8 @@ int main(int argc, char** argv) {
     run_mailbox_case();
     run_mailbox_latest_cases();
     run_mailbox_owner_death_case();
+    run_remote_late_write_case();
+    run_state_gate_cases();
     run_frame_cases();
     run_gate_cases();
 

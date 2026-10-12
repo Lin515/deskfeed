@@ -698,7 +698,19 @@ bool remote_fetch_pod(unsigned long process_id, unsigned long long module_base, 
         ok = true;
     } while (false);
 
-    remote_free(process_id, buffer);
+    // 与路径缓冲/scope 缓冲同一条决策：只有"线程从未创建"或"线程确实退出"之后才能释放。远程
+    // `DeskFeedGetStatus` 在超时那一刻可能还没写那 144 字节；提前 `VirtualFreeEx` 会让它写进已释放
+    // 的内存（目标进程内存破坏）。短命注入器把这块泄露到目标进程退出即可，绝不用 TerminateThread 抢。
+    if (may_release_remote_buffer(call.thread_created, call.signaled)) {
+        remote_free(process_id, buffer);
+    } else {
+        // 如实追加"没有释放"这一事实，不覆盖前面那条超时原因。
+        if (!error.empty()) {
+            error += L"; ";
+        }
+        error += L"the remote status buffer stays allocated because the GetStatus thread has not "
+                 L"exited; it is released when the target process exits";
+    }
     return ok;
 }
 

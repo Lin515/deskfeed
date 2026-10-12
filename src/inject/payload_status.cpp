@@ -108,6 +108,7 @@ char const* payload_state_name(PayloadState state) {
     switch (state) {
         case PayloadState::NotMapped: return "not-mapped";
         case PayloadState::MappedUnknownAbi: return "mapped-unknown-abi";
+        case PayloadState::MappedUnverifiable: return "mapped-unverifiable";
         case PayloadState::MappedInactive: return "mapped-inactive";
         case PayloadState::MappedActive: return "mapped-active";
         case PayloadState::MappedRetained: return "mapped-retained";
@@ -216,17 +217,17 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
         return true;
     }
     if (!pe_image_matches_module(export_info, module.size, export_error)) {
-        out.state = PayloadState::MappedUnknownAbi;
+        out.state = PayloadState::MappedUnverifiable;
         out.detail = L"the on-disk payload does not match the loaded module: " + export_error;
         return true;
     }
     // 尺寸相同不等于同一个 build：受限读取远程镜像自己的 PE 元数据与导出表，只有同名导出的
-    // 远程真实 RVA 与磁盘一致、且落在可执行节内才允许调用；否则就是"读不出可信状态"（Unknown），
-    // 绝不因此报成 NotMapped / active。
+    // 远程真实 RVA 与磁盘一致、且落在可执行节内才允许调用；否则就是"读不出可信状态"，绝不因此
+    // 报成 NotMapped / active，也绝不允许任何 Stop/eject 走这条路。
     unsigned long verified_rva = 0;
     if (!verify_remote_export(process_id, module.base, module.size, "DeskFeedGetStatus", export_info,
                               verified_rva, export_error)) {
-        out.state = PayloadState::MappedUnknownAbi;
+        out.state = PayloadState::MappedUnverifiable;
         out.detail = L"the loaded payload does not match the on-disk DLL: " + export_error;
         return true;
     }
@@ -240,7 +241,9 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
     std::wstring fetch_error;
     if (!remote_fetch_pod(process_id, module.base, verified_rva, &pod, sizeof(pod), 5000, call,
                           fetch_error)) {
-        out.state = PayloadState::MappedUnknownAbi;
+        // 超时/未创建/读回失败：结论未知。绝不能当成 Inactive（那会让调用方去 Stop 一个可能正有
+        // 远程线程在它代码里执行的模块）。
+        out.state = PayloadState::MappedUnverifiable;
         out.detail = L"DeskFeedGetStatus did not answer: " + fetch_error;
         return true;
     }
@@ -253,7 +256,7 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
     std::wstring pod_scope;
     std::wstring pod_problem;
     if (!pod_is_well_formed(pod, pod_scope, pod_problem)) {
-        out.state = PayloadState::MappedUnknownAbi;
+        out.state = PayloadState::MappedUnverifiable;
         out.detail = L"the payload wrote a malformed status POD: " + pod_problem;
         return true;
     }
@@ -261,6 +264,8 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
     out.have_pod = true;
     out.pod = pod;
     out.scope_matches = pod_scope == scope;
+    // 走到这里才算"读到了一张可信的 POD"：后面的 Inactive/Active/Retained 都是确定的结论。
+    out.conclusive = true;
 
     // POD 报的生产者身份必须与帧头一致：否则它挂的是**另一个** scope / 另一份邮箱的主人。
     if (out.mailbox_present) {

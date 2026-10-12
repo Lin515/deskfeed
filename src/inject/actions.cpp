@@ -278,10 +278,31 @@ int do_load(Options const& options) {
             report(L"nothing was injected for this target");
             return 0;
         }
+        if (status.state == PayloadState::MappedUnknownAbi ||
+            status.state == PayloadState::MappedUnverifiable) {
+            // 结论不可信（没有状态 ABI / 远程调用超时 / POD 不可信 / 身份不一致）：**绝不**去
+            // Stop 或卸载。这种模块里可能正有一个没退出的远程线程在跑它的代码，卸载就是把它抽走。
+            report(L"refusing to reload: the payload state is not verifiable (" +
+                   ascii_to_wide(payload_state_name(status.state)) + L": " + status.detail +
+                   L"); not stopping anything in this run");
+            if (options.dry_run) {
+                report(L"dry run: would still retire stale payloads in other explorer.exe processes");
+            } else if (!clean_other_explorers(target.process_id, dll_path, /*dry_run=*/false)) {
+                report(L"stale-other-retained: a stale payload in another explorer.exe could not be safely removed (deployment requires no stale payload elsewhere)");
+            }
+            return 1;
+        }
         if (options.dry_run) {
             report(L"would stop the mapped payload (it is not provably active) and load it again");
             report(L"dry run: would also retire stale payloads in other explorer.exe processes");
             return 0;
+        }
+        if (!state_allows_reload_stop(status)) {
+            // 兜底：任何不在"可信 + Inactive"这一格的组合都不允许先停再装。
+            report(std::wstring(L"refusing to reload: the payload state '") +
+                   ascii_to_wide(payload_state_name(status.state)) +
+                   L"' does not allow a stop-then-load");
+            return 1;
         }
         report(L"the mapped payload is not provably active; removing it before loading again");
         bool retired = false;
@@ -470,6 +491,21 @@ int do_stop(Options const& options) {
         if (options.dry_run) {
             report(L"would stop the payload in pid " + std::to_wstring(pid) +
                    (options.unload ? L" and unload the DLL" : L" and leave the DLL mapped"));
+            continue;
+        }
+        // 状态门禁：只有**结论可信**的目标才允许 Stop。超时、没有状态 ABI、POD 不可信、身份不一致
+        // 一律跳过 —— 那种模块里可能正有一个没退出的远程线程在跑它的代码，卸载就是把它抽走。
+        PayloadStatus victim_status;
+        std::wstring victim_error;
+        bool const queried =
+            query_payload_status(pid, dll_path, options.scope, victim_status, victim_error);
+        if (!queried || !state_allows_stop(victim_status)) {
+            std::wstring reason = queried ? ascii_to_wide(payload_state_name(victim_status.state)) +
+                                                L" (" + victim_status.detail + L")"
+                                          : L"status query failed (" + victim_error + L")";
+            report(L"skipping pid " + std::to_wstring(pid) + L": " + reason +
+                   L"; refusing to stop an unverifiable payload");
+            all_ok = false;
             continue;
         }
         bool retired = false;

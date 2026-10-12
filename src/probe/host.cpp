@@ -728,10 +728,11 @@ DWORD WINAPI worker_entry(LPVOID) {
 
 // 收尾判据：逐次 FreeLibrary 直到失败。这是 loader 自己记的账，不是预测：健康路径必须是 1
 // （那一次是探针自己的 LoadLibrary；XAML 为每个 site 记的引用已由负载在解析阶段还清）。
-void report_module_references(HMODULE module) {
+// 返回值就是账上的引用数：调用方必须据此判红，而不是只把这一行打给人看。
+int report_module_references(HMODULE module) {
     if (module == nullptr) {
         deskfeed::log_line(L"the payload was never loaded");
-        return;
+        return -1;
     }
     // 取路径要在卸载之前：最后一次成功的 FreeLibrary 已经把模块的代码与数据一起拿走。
     std::wstring const path = deskfeed::module_file_path(module);
@@ -745,6 +746,7 @@ void report_module_references(HMODULE module) {
     deskfeed::log_format(L"the payload module (%s) is %s now", name.c_str(),
                          ::GetModuleHandleW(name.c_str()) == nullptr ? L"fully unloaded"
                                                                     : L"still mapped");
+    return references;
 }
 
 int run_host(HostOptions const& options) {
@@ -895,7 +897,15 @@ int run_host(HostOptions const& options) {
             g_failed = true;
         }
 
-        report_module_references(g_module);
+        // 引用计数不是"打给人看的一行"：健康路径必须刚好是 1（探针自己那一次 LoadLibrary）。
+        // 0/负值说明多还了一次（模块可能在它自己的代码还在跑时被抽走），>1 说明少还了。
+        int const references = report_module_references(g_module);
+        if (references != 1) {
+            deskfeed::log_format(L"the payload module reference count is %d, not 1: the site "
+                                 L"references were not returned exactly once",
+                                 references);
+            g_failed = true;
+        }
     }
 
     for (ExtraCore* core : g_extra_cores) {

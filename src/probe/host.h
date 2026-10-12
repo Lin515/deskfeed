@@ -39,8 +39,9 @@ struct HostOptions {
 // 跑一次自测宿主。返回 0 表示按预期完成（对抗用例里"观察到对抗症状"也算按预期）。
 int run_host(HostOptions const& options);
 
-// 收尾判据：逐次 `FreeLibrary` 直到失败，打印
-// `payload module references at the end: N`（健康路径必须是 1：那 1 次是探针自己的 LoadLibrary）。
-void report_module_references(HMODULE module);
+// 收尾判据：逐次 `FreeLibrary` 直到失败，打印 `payload module references at the end: N`，
+// 并**返回** N —— 调用方据此判红，而不是只把这一行打给人看。健康路径必须是 1（那 1 次是探针
+// 自己的 `LoadLibrary`）。`module == nullptr`（从未装载）返回 -1。
+int report_module_references(HMODULE module);
 
 }  // namespace deskfeed::probe

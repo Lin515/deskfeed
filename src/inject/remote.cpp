@@ -223,6 +223,13 @@ bool list_processes_by_image(std::wstring const& image_name, std::vector<Process
                 }
                 ::CloseHandle(process);
             }
+            // 创建时间现在就捕获：PID 会被复用，任何"还是当初那个进程"的判断（含为**别的**
+            // explorer 单独拿一份租约）都必须带上它，而不是等稍后按 PID 重开。
+            std::uint64_t creation_time = 0;
+            std::wstring time_error;
+            if (process_creation_time(entry.th32ProcessID, creation_time, time_error)) {
+                item.creation_time = creation_time;
+            }
             found.push_back(std::move(item));
         } while (::Process32NextW(snapshot, &entry));
     }
@@ -429,174 +436,182 @@ RemoteCall call_remote_thread(unsigned long process_id, void* start, void* param
     return result;
 }
 
-bool inject_library(unsigned long process_id, std::wstring const& dll_path, ModuleEntry& loaded,
-                    bool& already_loaded, std::wstring& error) {
-    already_loaded = false;
+RemoteCall issue_remote_thread_on(HANDLE target_process, void* start, void* parameter) {
+    RemoteCall result;
+    if (target_process == nullptr) {
+        result.error = L"no target process handle was captured for this action";
+        return result;
+    }
+    if (start == nullptr) {
+        result.error = L"no remote entry point";
+        return result;
+    }
+    // 立即返回：未决时线程句柄保留，由调用方 park 到真实结论或显式按"未知"保留。**绝不**在这里
+    // 等一个上限然后把没回来的调用当成干净。
+    return run_remote_thread(target_process, start, parameter, 0);
+}
 
-    ModuleEntry existing;
-    std::wstring lookup_error;
-    switch (lookup_module_by_full_path(process_id, dll_path, existing, lookup_error)) {
-        case ModuleLookup::Found:
-            already_loaded = true;
-            loaded = existing;
-            return true;
-        case ModuleLookup::Error:
-            error = L"cannot read the target module list: " + lookup_error;
-            return false;
-        case ModuleLookup::NotFound:
-            break;
+bool remote_export_address(unsigned long process_id, char const* module_name, char const* export_name,
+                           void*& out, std::wstring& error) {
+    return remote_address_of_export(process_id, module_name, export_name, out, error);
+}
+
+RemoteCall issue_load_library_on(HANDLE target_process, unsigned long process_id,
+                                 std::wstring const& dll_path, RemoteBuffer& path_buffer,
+                                 bool& path_allocated, std::wstring& error) {
+    RemoteCall result;
+    path_buffer = RemoteBuffer{};
+    path_allocated = false;
+    error.clear();
+    if (target_process == nullptr) {
+        result.error = L"no target process handle was captured for this action";
+        error = result.error;
+        return result;
     }
 
-    HANDLE process = open_target(process_id, error);
-    if (process == nullptr) {
+    SIZE_T const path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
+    if (!remote_alloc_on(target_process, path_bytes, path_buffer, error)) {
+        result.error = error;
+        return result;
+    }
+    path_allocated = true;
+    if (!remote_write_on(target_process, path_buffer.address, dll_path.c_str(), path_bytes, error)) {
+        result.error = error;
+        return result;
+    }
+
+    void* load_library = nullptr;
+    if (!remote_address_of_export(process_id, "kernel32.dll", "LoadLibraryW", load_library, error)) {
+        result.error = error;
+        return result;
+    }
+    return issue_remote_thread_on(target_process, load_library,
+                                  reinterpret_cast<void*>(path_buffer.address));
+}
+
+bool confirm_load_library(unsigned long process_id, std::wstring const& dll_path,
+                          RemoteCall const& call, ModuleEntry& loaded, std::wstring& error) {
+    loaded = ModuleEntry{};
+    error.clear();
+    if (!call.signaled) {
+        // 线程还没退出时模块表里可能已经出现这个名字，但那一刻 DllMain 可能还没返回：接着调
+        // Start / FreeLibrary 就是在一个尚未完成初始化的模块里跑代码。所以这里拒绝给出结论。
+        error = L"LoadLibraryW has not returned; whether the module is loaded is unknown";
         return false;
     }
 
-    bool ok = false;
-    do {
-        SIZE_T const path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
-        void* remote_path = ::VirtualAllocEx(process, nullptr, path_bytes, MEM_COMMIT | MEM_RESERVE,
-                                             PAGE_READWRITE);
-        if (remote_path == nullptr) {
-            error = L"VirtualAllocEx failed: " + deskfeed::last_error_text();
-            break;
+    ModuleEntry found;
+    std::wstring find_error;
+    switch (lookup_module_by_full_path(process_id, dll_path, found, find_error)) {
+        case ModuleLookup::Found:
+            loaded = found;
+            if (call.exit_code == 0) {
+                deskfeed::log_format(L"note: LoadLibraryW reported 0 (a truncated x64 handle or a "
+                                     L"failure) yet the module is mapped; the module list is the "
+                                     L"authority here");
+            }
+            return true;
+        case ModuleLookup::NotFound:
+            error = L"LoadLibraryW did not map the module (remote thread exit code " +
+                    deskfeed::hex_text(call.exit_code) + L")";
+            return false;
+        case ModuleLookup::Error:
+            error = L"the module was loaded but the target module list could not be read: " +
+                    find_error;
+            return false;
+    }
+    error = L"the target module list could not be interpreted";
+    return false;
+}
+
+RemoteCall issue_free_library_on(HANDLE target_process, unsigned long process_id,
+                                 unsigned long long module_base, std::wstring& error) {
+    RemoteCall result;
+    error.clear();
+    void* free_library = nullptr;
+    if (!remote_address_of_export(process_id, "kernel32.dll", "FreeLibrary", free_library, error)) {
+        result.error = error;
+        return result;
+    }
+    return issue_remote_thread_on(target_process, free_library,
+                                  reinterpret_cast<void*>(module_base));
+}
+
+bool confirm_module_gone(unsigned long process_id, unsigned long long module_base,
+                         std::wstring& error) {
+    std::vector<ModuleEntry> modules;
+    std::wstring module_error;
+    if (!list_modules(process_id, modules, module_error)) {
+        error = L"cannot confirm the unload: " + module_error;
+        return false;
+    }
+    for (ModuleEntry const& module : modules) {
+        if (module.base == module_base) {
+            error = L"the module is still mapped after FreeLibrary (its reference count is not zero)";
+            return false;
         }
+    }
+    return true;
+}
 
-        SIZE_T written = 0;
-        if (!::WriteProcessMemory(process, remote_path, dll_path.c_str(), path_bytes, &written)) {
-            error = L"WriteProcessMemory failed: " + deskfeed::last_error_text();
-            ::VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-            break;
-        }
+bool remote_alloc_on(HANDLE target_process, std::size_t bytes, RemoteBuffer& out,
+                     std::wstring& error) {
+    out = RemoteBuffer{};
+    if (target_process == nullptr) {
+        error = L"no target process handle was captured for this action";
+        return false;
+    }
+    if (bytes == 0) {
+        error = L"remote_alloc_on with zero bytes";
+        return false;
+    }
+    void* const block = ::VirtualAllocEx(target_process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_READWRITE);
+    if (block == nullptr) {
+        error = L"VirtualAllocEx failed: " + deskfeed::last_error_text();
+        return false;
+    }
+    out.address = reinterpret_cast<unsigned long long>(block);
+    out.bytes = bytes;
+    return true;
+}
 
-        std::wstring address_error;
-        void* load_library = nullptr;
-        if (!remote_address_of_export(process_id, "kernel32.dll", "LoadLibraryW", load_library,
-                                      address_error)) {
-            error = address_error;
-            ::VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-            break;
-        }
+void remote_free_on(HANDLE target_process, RemoteBuffer const& buffer) {
+    if (target_process == nullptr || buffer.address == 0) {
+        return;
+    }
+    ::VirtualFreeEx(target_process, reinterpret_cast<void*>(buffer.address), 0, MEM_RELEASE);
+}
 
-        // 装载可能比 30 秒更久（网络驱动器上的 DLL、安全软件扫描），但**超时不算成功**：
-        // 线程没退出时 DllMain 可能还在跑，调用方接着调 DeskFeedStart 就是在没初始化完的模块里
-        // 执行代码。这里只报告"结论不确定"，模块保持映射，由调用方稍后复查。
-        RemoteCall call = run_remote_thread(process, load_library, remote_path, 30000);
-
-        // 远程缓冲只在"线程从未创建"或"线程确实退出"后释放。超时释放就是 use-after-free：
-        // 目标进程里的 LoadLibraryW 可能还在读那个路径串。短命注入器可以安全地把它泄露到
-        // 目标进程退出，绝不用 TerminateThread 去抢。
-        if (may_release_remote_buffer(call.thread_created, call.signaled)) {
-            ::VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
-        } else {
-            deskfeed::log_format(L"note: the remote path buffer (0x%llx) stays allocated in the "
-                                 L"target until it exits: the LoadLibraryW thread has not returned",
-                                 static_cast<unsigned long long>(
-                                     reinterpret_cast<unsigned long long>(remote_path)));
-        }
-
-        // 本批（primitive）：这条路径仍按"未知即报告"收尾，句柄在这里显式收掉。N3a 的 actor 会在
-        // 持有租约的同一条线程上改用 park_remote_call()，把"有一次入口调用没回来"变成实际的
-        // signal 或目标死亡，而不是在这里放弃观察。
-        release_remote_call(call);
-
-        if (!call.thread_created) {
-            error = call.error;
-            break;
-        }
-        if (!load_result_conclusive(call.thread_created, call.signaled)) {
-            error = L"LoadLibraryW has not returned within 30 s; whether the module is loaded is "
-                    L"unknown, and starting it now could run inside a DllMain that has not finished. "
-                    L"The module (if any) stays mapped; check --status before trying again";
-            break;
-        }
-
-        // 线程退出了，结论才算确定。退出码是 DWORD，x64 的 HMODULE 会被截断，所以它**不是**
-        // 基址来源；模块表（按完整路径）才是。
-        ModuleEntry found;
-        std::wstring find_error;
-        switch (lookup_module_by_full_path(process_id, dll_path, found, find_error)) {
-            case ModuleLookup::Found:
-                loaded = found;
-                if (call.exit_code == 0) {
-                    deskfeed::log_format(L"note: LoadLibraryW reported 0 (a truncated x64 handle or "
-                                         L"a failure) yet the module is mapped; the module list is "
-                                         L"the authority here");
-                }
-                ok = true;
-                break;
-            case ModuleLookup::NotFound:
-                error = L"LoadLibraryW did not map the module (remote thread exit code " +
-                        deskfeed::hex_text(call.exit_code) + L")";
-                break;
-            case ModuleLookup::Error:
-                error = L"the module was loaded but the target module list could not be read: " +
-                        find_error;
-                break;
-        }
-        break;
-    } while (false);
-
-    ::CloseHandle(process);
+bool remote_write_on(HANDLE target_process, unsigned long long address, void const* data,
+                     std::size_t bytes, std::wstring& error) {
+    if (target_process == nullptr) {
+        error = L"no target process handle was captured for this action";
+        return false;
+    }
+    SIZE_T written = 0;
+    bool const ok = ::WriteProcessMemory(target_process, reinterpret_cast<void*>(address), data, bytes,
+                                         &written) != FALSE &&
+                    written == bytes;
+    if (!ok) {
+        error = L"WriteProcessMemory failed: " + deskfeed::last_error_text();
+    }
     return ok;
 }
 
-bool eject_library(unsigned long process_id, unsigned long long module_base, std::wstring& error) {
-    HANDLE process = open_target(process_id, error);
-    if (process == nullptr) {
+bool remote_read_on(HANDLE target_process, unsigned long long address, void* out, std::size_t bytes,
+                    std::wstring& error) {
+    if (target_process == nullptr) {
+        error = L"no target process handle was captured for this action";
         return false;
     }
-
-    bool ok = false;
-    do {
-        std::wstring address_error;
-        void* free_library = nullptr;
-        if (!remote_address_of_export(process_id, "kernel32.dll", "FreeLibrary", free_library,
-                                      address_error)) {
-            error = address_error;
-            break;
-        }
-
-        RemoteCall call =
-            run_remote_thread(process, free_library, reinterpret_cast<void*>(module_base), 15000);
-        // 同上：本批先把句柄显式收掉（事实按"未知"报告）；N3a 的 actor 在持有租约时会 park 到
-        // 真实 signal 或目标死亡，再决定模块是否真的消失。
-        release_remote_call(call);
-        if (!call.thread_created) {
-            error = call.error;
-            break;
-        }
-        if (!call.signaled) {
-            error = call.error;
-            break;
-        }
-        if (call.exit_code == 0) {
-            error = L"FreeLibrary returned FALSE in the target process";
-            break;
-        }
-
-        // FreeLibrary 返回 TRUE 也可能只是把引用数减了一，模块仍在表里。卸载必须用模块表确认。
-        std::vector<ModuleEntry> modules;
-        std::wstring module_error;
-        if (!list_modules(process_id, modules, module_error)) {
-            error = L"cannot confirm the unload: " + module_error;
-            break;
-        }
-        bool still_mapped = false;
-        for (ModuleEntry const& module : modules) {
-            if (module.base == module_base) {
-                still_mapped = true;
-                break;
-            }
-        }
-        if (still_mapped) {
-            error = L"the module is still mapped after FreeLibrary (its reference count is not zero)";
-            break;
-        }
-        ok = true;
-    } while (false);
-
-    ::CloseHandle(process);
+    SIZE_T read = 0;
+    bool const ok = ::ReadProcessMemory(target_process, reinterpret_cast<void const*>(address), out,
+                                        bytes, &read) != FALSE &&
+                    read == bytes;
+    if (!ok) {
+        error = L"ReadProcessMemory failed: " + deskfeed::last_error_text();
+    }
     return ok;
 }
 

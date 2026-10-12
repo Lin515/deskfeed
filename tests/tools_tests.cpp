@@ -19,6 +19,7 @@
 #include "display/reading.h"
 #include "inject/actions.h"
 #include "inject/guard.h"
+#include "inject/leased_call.h"
 #include "inject/payload_status.h"
 #include "inject/pe_export.h"
 #include "inject/remote.h"
@@ -26,6 +27,7 @@
 #include "platform/paths.h"
 #include "platform/win32_util.h"
 #include "probe/host_gate.h"
+#include "probe/host_wait.h"
 
 #include <windows.h>
 
@@ -2356,6 +2358,633 @@ void run_guard_cases() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// N3b：把租约与 parking 真的接进动作（load / stop / status / watch 的每一轮）
+//
+// 这一组咬的是**动作路径**，不是纯函数：真实的隐藏夹具主机（`tools_fixture_host.cpp`）+ 真实的夹具
+// 负载 DLL（`fixture_payload.cpp`，导出 `DeskFeedStart` / `DeskFeedStop` / `DeskFeedGetStatus`）
+// + 真实由 `CreateRemoteThread` 打进去的入口线程。用例一边跑动作，一边直接读**命名记录**，看它
+// 从 `PendingTid` 走回 `Idle`；以及看"没有结论"时租约绝不被释放。
+//
+// 绝不碰真实 explorer.exe：目标恒为用例自己 spawn 的夹具主机。
+// ---------------------------------------------------------------------------
+
+std::wstring fixture_dir() {
+    // 缺省：与本可执行文件同目录（ROOT 构建树里夹具与用例同目录）。
+    // 覆盖：DESKFEED_TOOLS_FIXTURE_DIR（本地隔离构建树里夹具被放到别处时用）。
+    wchar_t buffer[32768]{};
+    DWORD const length = ::GetEnvironmentVariableW(L"DESKFEED_TOOLS_FIXTURE_DIR", buffer,
+                                                   static_cast<DWORD>(std::size(buffer)));
+    std::wstring dir;
+    if (length > 0 && length < std::size(buffer)) {
+        dir.assign(buffer, length);
+    } else {
+        std::wstring const self = deskfeed::module_self_path();
+        std::wstring::size_type const slash = self.find_last_of(L"\\/");
+        dir = slash == std::wstring::npos ? std::wstring() : self.substr(0, slash);
+    }
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) {
+        dir.pop_back();
+    }
+    return dir;
+}
+
+std::wstring fixture_payload_path() {
+    return fixture_dir() + L"\\deskfeed-test-fixture-payload.dll";
+}
+
+std::wstring fixture_host_path() {
+    return fixture_dir() + L"\\deskfeed-tools-fixture-host.exe";
+}
+
+// 给夹具主机进程拼一份环境块（只覆盖夹具开关；其余照抄本进程，保证 PATH 等还在）。
+std::wstring build_environment(std::vector<std::pair<std::wstring, std::wstring>> const& overrides) {
+    std::vector<std::wstring> entries;
+    LPWCH const block = ::GetEnvironmentStringsW();
+    if (block != nullptr) {
+        for (wchar_t const* entry = block; *entry != L'\0'; entry += ::wcslen(entry) + 1) {
+            std::wstring text(entry);
+            bool replaced = false;
+            for (auto const& pair : overrides) {
+                if (text.size() > pair.first.size() &&
+                    ::_wcsnicmp(text.c_str(), pair.first.c_str(), pair.first.size()) == 0 &&
+                    text[pair.first.size()] == L'=') {
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                entries.push_back(text);
+            }
+        }
+        ::FreeEnvironmentStringsW(block);
+    }
+    for (auto const& pair : overrides) {
+        entries.push_back(pair.first + L"=" + pair.second);
+    }
+    std::wstring result;
+    for (auto const& entry : entries) {
+        result += entry;
+        result.push_back(L'\0');
+    }
+    result.push_back(L'\0');
+    return result;
+}
+
+struct FixtureHost {
+    PROCESS_INFORMATION process{};
+    unsigned long pid = 0;
+    std::uint64_t creation_time = 0;
+    unsigned long long dll_base = 0;
+    deskfeed::inject::PeExportInfo status_export;
+    deskfeed::inject::PeExportInfo start_export;
+    deskfeed::inject::PeExportInfo stop_export;
+    bool ready = false;
+
+    ~FixtureHost() { kill(); }
+
+    // 只终止**本用例自己** CreateProcessW 出来的那个 PID，绝不按镜像名杀进程。
+    void kill() {
+        if (process.hProcess != nullptr) {
+            ::TerminateProcess(process.hProcess, 0);
+            ::WaitForSingleObject(process.hProcess, 5000);
+            ::CloseHandle(process.hProcess);
+            process.hProcess = nullptr;
+        }
+        if (process.hThread != nullptr) {
+            ::CloseHandle(process.hThread);
+            process.hThread = nullptr;
+        }
+        pid = 0;
+    }
+};
+
+bool spawn_fixture_host(FixtureHost& host,
+                        std::vector<std::pair<std::wstring, std::wstring>> const& env,
+                        bool load_fixture) {
+    using namespace deskfeed::inject;
+    host = FixtureHost{};
+    std::wstring const dll = fixture_payload_path();
+    std::wstring const exe = fixture_host_path();
+    if (::GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES ||
+        ::GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    std::wstring command = L"\"" + exe + L"\"";
+    if (load_fixture) {
+        command += L" --load-fixture \"" + dll + L"\"";
+    }
+    command += L" --parent " + std::to_wstring(::GetCurrentProcessId());
+    command += L" --lifetime-ms 120000";
+
+    std::wstring const block = build_environment(env);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    if (::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                         const_cast<wchar_t*>(block.c_str()), nullptr, &startup,
+                         &host.process) == FALSE) {
+        return false;
+    }
+    host.pid = host.process.dwProcessId;
+
+    std::wstring time_error;
+    if (!process_creation_time(host.pid, host.creation_time, time_error)) {
+        return false;
+    }
+
+    if (load_fixture) {
+        for (int attempt = 0; attempt < 100 && host.dll_base == 0; ++attempt) {
+            ::Sleep(50);
+            std::vector<ModuleEntry> modules;
+            std::wstring list_error;
+            if (list_modules(host.pid, modules, list_error)) {
+                for (ModuleEntry const& entry : modules) {
+                    if (module_path_matches(entry.path, dll)) {
+                        host.dll_base = entry.base;
+                    }
+                }
+            }
+        }
+        if (host.dll_base == 0) {
+            return false;
+        }
+    }
+
+    std::wstring error;
+    PeExportError kind = PeExportError::None;
+    host.ready = pe_export_rva(dll, "DeskFeedGetStatus", host.status_export, error, &kind) &&
+                 pe_export_rva(dll, "DeskFeedStart", host.start_export, error, &kind) &&
+                 pe_export_rva(dll, "DeskFeedStop", host.stop_export, error, &kind);
+    return host.ready;
+}
+
+deskfeed::inject::ActionContext fixture_context(FixtureHost const& host) {
+    deskfeed::inject::ActionContext context;
+    context.process_id = host.pid;
+    context.creation_time = host.creation_time;
+    context.other_image_name = L"deskfeed-tools-fixture-host.exe";
+    return context;
+}
+
+int g_gate_serial = 0;
+
+std::wstring make_gate_name() {
+    return L"Local\\DeskFeedFixtureGate-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+           std::to_wstring(++g_gate_serial);
+}
+
+// 只读地看那份**命名记录**（与 actor 持锁写的同一块跨进程内存）。读端可能撞上写端的快照，
+// 所以每次读都用 `guard_classify` 的 checksum 验一遍，撞上撕裂就重读。
+struct GuardRecordWatch {
+    HANDLE mapping = nullptr;
+    void* view = nullptr;
+
+    bool open(deskfeed::inject::GuardTarget const& target) {
+        namespace payload = deskfeed::payload;
+        wchar_t name[payload::kGuardNameCapacity]{};
+        if (!payload::guard_format_object_name(name, std::size(name), payload::kGuardSuffixRecord,
+                                               target.process_id, target.creation_time)) {
+            return false;
+        }
+        mapping = ::OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+        if (mapping == nullptr) {
+            return false;
+        }
+        view = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, payload::kGuardRecordSize);
+        return view != nullptr;
+    }
+
+    void close() {
+        if (view != nullptr) {
+            ::UnmapViewOfFile(view);
+            view = nullptr;
+        }
+        if (mapping != nullptr) {
+            ::CloseHandle(mapping);
+            mapping = nullptr;
+        }
+    }
+
+    bool read(deskfeed::payload::GuardRecord& out) const {
+        if (view == nullptr) {
+            return false;
+        }
+        std::memcpy(&out, view, sizeof(out));
+        return true;
+    }
+
+    bool wait_for(deskfeed::payload::GuardSnapshot wanted, int timeout_ms,
+                  deskfeed::payload::GuardRecord* last = nullptr) {
+        for (int waited = 0; waited <= timeout_ms; waited += 10) {
+            deskfeed::payload::GuardRecord record{};
+            if (read(record)) {
+                if (last != nullptr) {
+                    *last = record;
+                }
+                if (deskfeed::payload::guard_classify(record) == wanted) {
+                    return true;
+                }
+            }
+            ::Sleep(10);
+        }
+        return false;
+    }
+};
+
+void run_leased_action_cases() {
+    using namespace deskfeed::inject;
+    namespace payload = deskfeed::payload;
+
+    // ---- 受租约保护的一次调用：记录真的走到 PendingTid，再随真实 signal 回到 Idle --------
+    if (wanted("leasecall/record-and-park")) {
+        FixtureHost host;
+        std::wstring const gate_name = make_gate_name();
+        HANDLE const gate = ::CreateEventW(nullptr, TRUE, FALSE, gate_name.c_str());
+        if (gate == nullptr || !spawn_fixture_host(host, {{L"DESKFEED_FIXTURE_STATUS_GATE", gate_name}},
+                                                   /*load_fixture=*/true)) {
+            check(false, "leasecall/record-and-park could not set up the fixture host");
+            if (gate != nullptr) {
+                ::CloseHandle(gate);
+            }
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(host.pid, host.creation_time, target, error),
+                  "leasecall/record-and-park captured the target process");
+            GuardTarget const guard_target{target.process_id, target.creation_time};
+            GuardRecordWatch watch;
+
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc_on(target.process, sizeof(payload::PayloadStatusPod), buffer,
+                                  buffer_error),
+                  "leasecall/record-and-park allocated the POD buffer in the target");
+            // 调用方先写好 ABI 头（真实负载也按这条契约判断自己认不认这份布局）。
+            payload::PayloadStatusPod initial{};
+            initial.size = sizeof(initial);
+            initial.abi = payload::kPayloadStatusAbi;
+            initial.width = payload::kPayloadStatusWidth;
+            check(remote_write_on(target.process, buffer.address, &initial, sizeof(initial),
+                                  buffer_error),
+                  "leasecall/record-and-park wrote the POD header into the target");
+
+            LeaseCall call;
+            GuardAcquire acquired = GuardAcquire::Error;
+            bool concluded = false;
+            std::atomic<bool> acquired_flag{false};
+            std::thread actor([&]() {
+                GuardLease lease;
+                std::wstring acquire_error;
+                acquired = lease.acquire(guard_target, acquire_error);
+                if (!guard_acquire_allows_action(acquired)) {
+                    acquired_flag.store(true);
+                    return;
+                }
+                acquired_flag.store(true);
+                // 真实的"超时未决"：闸门还没放行，200 ms 的等待必然超时，线程句柄被保留下来。
+                call = run_leased_call(lease, target, 50, [&]() -> RemoteCall {
+                    return call_remote_export_on(target.process, host.dll_base,
+                                                 host.status_export.rva,
+                                                 reinterpret_cast<void*>(buffer.address), 200);
+                });
+                lease.note_action_conclusive(true);
+                std::wstring conclude_error;
+                concluded = lease.conclude_clean(conclude_error);
+            });
+
+            while (!acquired_flag.load()) {
+                ::Sleep(1);
+            }
+            check(acquired == GuardAcquire::Acquired,
+                  "leasecall/record-and-park the actor acquired the lease");
+            check(watch.open(guard_target),
+                  "leasecall/record-and-park opened the named record the actor created");
+
+            payload::GuardRecord pending_record{};
+            check(watch.wait_for(payload::GuardSnapshot::PendingTid, 4000, &pending_record),
+                  "leasecall/record-and-park the named record is PendingTid while the callee is "
+                  "still inside the target");
+            check(pending_record.tid != 0,
+                  "leasecall/record-and-park the record carries the real entry tid");
+            check(guard_probe_thread(host.pid, pending_record.tid) == GuardTidProbe::Present,
+                  "leasecall/record-and-park that tid is really alive inside the target");
+
+            // 放行：夹具写完 POD 再返回 ⇒ park 必须等到**真实** signal。
+            ::SetEvent(gate);
+            actor.join();
+
+            check(call.outcome == LeaseCallOutcome::Completed && call.call.completed_late,
+                  "leasecall/record-and-park parking observed the real (late) completion");
+            check(call.call.exit_code == 1,
+                  "leasecall/record-and-park the real exit code was read after the timeout");
+            check(concluded, "leasecall/record-and-park the actor concluded clean");
+            check(watch.wait_for(payload::GuardSnapshot::Idle, 3000),
+                  "leasecall/record-and-park the record is back to Idle");
+            check(!guard_event_signaled(guard_target),
+                  "leasecall/record-and-park no sticky uncertainty was left behind");
+
+            payload::PayloadStatusPod pod{};
+            check(remote_read_on(target.process, buffer.address, &pod, sizeof(pod), buffer_error),
+                  "leasecall/record-and-park the caller's buffer is still there");
+            check(pod.size == sizeof(pod) && pod.abi == payload::kPayloadStatusAbi,
+                  "leasecall/record-and-park the late 144-byte write landed intact");
+
+            remote_free_on(target.process, buffer);
+            watch.close();
+            close_target_process(target);
+            ::CloseHandle(gate);
+            host.kill();
+        }
+    }
+
+    // ---- 完整动作路径：stop 旧的（真实 FreeLibrary）→ 再 LoadLibraryW → Start ------------------
+    if (wanted("action/load-stop-start")) {
+        FixtureHost host;
+        std::vector<std::pair<std::wstring, std::wstring>> const env = {
+            {L"DESKFEED_FIXTURE_STATUS_STARTED", L"0"},
+            {L"DESKFEED_FIXTURE_STATUS_UNLOAD_SAFE", L"1"},
+            {L"DESKFEED_FIXTURE_STOP_CODE", L"1"},
+            {L"DESKFEED_FIXTURE_START_CODE", L"1"},
+        };
+        if (!spawn_fixture_host(host, env, /*load_fixture=*/true)) {
+            check(false, "action/load-stop-start could not set up the fixture host");
+        } else {
+            ActionContext const context = fixture_context(host);
+            Options options;
+            options.action = L"load";
+            options.payload_path = fixture_payload_path();
+            options.scope = L"fixture-" + std::to_wstring(::GetCurrentProcessId());
+            int const code = do_load_in(context, options);
+            check_eq(code, 0,
+                     "action/load-stop-start the load succeeds through the real action path");
+
+            ModuleEntry module;
+            std::wstring find_error;
+            check(lookup_module_by_full_path(host.pid, fixture_payload_path(), module, find_error) ==
+                      ModuleLookup::Found,
+                  "action/load-stop-start the payload is mapped in the target after the load");
+
+            GuardTarget const guard_target{host.pid, host.creation_time};
+            check(!guard_event_signaled(guard_target),
+                  "action/load-stop-start the lease was released cleanly (no sticky uncertainty)");
+            host.kill();
+        }
+    }
+
+    // ---- 未退休（Stop 报 0）绝不 FreeLibrary：报告 retained，模块保持映射 ----------------------
+    if (wanted("action/stop-retained-no-eject")) {
+        FixtureHost host;
+        std::vector<std::pair<std::wstring, std::wstring>> const env = {
+            {L"DESKFEED_FIXTURE_STATUS_STARTED", L"1"},
+            {L"DESKFEED_FIXTURE_STATUS_THREAD_ALIVE", L"1"},
+            {L"DESKFEED_FIXTURE_STATUS_UNLOAD_SAFE", L"1"},
+            {L"DESKFEED_FIXTURE_STOP_CODE", L"0"},  // "我没退休"
+        };
+        if (!spawn_fixture_host(host, env, /*load_fixture=*/true)) {
+            check(false, "action/stop-retained-no-eject could not set up the fixture host");
+        } else {
+            ActionContext const context = fixture_context(host);
+            Options options;
+            options.action = L"stop";
+            options.payload_path = fixture_payload_path();
+            options.scope = L"fixture-" + std::to_wstring(::GetCurrentProcessId());
+            int const code = do_stop_in(context, options);
+            check_eq(code, 1,
+                     "action/stop-retained-no-eject an unretired payload is reported as a failure");
+
+            ModuleEntry module;
+            std::wstring find_error;
+            check(lookup_module_by_full_path(host.pid, fixture_payload_path(), module, find_error) ==
+                      ModuleLookup::Found,
+                  "action/stop-retained-no-eject the DLL is still mapped (no FreeLibrary on an "
+                  "unretired payload)");
+            host.kill();
+        }
+    }
+
+    // ---- 租约门禁真的在动作里：Busy 不给结论、同线程递归不抹掉粘性未知 -------------------------
+    if (wanted("action/status-lease")) {
+        FixtureHost host;
+        if (!spawn_fixture_host(host, {{L"DESKFEED_FIXTURE_STATUS_STARTED", L"0"}},
+                                /*load_fixture=*/true)) {
+            check(false, "action/status-lease could not set up the fixture host");
+        } else {
+            ActionContext const context = fixture_context(host);
+            Options options;
+            options.action = L"status";
+            options.payload_path = fixture_payload_path();
+            options.scope = L"fixture-" + std::to_wstring(::GetCurrentProcessId());
+
+            GuardTarget const guard_target{host.pid, host.creation_time};
+            GuardLease holder;
+            std::wstring error;
+            check(holder.acquire(guard_target, error) == GuardAcquire::Acquired,
+                  "action/status-lease the test acquired the lease");
+
+            // 另一位 actor 在**另一条线程**上问状态：拿不到租约 ⇒ 只报告"问不出来"，绝不动作。
+            int busy_code = 0;
+            std::thread other([&]() { busy_code = do_status_in(context, options); });
+            other.join();
+            check_eq(busy_code, 2,
+                     "action/status-lease a busy lease makes status say 'cannot tell'");
+
+            std::wstring conclude_error;
+            holder.note_action_conclusive(true);
+            check(holder.conclude_clean(conclude_error),
+                  "action/status-lease the test released its lease cleanly");
+            check_eq(do_status_in(context, options), 1,
+                     "action/status-lease status answers once the lease is free");
+
+            // 同一条线程再次 acquire 拿到的是 WAIT_OBJECT_0（递归）而不是 WAIT_ABANDONED：
+            // 这条路径绝不能把上一位留下的粘性未知当成良性残留。
+            GuardLease recursive;
+            check(recursive.acquire(guard_target, error) == GuardAcquire::Acquired,
+                  "action/status-lease the same thread re-acquired (a recursive Win32 mutex)");
+            recursive.abandon_unknown();
+            check_eq(do_status_in(context, options), 2,
+                     "action/status-lease a same-thread re-acquire must not erase the sticky unknown");
+            host.kill();
+        }
+    }
+
+    // ---- 上一位 actor 崩了（真 abandoned）：Busy 之后由下一位解除 ------------------------------
+    if (wanted("action/abandon-recovery")) {
+        FixtureHost host;
+        if (!spawn_fixture_host(host, {{L"DESKFEED_FIXTURE_STATUS_STARTED", L"0"}},
+                                /*load_fixture=*/true)) {
+            check(false, "action/abandon-recovery could not set up the fixture host");
+        } else {
+            ActionContext const context = fixture_context(host);
+            Options options;
+            options.action = L"status";
+            options.payload_path = fixture_payload_path();
+            options.scope = L"fixture-" + std::to_wstring(::GetCurrentProcessId());
+            GuardTarget const guard_target{host.pid, host.creation_time};
+
+            // 一个注定不存在的 TID：起一条线程、记住它的 TID、join 掉。
+            unsigned long absent_tid = 0;
+            {
+                std::thread temp([]() {});
+                absent_tid = ::GetThreadId(temp.native_handle());
+                temp.join();
+            }
+            check(absent_tid != 0, "action/abandon-recovery captured a real (now gone) tid");
+
+            HANDLE const release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            std::atomic<bool> holding{false};
+            std::thread crasher([&]() {
+                GuardLease lease;
+                std::wstring acquire_error;
+                if (lease.acquire(guard_target, acquire_error) == GuardAcquire::Acquired) {
+                    std::wstring write_error;
+                    lease.note_remote_call_started(absent_tid, write_error);
+                }
+                holding.store(true);
+                ::WaitForSingleObject(release, 5000);
+                // 不结算、不释放：线程退出 ⇒ 内核把 mutex 标成 abandoned。
+            });
+            while (!holding.load()) {
+                ::Sleep(1);
+            }
+            check_eq(do_status_in(context, options), 2,
+                     "action/abandon-recovery a live holder makes the next actor Busy");
+            ::SetEvent(release);
+            crasher.join();
+            check_eq(do_status_in(context, options), 1,
+                     "action/abandon-recovery the next actor recovers once the owner thread really "
+                     "ended and the recorded tid is gone");
+            check(!guard_event_signaled(guard_target),
+                  "action/abandon-recovery recovery cleared the sticky event");
+            ::CloseHandle(release);
+            host.kill();
+        }
+    }
+
+    // ---- 上一位 actor 在 PendingNoTid 之后崩了：本会话永久未知，下一位绝不清 -------------------
+    if (wanted("action/abandon-no-tid-unknown")) {
+        FixtureHost host;
+        if (!spawn_fixture_host(host, {{L"DESKFEED_FIXTURE_STATUS_STARTED", L"0"}},
+                                /*load_fixture=*/true)) {
+            check(false, "action/abandon-no-tid-unknown could not set up the fixture host");
+        } else {
+            ActionContext const context = fixture_context(host);
+            Options options;
+            options.action = L"status";
+            options.payload_path = fixture_payload_path();
+            options.scope = L"fixture-" + std::to_wstring(::GetCurrentProcessId());
+            GuardTarget const guard_target{host.pid, host.creation_time};
+
+            std::thread crasher([&]() {
+                GuardLease lease;
+                std::wstring acquire_error;
+                if (lease.acquire(guard_target, acquire_error) == GuardAcquire::Acquired) {
+                    std::wstring write_error;
+                    lease.note_remote_call_pending(write_error);  // 有入口在飞、但还不知道 TID
+                }
+                // 线程到此结束：abandoned，记录停在 PendingNoTid。
+            });
+            crasher.join();
+
+            check_eq(do_status_in(context, options), 2,
+                     "action/abandon-no-tid-unknown a crash after PendingNoTid keeps the target "
+                     "uncertain");
+            GuardRecordWatch watch;
+            check(watch.open(guard_target), "action/abandon-no-tid-unknown opened the named record");
+            payload::GuardRecord record{};
+            check(watch.read(record), "action/abandon-no-tid-unknown read the named record");
+            check(record.state == payload::kGuardStatePendingNoTid && record.tid == 0,
+                  "action/abandon-no-tid-unknown the pending record is left exactly as it was");
+            check(guard_event_signaled(guard_target),
+                  "action/abandon-no-tid-unknown the sticky uncertainty is set");
+            watch.close();
+            host.kill();
+        }
+    }
+}
+
+DWORD WINAPI trivial_thread_entry(void*) { return 0; }
+
+void run_host_safety_cases() {
+    using namespace deskfeed::probe;
+    // ---- 卸载门禁：任何一项事实不成立都**不**允许归还模块引用 --------------------------------
+    //
+    // 这是宿主收尾那**唯一**一处 FreeLibrary 循环（`report_module_references`）前面的判据。
+    // 断言的形状就是"缺什么都不能卸"：工作线程没真退出、停止入口没跑过/报了未退休、有悬挂、
+    // feed 模式下状态 POD 不可信 —— 逐条都必须 false。
+    if (wanted("hostgate/retirement-no-unload")) {
+        UnloadGate perfect;
+        perfect.worker_exited = true;
+        perfect.stop_ran = true;
+        perfect.dangling_clear = true;
+        check(unload_allowed(perfect),
+              "hostgate/retirement-no-unload a fully proven retirement allows returning references");
+
+        UnloadGate strong = perfect;
+        strong.feed_mode = true;
+        strong.status_clear = true;
+        check(unload_allowed(strong), "hostgate/retirement-no-unload feed with a clear POD allows it");
+
+        // 逐项反例。每一项都对应一个真实缺陷形状：
+        UnloadGate worker_alive = perfect;
+        worker_alive.worker_exited = false;  // "已经 post 过 WM_CLOSE"不等于线程退出了
+        check(!unload_allowed(worker_alive),
+              "hostgate/retirement-no-unload a worker that has not really exited never unloads");
+
+        UnloadGate stop_zero = perfect;
+        stop_zero.stop_ran = false;  // DeskFeedStop 报 0 = 未退休
+        check(!unload_allowed(stop_zero),
+              "hostgate/retirement-no-unload a 'not retired' stop never unloads");
+
+        UnloadGate dangling = perfect;
+        dangling.dangling_clear = false;  // 还有未证明安全的悬挂
+        check(!unload_allowed(dangling),
+              "hostgate/retirement-no-unload a dangling hook never unloads");
+
+        UnloadGate feed_untrusted = perfect;
+        feed_untrusted.feed_mode = true;
+        feed_untrusted.status_clear = false;  // POD 不可信 / thread_alive!=0 / unload_safe!=1
+        check(!unload_allowed(feed_untrusted),
+              "hostgate/retirement-no-unload feed with an unclear status POD never unloads");
+
+        UnloadGate default_gate;
+        check(!unload_allowed(default_gate),
+              "hostgate/retirement-no-unload the default (all-unknown) gate is fail closed");
+    }
+
+    // ---- 收尾等待：只有**真实** signal 才算退出，超时/活着一律 false ---------------------------
+    if (wanted("hostgate/worker-join")) {
+        std::atomic<bool> release{false};
+        std::thread lingering([&]() {
+            while (!release.load()) {
+                ::Sleep(5);
+            }
+        });
+        HANDLE const handle = lingering.native_handle();
+        check(!wait_thread_exit_pumping(handle, 150),
+              "hostgate/worker-join a thread that is still running is not reported as exited");
+        release.store(true);
+        // 先观察"真的退出了"，再 join（MSVC 的 std::thread::join 会关掉底层句柄）。
+        check(wait_thread_exit_pumping(handle, 3000),
+              "hostgate/worker-join a really exited thread is observed as exited");
+        lingering.join();
+        check(!wait_thread_exit_pumping(nullptr, 10),
+              "hostgate/worker-join a null handle is never 'exited'");
+
+        // 一条早就跑完、句柄仍然有效的线程：必须立刻观察到。
+        HANDLE const finished = ::CreateThread(nullptr, 0, trivial_thread_entry, nullptr, 0, nullptr);
+        if (finished == nullptr) {
+            check(false, "hostgate/worker-join could not create the trivial thread");
+        } else {
+            ::WaitForSingleObject(finished, 5000);
+            check(wait_thread_exit_pumping(finished, 1000),
+                  "hostgate/worker-join an already finished thread is observed immediately");
+            ::CloseHandle(finished);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2388,6 +3017,8 @@ int main(int argc, char** argv) {
     run_remote_late_write_case();
     run_park_cases();
     run_guard_cases();
+    run_leased_action_cases();
+    run_host_safety_cases();
     run_state_gate_cases();
     run_frame_cases();
     run_gate_cases();

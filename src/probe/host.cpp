@@ -4,6 +4,7 @@
 #include "platform/log.h"
 #include "platform/win32_util.h"
 #include "probe/host_gate.h"
+#include "probe/host_wait.h"
 #include "probe/observer_pod.h"
 #include "probe/probe_hooks.h"
 
@@ -749,6 +750,29 @@ int report_module_references(HMODULE module) {
     return references;
 }
 
+// 只归还**本进程自己那一次** `LoadLibrary` 的引用（BLOCKED 路径专用）：BLOCKED 时除了装载与解析
+// 导出什么都没跑，所以只该还这一份。**绝不**循环 `FreeLibrary` 去清"未知的引用"——那会把别的持有者
+// 的引用一起抽走。返回后模块是否还在表里如实打印。
+void release_single_reference(HMODULE module) {
+    if (module == nullptr) {
+        deskfeed::log_line(L"this process never loaded the payload; nothing to return");
+        return;
+    }
+    // 取路径要在卸载之前：最后一次成功的 FreeLibrary 已经把模块的代码与数据一起拿走。
+    std::wstring const path = deskfeed::module_file_path(module);
+    std::wstring const name = path.substr(path.find_last_of(L'\\') + 1);
+
+    bool const returned = ::FreeLibrary(module) != FALSE;
+    deskfeed::log_format(L"BLOCKED: this process's single load reference -> %s",
+                         returned ? L"returned" : L"could not be returned");
+    deskfeed::log_format(L"the payload module (%s) is %s now", name.c_str(),
+                         ::GetModuleHandleW(name.c_str()) == nullptr ? L"fully unloaded"
+                                                                    : L"still mapped");
+}
+
+// 有界地等到 `thread` **真实 signal** 的等待器在 `probe/host_wait.h`（探针收尾的公共形状，见那里的
+// 说明：必须边等边泵消息，而且"post 过 WM_CLOSE"不是证据）。
+
 int run_host(HostOptions const& options) {
     g_options = options;
     g_dump_only = options.dump_only;
@@ -829,8 +853,13 @@ int run_host(HostOptions const& options) {
     }
 
     HANDLE const worker = ::CreateThread(nullptr, 0, worker_entry, nullptr, 0, nullptr);
-    if (worker != nullptr) {
-        ::CloseHandle(worker);
+    if (worker == nullptr) {
+        // 建不出工作线程就**立刻失败退出**：绝不留在 GetMessage 里等一条永远不会工作的线程——
+        // 那会把"起不来"变成"永久挂住"，而且什么都没证明。
+        deskfeed::log_format(L"cannot create the host worker thread: %s",
+                             deskfeed::last_error_text().c_str());
+        g_failed = true;
+        return kHostExitFailed;
     }
     MSG message{};
     while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -838,20 +867,55 @@ int run_host(HostOptions const& options) {
         ::DispatchMessageW(&message);
     }
 
+    // 消息循环结束（工作线程 post 了 WM_CLOSE、窗口销毁并 PostQuitMessage）**不等于**工作线程已经
+    // 退出。"已经请它退"、"已经 post 过 WM_CLOSE"都不是证据：归还模块引用之前必须等到**真实**
+    // signal，等待期间继续泵消息。没等到就什么都不碰。
+    bool const worker_exited = wait_thread_exit_pumping(worker, 30000);
+    ::CloseHandle(worker);
+    if (!worker_exited) {
+        deskfeed::log_line(L"the host worker thread has not really exited");
+        g_failed = true;
+    }
+
+    // 额外的 XAML 核心也必须**真实退出**：它们各自的 WindowsXamlManager / DesktopWindowXamlSource
+    // 是那些线程上的局部对象，线程还在跑就让它们析构（或让进程收尾去拆）就是在别人还在用的对象上做
+    // 拆除。先请它们退（WM_QUIT），再逐个等到真实 signal；绝不 ShutdownQueueAsync（冻结禁用）。
+    for (ExtraCore* core : g_extra_cores) {
+        if (core->thread != nullptr) {
+            ::PostThreadMessageW(::GetThreadId(core->thread), WM_QUIT, 0, 0);
+        }
+    }
+    for (ExtraCore* core : g_extra_cores) {
+        if (core->thread != nullptr && !wait_thread_exit_pumping(core->thread, 10000)) {
+            deskfeed::log_line(L"an extra XAML core thread has not really exited; refusing to "
+                               L"destroy XAML objects under a live thread");
+            g_failed = true;
+        }
+    }
+
     if (g_blocked) {
-        // BLOCKED：什么都没跑（除了装载/解析导出与一次 LoadLibrary 引用）。
-        // 这里**不**调用任何会改变负载状态的入口，只把自己那份引用还清再退出。
-        report_module_references(g_module);
+        // BLOCKED：除了"装载 + 解析导出 + 本进程那一次 LoadLibrary"，一条用例都没跑。所以只归还
+        // **自己这一份**引用；绝不循环 FreeLibrary 去清"未知的引用"——那会把别的持有者（含第三方
+        // 钩子）的引用一起抽走，正是在不安全的时候强行卸载。
+        release_single_reference(g_module);
     } else {
+        UnloadGate gate;
+        gate.worker_exited = worker_exited;
+        gate.feed_mode = options.feed;
+
         if (options.feed && !g_feed_retired) {
             // 生产收尾：只有返回 1 才表示门禁全过。
             DWORD const stopped = g_probe.feed_stop(
                 reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
             deskfeed::log_format(L"DeskFeedStop -> %lu (%s)", stopped,
                                  stopped == 1 ? L"retired" : L"NOT retired");
+            gate.stop_ran = stopped == 1;
             if (stopped != 1) {
                 g_failed = true;
             }
+        } else if (options.feed) {
+            // 早先那一轮（挂住 UI / 慢执行）已经拿到过"可以卸载"，那正是 g_feed_retired 的含义。
+            gate.stop_ran = true;
         }
         if (options.feed) {
             // 状态 POD 复核：线程必须已经不在跑、unload_safe 必须为真、不得有悬挂。
@@ -866,24 +930,33 @@ int run_host(HostOptions const& options) {
                                     L"dangling=%u block=%u",
                                     pod.started, pod.thread_alive, pod.unload_safe, pod.dangling,
                                     pod.xaml_block_present);
-                if (pod.thread_alive != 0 || pod.unload_safe != 1 || pod.dangling != 0) {
+                gate.status_clear = pod.thread_alive == 0 && pod.unload_safe == 1 && pod.dangling == 0;
+                if (!gate.status_clear) {
                     deskfeed::log_line(L"the payload is not safely retired according to its own "
                                        L"status POD");
                     g_failed = true;
                 }
             }
         }
+
+        // 悬挂判据：只要载荷提供了它就**必须**报 0；该模式要求它却缺了同样是失败。它不适用时
+        // （`--mock` 基线）不算通过，闭环由最后的引用计数兜。
+        bool const dangling_required = options.teardown || options.third_party || options.hook ||
+                                       options.hang_ui_ms != 0 || options.feed;
         if (g_probe.dangling != nullptr) {
             if (g_probe.dangling() != 0) {
                 deskfeed::log_line(L"a hook is still dangling");
                 g_failed = true;
+            } else {
+                gate.dangling_clear = true;
             }
-        } else if (options.teardown || options.third_party || options.hook ||
-                   options.hang_ui_ms != 0 || options.feed) {
-            // gate 保证这些模式下 dangling 存在；真走到这里说明导出在运行期丢了。
+        } else if (dangling_required) {
             deskfeed::log_line(L"the dangling judge export disappeared after the gate");
             g_failed = true;
+        } else {
+            gate.dangling_clear = true;
         }
+
         if (options.balance_check) {
             // 第二次 stop 既不该多还也不该少还（引用数必须仍是 1）。
             deskfeed::log_line(L"balance check: calling the payload stop entry point again");
@@ -891,26 +964,36 @@ int run_host(HostOptions const& options) {
         }
         if (g_probe.stop != nullptr) {
             g_probe.stop();
+            if (!options.feed) {
+                // 结构自测：探针停止入口返回 void，它本身**不是**安全证明。它能证明的只有"真的被
+                // 调用过"；闭环由上面的悬挂判据与下面的引用计数合起来钉住。
+                gate.stop_ran = true;
+            }
         } else if (!options.feed) {
             // 结构自测的 gate 要求 DeskFeedProbeStop 存在；真走到这里说明它在运行期丢了。
             deskfeed::log_line(L"the payload stop entry point disappeared after the gate");
             g_failed = true;
         }
 
-        // 引用计数不是"打给人看的一行"：健康路径必须刚好是 1（探针自己那一次 LoadLibrary）。
-        // 0/负值说明多还了一次（模块可能在它自己的代码还在跑时被抽走），>1 说明少还了。
-        int const references = report_module_references(g_module);
-        if (references != 1) {
-            deskfeed::log_format(L"the payload module reference count is %d, not 1: the site "
-                                 L"references were not returned exactly once",
-                                 references);
+        // 卸载前的**唯一**判据（`probe/host_gate.h` 的纯函数）：线程真退出、停止入口真跑过、悬挂判据
+        // 为 0，feed 还要状态 POD 报 thread_alive=0 / unload_safe=1 / dangling=0。任何一项不成立都
+        // **不**归还引用、**不** FreeLibrary，模块保持映射到本进程结束——而不是"报个 warning 然后
+        // 照样强卸"。第三方提前 done 之类的变异必须能观察到不安全症状，但**不能**借它强行卸载。
+        if (!unload_allowed(gate)) {
+            deskfeed::log_line(L"retained/unverifiable: the retirement gate did not pass; the module "
+                               L"is left mapped until this process ends (nothing is force-unloaded)");
             g_failed = true;
-        }
-    }
-
-    for (ExtraCore* core : g_extra_cores) {
-        if (core->thread != nullptr) {
-            ::PostThreadMessageW(::GetThreadId(core->thread), WM_QUIT, 0, 0);
+        } else {
+            // 引用计数不是"打给人看的一行"：健康路径必须刚好是 1（探针自己那一次 LoadLibrary）。
+            // 0/负值说明多还了一次（模块可能在它自己的代码还在跑时被抽走），>1 说明少还了。这一步
+            // 会让 loader 逐次 FreeLibrary，所以它**只**允许在门禁全部通过之后跑。
+            int const references = report_module_references(g_module);
+            if (references != 1) {
+                deskfeed::log_format(L"the payload module reference count is %d, not 1: the site "
+                                     L"references were not returned exactly once",
+                                     references);
+                g_failed = true;
+            }
         }
     }
     if (g_blocked) {

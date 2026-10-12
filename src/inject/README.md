@@ -7,13 +7,14 @@ explorer.exe、按需撤下来、报告它是否真的在工作。它是主进�
 | 文件 | 作用 |
 | --- | --- |
 | `main.cpp` | 命令行：`--load` / `--stop` / `--status` / `--watch` 与 `--payload` / `--scope` / `--dry-run` / `--no-unload` / `--interval` / `--once`；日志写 `%LOCALAPPDATA%\DeskFeed\deskfeed-inject.log`（每次截断）。 |
-| `actions.h` / `actions.cpp` | 四个动作本身：装载前的状态复查与残留清理、装载并调 `DeskFeedStart`、按门禁撤下、状态查询、watch 的一轮；`unload_decision()` 是卸载门禁的**纯函数**，可以被离线用例直接咬住。 |
+| `actions.h` / `actions.cpp` | 四个动作本身：装载前的状态复查与残留清理、装载并调 `DeskFeedStart`、按门禁撤下、状态查询、watch 的一轮；`unload_decision()` 是卸载门禁的**纯函数**，可以被离线用例直接咬住。每个动作都跑在 `run_actor()` 这一层 actor 外壳里：捕获一次目标句柄 → 拿租约 → 动作 → 按**事实**收尾（没有未决调用才释放）。 |
 | `target.h` / `target.cpp` | 目标解析：任务栏属主（`Shell_TrayWnd`，次选 `Shell_SecondaryTrayWnd`），找不到就拒绝；`--scope` 走实例名白名单。 |
-| `remote.h` / `remote.cpp` | 远程原语：进程/模块枚举、`CreateRemoteThread` 的一次调用（返回真实退出码与"是否已退出"）、`LoadLibraryW` 装载、`FreeLibrary` 卸载、以及一块定长缓冲的读写（安全 POD ABI）；未决调用**保留**真实线程句柄，并能在捕获的那个目标进程句柄上 park 到真实结论。 |
+| `remote.h` / `remote.cpp` | 远程原语：进程/模块枚举、`CreateRemoteThread` 的一次调用（返回真实退出码与"是否已退出"）、以及受租约保护的动作要用的 `*_on(HANDLE)` 形状（`remote_alloc_on` / `issue_remote_thread_on` / `issue_load_library_on` / `confirm_load_library` / `issue_free_library_on` / `confirm_module_gone`）。所有内存操作与建线程都用**一次动作内捕获的那个句柄**，绝不按 PID 重开；未决调用**保留**真实线程句柄，由 `park_remote_call` 等到真实结论。 |
 | `guard.h` / `guard.cpp` | per-target 租约：命名 mutex + 粘性不确定事件 + 命名记录（布局唯一出处是 `src/payload/guard_record.h`），以及"崩掉的 actor 由下一位解除"的恢复判定。 |
+| `leased_call.h` | 一次"受租约保护的远程调用"的**唯一**代码路径：`PendingNoTid`（在建线程之前）→ 真实 TID → `PendingTid` → park 到真实 signal / 真实目标死亡 → `Idle`。五个调用点（`LoadLibraryW` / `Start` / `GetStatus` / `Stop` / `FreeLibrary`）都只走这里。 |
 | `pe_export.h` / `pe_export.cpp` | 从**磁盘上的 PE 文件**解析导出函数的 RVA（经节表换算），并**拒绝转发导出**。 |
 | `status_pod.h` | 负载生命周期状态的固定 POD（提议版，见下面"状态"）。 |
-| `payload_status.h` / `payload_status.cpp` | 把"模块映射着"升级成"可证明在工作"：远程 `DeskFeedGetStatus` + 只读读一遍显示邮箱帧头里的生产者身份。 |
+| `payload_status.h` / `payload_status.cpp` | 把"模块映射着"升级成"可证明在工作"：远程 `DeskFeedGetStatus`（**在租约内**、用捕获的句柄调用并按写序记账）+ 只读读一遍显示邮箱帧头里的生产者身份。 |
 
 ## 命令行与退出码
 
@@ -124,7 +125,12 @@ Local\DeskFeed-payload-guard-<pid>-<creationhex>-record
 
 写序（actor 是记录的唯一写者）：`PendingNoTid` 必须在 `CreateRemoteThread` **之前**写入 →
 拿到 TID 后写 `PendingTid{tid}` → 远程调用**真实返回**（线程句柄真的 signaled）或**目标进程死亡**
-之后才写 `Idle`。
+之后才写 `Idle`。五个调用点各自走一遍这个周期，`DeskFeedStop` 与紧随其后的 `FreeLibrary` 是**两次**
+独立的周期。
+
+`--watch` 的**每一轮各自拿一份租约**，并且一轮以未知收尾时**这一轮就结束、watch 退出**：Win32
+mutex 是同线程递归的，同一条线程带着上一位的未释放租约再 `acquire` 拿到的是 `WAIT_OBJECT_0`
+（不是 `WAIT_ABANDONED`），那条路径会把未知当成良性残留。所以绝不在同一条线程上进入下一轮。
 
 释放：**只有一个** `ReleaseMutex` 调用点，谓词是 `没有任何未决远程调用 && 动作已定论`；不成立时
 **不释放**、保持事实。异常、提前 `return`、对象析构的默认行为都是 **abandon（置粘性事件、不释放）**
@@ -136,11 +142,21 @@ Local\DeskFeed-payload-guard-<pid>-<creationhex>-record
 回调 / 探针入口）都不在这套门里——它们仍靠原有 G1/G2 的收尾证明，不因租约而"看起来更安全"。
 租约按目标 PID + 创建时间命名 ⇒ **跨 explorer 不互斥**；`Local\` ⇒ 跨会话天然隔离。
 
-> 现状：`guard.h`/`guard.cpp` 这一层（获取、恢复、记录写序、单点释放）已实现并有离线用例
-> （含"崩溃 actor 留下的 really-abandoned"与"第二个 actor 的 `WAIT_TIMEOUT` 作为释放可观测证据"，
-> 以及两个编译期变异副本证明谓词真的会咬）。`do_load`/`do_stop`/`do_status`/`--watch` 每轮
-> **接入**这一层（含把 parking 接进动作）是紧随其后的下一批，在那之前上面"每条路径都受租约保护"
-> 还不成立。
+> 现状：租约层（获取、恢复、记录写序、单点释放、parking）与**四个动作的接线**都已落地，并有离线
+> 用例逐条咬住：
+> * 纯原语：`guard/*`（含"崩溃 actor 留下的 really-abandoned"、"第二个 actor 的 `WAIT_TIMEOUT` 作为
+>   释放可观测证据"）与 `park/*`；
+> * 动作路径：`leasecall/record-and-park`（真实的远程入口线程把命名记录从 `Idle` 推到 `PendingTid`、
+>   超时未决之后由 parking 等到真实 signal 再回到 `Idle`，调用方缓冲完好）、`action/load-stop-start`
+>   （真实 `DeskFeedStop` → `FreeLibrary` → `LoadLibraryW` → `DeskFeedStart` 五个调用点全走一遍）、
+>   `action/stop-retained-no-eject`（`DeskFeedStop` 报 0 时**绝不** `FreeLibrary`）、`action/status-lease`
+>   （Busy 只报告、同线程递归 acquire 不抹掉粘性未知）、`action/abandon-recovery`、
+>   `action/abandon-no-tid-unknown`。夹具是隐藏的夹具主机进程 + 夹具负载 DLL，**不碰真实 explorer**。
+> * 三个编译期变异副本证明释放谓词、abandon 语义与粘性事件真的会咬。
+>
+> 仍未做（诚实边界）：`deskfeed-probe.exe` 的 `--mock` / `--feed` 与对抗矩阵仍等 Native 的稳定
+> 测试 DLL 与 MAIN 的显式 GO；探针宿主自身的"退休结论才卸载 / worker 真实退出才归还"门禁在
+> 另行修复中。这两条完成之前，**不接受**任何"整条探针路径都已证明安全"的说法。
 
 ## 安全边界
 

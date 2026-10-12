@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 
+#include "inject/guard.h"
 #include "inject/remote.h"
 #include "inject/status_pod.h"
 
@@ -76,7 +77,12 @@ inline bool state_allows_stop(PayloadStatus const& status) {
 bool probe_mailbox_producer(std::wstring const& scope, MailboxProducer& out, std::wstring& error);
 
 // 组合查询：模块表 + 磁盘导出的 `DeskFeedGetStatus` + 帧头生产者身份。
-bool query_payload_status(unsigned long process_id, std::wstring const& dll_path,
-                          std::wstring const& scope, PayloadStatus& out, std::wstring& error);
+//
+// **必须在持有租约的同一条线程上、用一次动作捕获的那个目标句柄调用**：`DeskFeedGetStatus` 是一次
+// 远程调用，按写序记账（`PendingNoTid` → 真实 TID → park 到真实结论 → `Idle`）。任何非实际结论
+// （目标死亡 / 打断 / 系统调用失败）都返回 false —— 绝不报成 Inactive，也就绝不会流入 Stop/eject。
+bool query_payload_status(GuardLease& lease, TargetProcess const& target,
+                          std::wstring const& dll_path, std::wstring const& scope, PayloadStatus& out,
+                          std::wstring& error);
 
 }  // namespace deskfeed::inject

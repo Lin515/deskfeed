@@ -147,4 +147,55 @@ inline GateDecision gate_decision(HostOptions const& options, ExportPresence con
     return decision;
 }
 
+// ---------------------------------------------------------------------------
+// **卸载门禁**：允许归还模块引用的唯一判据。
+//
+// 为什么它是一条硬门禁而不是"几句日志"：`report_module_references()` 是"逐次 `FreeLibrary` 直到
+// 失败"的循环，一旦跑起来就不可撤销——它会一直抽引用，直到把**别的持有者**（第三方钩子、还没退出的
+// 线程）的引用也一起抽走。所以"能不能卸"必须先由一组事实判定，任何一项不成立都**不**归还引用、
+// **不** `FreeLibrary`，模块保持映射到本进程结束。
+//
+// 哪些东西**不是**证据（都在这里显式排除）：
+//   * "已经给工作线程 post 过 `WM_CLOSE`"——那只是请求退出；
+//   * 探针的 `DeskFeedProbeStop` 返回 `void`——它证明不了退休；
+//   * "引用数看起来是 1"——数引用本身就是卸载动作，必须在门禁通过之后才允许。
+//
+// 默认值全部是不成立 ⇒ fail closed。
+struct UnloadGate {
+    bool worker_exited = false;   // 工作线程**真实** signal（不是"已经请它退"）
+    bool stop_ran = false;        // feed：DeskFeedStop 返回 1；结构自测：停止入口真的调用过
+    bool feed_mode = false;       // 这一次是 --feed（有生产收尾与可读的状态 POD）
+    bool status_clear = false;    // POD 可信 且 thread_alive==0 且 unload_safe==1 且 dangling==0
+    bool dangling_clear = false;  // 载荷自己的悬挂判据报告 0（该模式不要求时为"不适用"）
+};
+
+// 测试专用变异开关：**只在被显式定义了这个宏的那一份副本里**生效（本地 ignored 工程里的
+// `deskfeed-tools-tests-mutation4` 目标）。交付产物不含它；留着是为了让"退休门禁真的会咬"这件事
+// 有机器证据，而不是只靠读代码。
+//   4 = 无视退休事实，照样允许归还模块引用（就是"报个 warning 然后强卸"这个缺陷形状）
+#ifndef DESKFEED_TOOLS_UNLOAD_GATE_MUTATION
+#define DESKFEED_TOOLS_UNLOAD_GATE_MUTATION 0
+#endif
+
+inline bool unload_allowed(UnloadGate const& gate) {
+#if DESKFEED_TOOLS_UNLOAD_GATE_MUTATION == 4
+    (void)gate;
+    return true;  // MUTATION(4)：把"线程没退 / 未退休 / 有悬挂 / POD 不可信"全部当没看见
+#else
+    if (!gate.worker_exited) {
+        return false;  // 线程还在跑：绝不碰模块
+    }
+    if (!gate.stop_ran) {
+        return false;  // 停止入口没跑过（或明确报"未退休"）
+    }
+    if (!gate.dangling_clear) {
+        return false;  // 有未证明安全的悬挂
+    }
+    if (gate.feed_mode && !gate.status_clear) {
+        return false;  // 生产收尾必须由状态 POD 证明线程已退、可卸载、无悬挂
+    }
+    return true;
+#endif
+}
+
 }  // namespace deskfeed::probe

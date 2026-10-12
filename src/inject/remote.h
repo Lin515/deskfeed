@@ -147,23 +147,6 @@ bool process_matches_identity(unsigned long process_id, std::uint64_t creation_t
 // （本工具只用会话内基址一致的 kernel32 导出，或刚装载进来的负载模块的导出）。
 RemoteCall call_remote_thread(unsigned long process_id, void* start, void* parameter, DWORD wait_ms);
 
-// 装载负载。已经装载（按**完整路径**命中）时把 `already_loaded` 置真并返回 true，**不再装载一次**
-// ——重复 `LoadLibraryW` 只会多加一次引用，让后面的卸载永远还不上。
-//
-// 模块的真实基址一律用 `MODULEENTRY32W` 枚举取得：远程线程的退出码是 DWORD，x64 的 HMODULE
-// 会被截断，绝不能拿它当基址用。
-//
-// **成功只在线程确实退出后成立**：`LoadLibraryW` 的远程线程没有在规定时间内退出时，即使模块名
-// 已经出现在模块表里也返回 false（"结论不确定"）——那一刻它的 `DllMain` 可能还没返回，调用方
-// 接着调 `DeskFeedStart` 就等于在一个尚未完成初始化的模块里跑代码。此时模块**保持映射**，
-// 由调用方按"不确定"处理（稍后 `--status`/`--load` 再来一次，不盲卸）。
-bool inject_library(unsigned long process_id, std::wstring const& dll_path, ModuleEntry& loaded,
-                    bool& already_loaded, std::wstring& error);
-
-// 卸载：远程 `FreeLibrary`，要求线程退出且退出码非 0，随后用模块枚举确认模块真的不在表里
-// （引用数没归零时 `FreeLibrary` 会返回 TRUE 但模块仍然映射）。
-bool eject_library(unsigned long process_id, unsigned long long module_base, std::wstring& error);
-
 // 调用一个 `DWORD WINAPI f(void*)` 形式的导出。`parameter` 可以是 nullptr，或目标进程里一块
 // 已写好的缓冲地址（状态 POD 就是后者）。
 RemoteCall call_remote_export(unsigned long process_id, unsigned long long module_base,
@@ -180,6 +163,53 @@ struct RemoteBuffer {
     unsigned long long address = 0;
     std::size_t bytes = 0;
 };
+
+// ---------------------------------------------------------------------------
+// 受租约保护的动作需要的"发起"形状：句柄一律用**一次动作内捕获的那一个**，绝不按 PID 重开。
+//
+// 为什么必须有这一组：一次动作里 LoadLibraryW / Start / GetStatus / Stop / FreeLibrary 每一步都
+// 可能超时未决。如果每一步都按 PID 重开句柄，"把代码写进去"与"等它退出"就可能落在两个不同的
+// 进程上（目标崩溃、PID 被复用），而"这次调用还没结论"这条事实就丢了。所以：
+//   * 所有内存操作（alloc/write/read/free）与所有 CreateRemoteThread 都走捕获的 hProcess；
+//   * `process_id` 仍然要传，但它**只**用于 Toolhelp 的只读模块表枚举（该 API 只接受 PID）；
+//   * 发起一律**不等待**：未决时线程句柄保留，由调用方 park 到真实结论或显式按未知保留。
+// ---------------------------------------------------------------------------
+
+// 在捕获的句柄上分配/写/读/释放远程缓冲。
+bool remote_alloc_on(HANDLE target_process, std::size_t bytes, RemoteBuffer& out, std::wstring& error);
+bool remote_write_on(HANDLE target_process, unsigned long long address, void const* data,
+                     std::size_t bytes, std::wstring& error);
+bool remote_read_on(HANDLE target_process, unsigned long long address, void* out, std::size_t bytes,
+                    std::wstring& error);
+void remote_free_on(HANDLE target_process, RemoteBuffer const& buffer);
+
+// 把一个本地解析出来的导出地址换算成目标进程里的地址（只读模块表，**不**建线程）。
+// 调用方随后用 `issue_remote_thread_on` 在捕获的句柄上起线程。
+bool remote_export_address(unsigned long process_id, char const* module_name, char const* export_name,
+                           void*& out, std::wstring& error);
+
+// 在捕获的句柄上起一次远程线程并**立即**返回（不等待）。未决时句柄保留，调用方必须
+// park 或 release；绝不"等一个上限然后把没回来的调用当成干净"。
+RemoteCall issue_remote_thread_on(HANDLE target_process, void* start, void* parameter);
+
+// 发起一次远程 `LoadLibraryW`（不等待）：把路径写进目标 + 解析 `LoadLibraryW` + 起线程。
+// `path_buffer`/`path_allocated` 交回调用方，由它按 `may_release_remote_buffer` 决定释放。
+// **只有**在真实结论（signal / 目标死亡）之后才能释放那块路径缓冲。
+RemoteCall issue_load_library_on(HANDLE target_process, unsigned long process_id,
+                                 std::wstring const& dll_path, RemoteBuffer& path_buffer,
+                                 bool& path_allocated, std::wstring& error);
+
+// 远程调用拿到**实际**结论（线程确实退出）之后，用模块表确认装载并给出真实基址。
+// 模块表是基址的**唯一**来源：线程退出码是 DWORD，x64 的 HMODULE 会被截断。
+bool confirm_load_library(unsigned long process_id, std::wstring const& dll_path,
+                          RemoteCall const& call, ModuleEntry& loaded, std::wstring& error);
+
+// 发起一次远程 `FreeLibrary`（不等待）；参数是目标进程里那个模块的基址。
+RemoteCall issue_free_library_on(HANDLE target_process, unsigned long process_id,
+                                 unsigned long long module_base, std::wstring& error);
+
+// `FreeLibrary` 返回 TRUE 也可能只是把引用数减了一。卸载必须用模块表确认真的不在表里。
+bool confirm_module_gone(unsigned long process_id, unsigned long long module_base, std::wstring& error);
 
 bool remote_alloc(unsigned long process_id, std::size_t bytes, RemoteBuffer& out, std::wstring& error);
 void remote_free(unsigned long process_id, RemoteBuffer const& buffer);

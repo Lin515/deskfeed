@@ -2,6 +2,7 @@
 
 #include "display/frame.h"
 #include "display/mailbox.h"
+#include "inject/leased_call.h"
 #include "inject/pe_export.h"
 #include "platform/win32_util.h"
 
@@ -9,6 +10,10 @@
 
 namespace deskfeed::inject {
 namespace {
+
+// parking 的 tick：只是周期性让出时间片/打日志的粒度，**不是**放弃等待的期限。远程
+// `DeskFeedGetStatus` 没回来时一律等到真实 signal 或真实目标死亡。
+constexpr DWORD kStatusParkTickMs = 200;
 
 // 有界地把帧头抄一份。写端用 seqlock（奇数 = 正在写），所以这里比前后两次序号：
 // 不相等就重来，超过次数就报告"不稳定"，绝不拿半张帧头当结论。
@@ -171,10 +176,16 @@ bool probe_mailbox_producer(std::wstring const& scope, MailboxProducer& out, std
     return true;
 }
 
-bool query_payload_status(unsigned long process_id, std::wstring const& dll_path,
-                          std::wstring const& scope, PayloadStatus& out, std::wstring& error) {
+bool query_payload_status(GuardLease& lease, TargetProcess const& target,
+                          std::wstring const& dll_path, std::wstring const& scope, PayloadStatus& out,
+                          std::wstring& error) {
     out = PayloadStatus{};
     error.clear();
+    if (target.process == nullptr) {
+        error = L"no target process handle was captured for this action";
+        return false;
+    }
+    unsigned long const process_id = target.process_id;
 
     ModuleEntry module;
     std::wstring lookup_error;
@@ -237,19 +248,57 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
     pod.abi = kPayloadStatusAbi;
     pod.width = kPayloadStatusWidth;  // 显式宽度：让负载侧 ABI 校验也能看出我们在说哪一份布局
 
-    RemoteCall call;
-    std::wstring fetch_error;
-    bool const fetched = remote_fetch_pod(process_id, module.base, verified_rva, &pod, sizeof(pod),
-                                          5000, call, fetch_error);
-    // 本批（primitive）：这条路径仍按"未知即报告"收尾，句柄在这里显式收掉（缓冲的释放规则由
-    // `remote_fetch_pod` 自己守，与句柄无关）。N3a 的 actor 会在持有租约的同一条线程上改用
-    // `park_remote_call()`，把"有一次入口调用没有回来"变成实际的 signal 或目标死亡。
-    release_remote_call(call);
-    if (!fetched) {
-        // 超时/未创建/读回失败：结论未知。绝不能当成 Inactive（那会让调用方去 Stop 一个可能正有
-        // 远程线程在它代码里执行的模块）。
+    // 一次受租约保护的远程 `DeskFeedGetStatus`：分配 + 写 POD + 在**捕获的**句柄上起线程，
+    // 然后 park 到真实 signal / 真实目标死亡。缓冲的释放规则与路径/scope 缓冲同源：只有"线程
+    // 从未创建"或"线程确实退出"之后才能 `VirtualFreeEx`；超时释放就是让负载写进已释放的内存。
+    RemoteBuffer buffer;
+    bool allocated = false;
+    std::wstring buffer_error;
+    LeaseCall const call = run_leased_call(lease, target, kStatusParkTickMs, [&]() -> RemoteCall {
+        if (!remote_alloc_on(target.process, sizeof(pod), buffer, buffer_error)) {
+            RemoteCall failed;
+            failed.error = buffer_error;
+            return failed;
+        }
+        allocated = true;
+        if (!remote_write_on(target.process, buffer.address, &pod, sizeof(pod), buffer_error)) {
+            RemoteCall failed;
+            failed.error = buffer_error;
+            return failed;
+        }
+        return issue_remote_thread_on(target.process,
+                                      reinterpret_cast<void*>(module.base + verified_rva),
+                                      reinterpret_cast<void*>(buffer.address));
+    });
+
+    if (!call.actually_concluded()) {
+        // 目标死亡 / 打断 / 系统调用失败：结论未知。绝不能当成 Inactive（那会让调用方去 Stop 一个
+        // 可能正有远程线程在它代码里执行的模块）。缓冲**保持不释放**（那个入口线程可能还在写它），
+        // 租约也不释放——由调用方按未知收尾并让本线程结束。
         out.state = PayloadState::MappedUnverifiable;
-        out.detail = L"DeskFeedGetStatus did not answer: " + fetch_error;
+        out.detail = L"DeskFeedGetStatus did not reach a real conclusion: " + call.error;
+        return true;
+    }
+    if (call.outcome == LeaseCallOutcome::NeverExecuted) {
+        // 线程从未创建：什么都不会再写那块缓冲，可以安全释放。
+        if (allocated) {
+            remote_free_on(target.process, buffer);
+            allocated = false;
+        }
+        out.state = PayloadState::MappedUnverifiable;
+        out.detail = L"DeskFeedGetStatus was never called: " + call.error;
+        return true;
+    }
+    // 线程确实退出了：先读回 POD，再释放缓冲（它已经不再读那块内存）。
+    bool const read_back =
+        remote_read_on(target.process, buffer.address, &pod, sizeof(pod), buffer_error);
+    if (allocated) {
+        remote_free_on(target.process, buffer);
+        allocated = false;
+    }
+    if (!read_back) {
+        out.state = PayloadState::MappedUnverifiable;
+        out.detail = L"the status POD could not be read back: " + buffer_error;
         return true;
     }
     if (pod.size != sizeof(PayloadStatusPod) || pod.abi != kPayloadStatusAbi) {

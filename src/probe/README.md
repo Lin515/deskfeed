@@ -11,8 +11,9 @@
 | --- | --- |
 | `main.cpp` | 命令行：三种离线量具（`--reading` / `--reading-rows` / `--frame-reading`）与 `--mock` / `--feed` 两种宿主模式、以及各对抗开关。离线量具**先于**任何窗口/线程/XAML/DLL 返回。 |
 | `offline.h` / `offline.cpp` | 离线量具本体：严格快照 v1 走 `snapshot_validate` + health 状态机（含**真实 Unix 毫秒**的 `expiresAtMs` 到期判定），诊断帧 JSON 只用于把 Waiting/Error/整体 alarm 这些显示分支画出来；三路共用 `display/reading.h` 的同一批纯函数。 |
-| `host.h` / `host.cpp` | 宿主：调度队列 → 单元 → 隐藏窗口 → XAML 岛（与 shell 同形状的 `SystemTrayFrameGrid` 树）→ `--cores N` 个核心 → 工作线程装载负载并做**唯一一次**走查 → UI 线程解析并应用 → 对抗序列 → 拆除 → 归还引用并打印 `payload module references at the end: 1`。退出码见下。 |
-| `host_gate.h` | feature gate 的**纯决策**：命令行开了哪些功能/对抗，就必须在负载里解析到哪些导出。缺任何一条 → `BLOCKED`（exit 2），一条也不跑；**不允许**"日志里说一句就跳过"再以 0 退出。 |
+| `host.h` / `host.cpp` | 宿主：调度队列 → 单元 → 隐藏窗口 → XAML 岛（与 shell 同形状的 `SystemTrayFrameGrid` 树）→ `--cores N` 个核心 → 工作线程装载负载并做**唯一一次**走查 → UI 线程解析并应用 → 对抗序列 → 拆除 → 归还引用并打印 `payload module references at the end: 1`。退出码见下。收尾顺序是硬的：**工作线程与额外 XAML 核心都拿到真实 signal** 之后才谈归还引用；任何一项退休事实不成立就**不**归还、**不** `FreeLibrary`，模块保持映射到本进程结束。 |
+| `host_gate.h` | 两条**纯决策**：① feature gate —— 命令行开了哪些功能/对抗，就必须在负载里解析到哪些导出，缺任何一条 → `BLOCKED`（exit 2），一条也不跑；**不允许**"日志里说一句就跳过"再以 0 退出。② **卸载门禁** `unload_allowed()` —— 宿主唯一一处 `FreeLibrary` 循环前面的判据（工作线程真退出、停止入口真跑过、悬挂判据为 0，feed 还要状态 POD 报 `thread_alive=0 / unload_safe=1 / dangling=0`），默认全不成立 ⇒ fail closed。 |
+| `host_wait.h` | 收尾等待的公共形状 `wait_thread_exit_pumping()`：等到**自己起的**线程真实 signal，期间继续泵消息（死等会把"线程互相推进"变成假死）。"已经 post 过 `WM_CLOSE`"不是证据，所以它只以真实 signal 为准。 |
 | `mock_producer.h` / `mock_producer.cpp` | 隔离 scope 的 mock 显示帧生产者：负载**不做外部 HTTP、不解析 JSON**，只从这块共享内存读最新完整帧。 |
 | `probe_hooks.h` / `probe_hooks.cpp` | 第三方 `WH_GETMESSAGE` 钩子与宿主侧 ack 观测，用来咬住收尾顺序（见下）。钩子只在**从负载拉到的阶段快照**显示"负载正处在自己的 `CallNext` 帧"时才泵消息。 |
 | `observer_pod.h` | 转发包含负载侧 common ABI 头 `payload/probe_api.h` 并起别名（R2 状态 POD、R3 阶段快照）：探针**不自带**第二份布局，头不在包含路径上就直接编译失败。 |
@@ -97,6 +98,20 @@
 （`--cores 1/2/3`、`--feed`）**都必须是 1**：那一次是探针自己的 `LoadLibrary`，XAML 为每个交出的
 site 记的引用已经由负载在解析阶段还清。数到 0 说明多还了一次（模块在它自己的代码还在跑时被抽走），
 数到 2 以上说明少还了（模块卸载不掉、下次注入报 already loaded）。
+
+**这一步本身是卸载动作，所以它有前置门禁**（`host_gate.h` 的 `unload_allowed()`，由离线用例逐项
+钉住）：只有工作线程**真实退出**、停止入口真的跑过（`--feed` 还要 `DeskFeedStop` 报 1）、悬挂判据报 0、
+且 `--feed` 的状态 POD 报 `thread_alive=0 / unload_safe=1 / dangling=0`，才允许数引用。任何一项不
+成立一律 **retained/unverifiable**：不归还引用、不 `FreeLibrary`，模块保持映射到本进程结束。
+"已经 post 过 `WM_CLOSE`"、"探针的停止入口返回 void"、"引用数看起来是 1"都**不是**退休证明。
+
+`BLOCKED`（exit 2）走另一条更窄的路：那时除了装载与解析导出什么都没跑，所以只归还**本进程自己那
+一次** `LoadLibrary` 的引用（打印 `BLOCKED: this process's single load reference -> ...`），**绝不**
+循环 `FreeLibrary` 去清"未知的引用"——那会把别的持有者（含第三方钩子）的引用一起抽走。
+
+拆除顺序同样是硬的：额外的 XAML 核心先收到 `WM_QUIT`，再逐个等到**真实** signal，然后才让
+`WindowsXamlManager` / `DesktopWindowXamlSource` 在本线程析构（它们的调度队列属于那些线程，线程还
+在跑就拆是在别人还在用的对象上动手）。绝不调用 `ShutdownQueueAsync()`（冻结禁用）。
 
 ## 已知前提与未验证项
 

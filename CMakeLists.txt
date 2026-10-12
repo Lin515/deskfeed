@@ -239,6 +239,9 @@ add_executable(deskfeed-tests
 )
 target_link_libraries(deskfeed-tests PRIVATE deskfeed_ipc deskfeed_net deskfeed_display ws2_32.lib)
 target_include_directories(deskfeed-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# 用例会真的起 `deskfeed.exe` 子进程（同目录），所以这是一条**真实图边**：只构建 deskfeed-tests
+# 时必须把当前源码的主进程一起构建出来，否则 `ctest` 会跑到上一次构建留下的旧 exe 上。
+add_dependencies(deskfeed-tests deskfeed)
 
 enable_testing()
 add_test(NAME deskfeed-tests COMMAND deskfeed-tests)
@@ -282,6 +285,10 @@ set_target_properties(deskfeed-reg-hook-caller PROPERTIES
     PREFIX ""
 )
 add_dependencies(deskfeed-native-tests deskfeed-reg-hook-caller)
+# 用例里有一条真的把**成品负载 DLL** LoadLibrary 进本进程的 status 用例（随后还有走测试 DLL 的
+# glue 用例），所以这两条也是**真实图边**：只构建 deskfeed-native-tests 时，对应的 DLL 必须一起
+# 构建出来，不能指望上一次构建在 `bin/` 里留下的旧产物。
+add_dependencies(deskfeed-native-tests deskfeed_payload)
 
 add_test(NAME deskfeed-native-tests COMMAND deskfeed-native-tests)
 
@@ -355,10 +362,28 @@ target_link_libraries(deskfeed-probe PRIVATE
 target_compile_options(deskfeed-probe PRIVATE /guard:cf)
 target_link_options(deskfeed-probe PRIVATE /guard:cf)
 
+# **测试专用**夹具：给"远程调用超时之后仍在写调用方缓冲"这条路径提供真实的延迟写者
+# （`tests/remote_delay_writer.cpp`）。必须是**另一个模块**里的导出：只有真的存在一个"先睡、后写"
+# 的函数，工具用例才能确定性地制造"调用已超时、写入还没发生"的窗口。它只被工具用例按同目录路径
+# LoadLibrary 进子进程，不部署、不安装、不进入任何交付二进制。
+#
+# 与仓库其余部分同一编译口径（/utf-8、UNICODE、/permissive-、基础 Win32 库）：少了 `deskfeed_base`
+# 时宽字符字面量与 Win32 原型在默认代码页下直接报 C2059/C1004。
+add_library(deskfeed-test-remote-writer MODULE
+    tests/remote_delay_writer.cpp
+)
+target_link_libraries(deskfeed-test-remote-writer PRIVATE deskfeed_base)
+set_target_properties(deskfeed-test-remote-writer PROPERTIES
+    OUTPUT_NAME "deskfeed-test-remote-writer"
+    PREFIX ""
+)
+
 add_executable(deskfeed-tools-tests
     tests/tools_tests.cpp
 )
 target_link_libraries(deskfeed-tools-tests PRIVATE deskfeed_inject_support)
+# 工具用例按"与本可执行文件同目录"找这个夹具（默认输出目录就是 `bin/`），所以必须一起构建出来。
+add_dependencies(deskfeed-tools-tests deskfeed-test-remote-writer)
 add_test(NAME deskfeed-tools-tests COMMAND deskfeed-tools-tests)
 
 # ---------------------------------------------------------------------------

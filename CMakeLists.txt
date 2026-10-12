@@ -169,6 +169,7 @@ set(DESKFEED_PAYLOAD_SOURCES
     src/payload/control_upstream.cpp
     src/payload/dllmain.cpp
     src/payload/feed.cpp
+    src/payload/guard_keeper.cpp
     src/payload/hook_post.cpp
     src/payload/host.cpp
     src/payload/reg_hook.cpp
@@ -322,6 +323,10 @@ add_executable(deskfeed-fake-injector
 # 与仓库其余部分同一编译口径（/utf-8、UNICODE、/permissive-、基础 Win32 库）：没有
 # `deskfeed_base` 时宽字符字面量与 Win32 原型在默认代码页下直接报 C2059/C1004。
 target_link_libraries(deskfeed-fake-injector PRIVATE deskfeed_base)
+# 主进程用例里有几条会真的起 `deskfeed-fake-injector.exe`（Q5：按 pid 记录假动作、不注入任何进程），
+# 所以这是与 `deskfeed` 同性质的一条**真实图边**：只构建 deskfeed-tests 时必须把这个夹具一起构建
+# 出来，否则干净克隆上的用例会跑到一个不存在的假注入器上（或上一次构建留下的旧产物上）。
+add_dependencies(deskfeed-tests deskfeed-fake-injector)
 add_executable(deskfeed-supervisor-tests
     tests/master_supervisor_tests.cpp
     src/master/taskbar_supervisor.cpp
@@ -348,6 +353,9 @@ add_test(NAME deskfeed-payload-test-audit
 # `resolve_scope`，它是 target.cpp 里的非内联定义，少了这份实现就是 LNK2019。
 add_library(deskfeed_inject_support STATIC
     src/inject/actions.cpp
+    # per-target 租约 + 入口记录 + 粘性不确定事件（契约与布局的唯一出处是
+    # `src/payload/guard_record.h`，这里只放工具侧的获取/写序/恢复实现）。
+    src/inject/guard.cpp
     src/inject/payload_status.cpp
     src/inject/pe_export.cpp
     src/inject/remote.cpp

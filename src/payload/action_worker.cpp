@@ -24,6 +24,10 @@ std::atomic<bool> g_quit{false};
 std::atomic<bool> g_pending_refresh{false};
 std::atomic<bool> g_pending_show{false};
 std::atomic<bool> g_running{false};
+#ifdef DESKFEED_NATIVE_TESTS
+// 见头文件：只让**测试**目标能确定性地制造"线程在期限内没退出"这个真实场景。
+std::atomic<unsigned> g_test_sleep_ms{0};
+#endif
 
 void send_refresh(std::wstring const& scope) {
     try {
@@ -60,6 +64,13 @@ DWORD WINAPI worker_entry(LPVOID) {
             if (g_quit.load()) {
                 break;
             }
+#ifdef DESKFEED_NATIVE_TESTS
+            // 真实的停住：线程确实没有退出，不是把 stop 的结果 mock 掉。`stop` 的超时因此是
+            // 真的超时，恢复（sleep 结束后线程看到 quit）也是真的恢复。
+            if (unsigned const test_sleep_ms = g_test_sleep_ms.load(); test_sleep_ms != 0) {
+                ::Sleep(test_sleep_ms);
+            }
+#endif
             // 作用域在锁里拷一份：发送期间 start/stop 可能改写 g_scope。
             std::wstring scope;
             {
@@ -174,5 +185,9 @@ bool action_worker_running() {
     std::lock_guard<std::mutex> guard(g_mutex);
     return g_running.load();
 }
+
+#ifdef DESKFEED_NATIVE_TESTS
+void action_worker_probe_set_test_sleep_ms(unsigned ms) { g_test_sleep_ms.store(ms); }
+#endif
 
 }  // namespace deskfeed::payload

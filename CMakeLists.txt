@@ -248,16 +248,22 @@ add_test(NAME deskfeed-tests COMMAND deskfeed-tests)
 # 以及成品负载 DLL 的自动审计。
 #
 # 它刻意与 tests/tests.cpp 分成两个可执行文件：那一份归主进程/帧/配置的作者，这一份只放任务栏负载
-# 这条路上的东西，两边互不踩。`src/payload/{feed,hook_post,reg_hook}.cpp` 在这里被**再编译一次**
-# （它们不碰 XAML，只依赖 Win32 与平台日志），所以测试不依赖负载 DLL 的加载；`reg_hook.cpp` 里
-# 那几个自测探针由 `DESKFEED_NATIVE_TESTS` 开关，成品 DLL 里没有它们。
+# 这条路上的东西，两边互不踩。`src/payload/{feed,hook_post,reg_hook,action_worker,control_upstream}.cpp`
+# 在这里被**再编译一次**（它们不碰 XAML，只依赖 Win32、平台日志与控制通道的编码那一半），所以测试
+# 不依赖负载 DLL 的加载；`reg_hook.cpp` 与 `action_worker.cpp` 里的自测探针由 `DESKFEED_NATIVE_TESTS`
+# 开关，成品 DLL 里没有它们。
+#
+# `action_worker.cpp` 必须在场：回收门里"动作工作线程真的没在期限内退出"这条失败只能由**真实的
+# 线程句柄超时**咬出来，用例不能用 mock 结果代替。
 add_executable(deskfeed-native-tests
     tests/native_tests.cpp
+    src/payload/action_worker.cpp
+    src/payload/control_upstream.cpp
     src/payload/feed.cpp
     src/payload/hook_post.cpp
     src/payload/reg_hook.cpp
 )
-target_link_libraries(deskfeed-native-tests PRIVATE deskfeed_platform)
+target_link_libraries(deskfeed-native-tests PRIVATE deskfeed_platform deskfeed_control_wire_send)
 target_include_directories(deskfeed-native-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(deskfeed-native-tests PRIVATE DESKFEED_NATIVE_TESTS=1)
 

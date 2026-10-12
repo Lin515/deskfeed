@@ -191,6 +191,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
         if (!g_started.compare_exchange_strong(expected, true)) {
             return 3;
         }
+        // 状态快照的 scope 只在这里登记，而且是在**线程发布之前**：查询方永远没有机会指定 scope，
+        // 也不可能读到"上一代的 scope 配这一代的身份"这种混合。它同时开一代（清掉上一代的回收门）。
+        deskfeed::payload::payload_publish_scope(scope);
         auto* payload_scope = new (std::nothrow) std::wstring(scope);
         if (payload_scope == nullptr) {
             g_started.store(false);
@@ -213,10 +216,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStart(void* scope_param) {
             return 4;
         }
         if (::ResumeThread(thread) == static_cast<DWORD>(-1)) {
-            // 登记成功但起不来：线程从未跑过，句柄还是我们自己的，关掉并退回失败。
-            ::CloseHandle(thread);
-            delete payload_scope;
-            g_started.store(false);
+            // 登记成功但起不来。句柄的所有权此刻已经归负载（`g_payload_thread`）：**绝不能**在这里
+            // `CloseHandle` —— 那会让状态查询与 Stop 去等一个已关闭、可能被复用的句柄值。线程也仍然
+            // 是 SUSPENDED、永远不会自己退出。
+            //
+            // 所以这条路径按 fail closed 处理：保留真实句柄与登记，把"这一次 Start 没有被接受"
+            // 明确写回状态快照（`started = 0`，`thread_alive` 仍由真实句柄决定），由 Stop 去等这条
+            // 永远不触发的句柄并返回"未退休"。绝不 `TerminateThread`，也绝不在没有"线程真的终止"
+            // 证据的情况下清登记。
+            deskfeed::payload::payload_mark_start_rejected();
             return 4;
         }
         return 1;
@@ -239,18 +247,24 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedStop(void* timeout_param) 
         // 卸载门是**线程已终止**，不是事件、不是标志位：事件之后线程入口还有一条 `return`，那也是
         // 本模块的指令。
         HANDLE const thread = deskfeed::payload::payload_thread_handle();
-        if (thread == nullptr) {
-            // 句柄没登记过。如果动作工作线程还在跑，那也是一条本模块的线程 ⇒ 绝不能报告可卸载。
-            if (deskfeed::payload::action_worker_running()) {
+        if (thread != nullptr) {
+            if (::WaitForSingleObject(thread, timeout) != WAIT_OBJECT_0) {
                 return 0;
             }
-            // 线程从未起过：没有任何本模块的线程代码在跑。
-            return 1;
-        }
-        if (::WaitForSingleObject(thread, timeout) != WAIT_OBJECT_0) {
+        } else if (deskfeed::payload::action_worker_running()) {
+            // 句柄没登记过，但动作工作线程还在跑：那也是一条本模块的线程 ⇒ 绝不能报告可卸载。
             return 0;
         }
-        return deskfeed::payload::payload_unload_safe() == 1 ? 1 : 0;
+
+        // 到这里线程确实已经终止（或从未起过）。负载线程自己的收尾若还有门没过（例如动作工作
+        // 线程在它的超时里没退出、钩子的 ping 没拿到），现在由这里把没过的门再走一遍：同一时刻
+        // 只有一个驱动者，且不在持锁期间做任何等待。已经拿到的门不会重跑。
+        std::wstring detail;
+        if (!deskfeed::payload::payload_retire_after_thread(timeout, detail)) {
+            deskfeed::log_format(L"payload stays loaded (not retired): %s", detail.c_str());
+            return 0;
+        }
+        return 1;
     } catch (...) {
         // 未退休：注入器必须保留映射（绝不在这里报告"可以卸载"）。
         return 0;
@@ -386,7 +400,10 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeTeardown(unsigned ti
 }
 
 extern "C" __declspec(dllexport) void __stdcall DeskFeedProbeStop() {
-    deskfeed::payload::xaml_tap_stop();
+    std::wstring detail;
+    if (!deskfeed::payload::xaml_tap_stop(2000, detail)) {
+        deskfeed::log_format(L"probe: diagnostics teardown is incomplete: %s", detail.c_str());
+    }
 }
 
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeDangling() {
@@ -518,7 +535,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedGetStatus(void* pod_buffer
         status.size = deskfeed::payload::kPayloadStatusSize;
         status.abi = deskfeed::payload::kPayloadStatusAbi;
         status.width = deskfeed::payload::kPayloadStatusWidth;
-        if (!deskfeed::payload::payload_get_status(status, std::wstring())) {
+        if (!deskfeed::payload::payload_get_status(status)) {
             return 0;
         }
         return copy_payload_status_seh(status, pod_buffer, deskfeed::payload::kPayloadStatusSize) ? 1

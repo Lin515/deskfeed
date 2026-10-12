@@ -16,6 +16,16 @@ namespace deskfeed::payload {
 // 由 DllMain 调用：只建清理事件。
 void payload_prepare();
 
+// 由 `DeskFeedStart` 在**线程发布之前**调用：把这一次真正被接受的 scope 登记进状态快照，并开一代
+// （清上一代的退休证据、unload_safe 归 0、置 started）。状态 ABI 里的 scope 只可能来自这里——
+// 没有任何调用方能在查询时指定 scope。
+void payload_publish_scope(std::wstring const& scope);
+
+// `ResumeThread` 失败这条 fail-closed 路径用：线程已经登记（句柄归负载所有、绝不能在这里关），但
+// 它仍然是 SUSPENDED、永远不会自己退出。把状态快照的 `started` 明确退回 0，这样状态查询不会把
+// 一个从未跑过的僵尸线程报成"已启动"；`thread_alive` 仍然由真实句柄决定（未触发 = 1）。
+void payload_mark_start_rejected();
+
 // 注入线程的入口。`scope` 为主进程实例命名空间（空 = 生产），负载据此挂上显示邮箱与主进程控制通道。
 // 返回时拆除已经完成、清理事件已经置位。
 void payload_run(HINSTANCE module_instance, std::wstring const& scope);
@@ -34,11 +44,18 @@ HANDLE payload_thread_handle();
 // 已经登记过则返回 false（调用方应关掉自己那份）。
 bool payload_publish_thread(HANDLE thread);
 
-// 卸载门：1 = 既定回收门禁全部通过；0 = 未退休（必须保留映射）。线程没结束前一律是 0。
+// 卸载门（**模块侧**证据）：1 = 既定回收门禁全部通过，并且本线程已经完成全部模块侧工作（只剩
+// `ret`）；0 = 未退休。它**不**包含"线程真的终止"这条证明——那条只能由调用方对自己持有的真实
+// 线程句柄等待得到，见 `DeskFeedStop`：两者同时成立才算可以卸载。
 DWORD payload_unload_safe();
 
 // 状态 ABI 的填充（见 src/payload/status_pod.h）：把当前状态写进调用方给的 POD。
 // 由导出的 `DeskFeedGetStatus` 调用；返回 false 表示这一轮拿不到可信状态。
-bool payload_get_status(PayloadStatusPod& pod, std::wstring const& scope);
+// **没有 scope 参数**：要报的 scope 是 `payload_publish_scope` 登记的那一个。
+bool payload_get_status(PayloadStatusPod& pod);
+
+// `DeskFeedStop` 的重试入口：负载线程已经**真的终止**（或从未起过）之后，把还没拿到证明的回收门
+// 再走一遍。内部保证同一时刻只有一个驱动者，且不在任何等锁期间做等待/ping；detail 写明没过的门。
+bool payload_retire_after_thread(unsigned timeout_ms, std::wstring& detail);
 
 }  // namespace deskfeed::payload

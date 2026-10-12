@@ -652,9 +652,13 @@ void xaml_tap_release_walk(size_t index) {
 // 拒收，它借出去的那份引用由 XAML 从调用方那里收回（见 TapSite::SetSite）。
 //
 // 两个数在同一个临界区里花掉，所以第二次 stop 是安全的：两个数都是零，什么也不做。
-void xaml_tap_stop() {
+//
+// 返回值就是这条路径**唯一现成的真实证据**：SetSite 排空到零。超时那一刻不宣称退休（返回 false）
+// 并保持模块映射；引用归还策略本身保持不变，不在这里发明新的门。
+bool xaml_tap_stop(unsigned timeout_ms, std::wstring& detail) {
     std::vector<std::shared_ptr<Site>> sites;
     unsigned ports = 0;
+    bool drained = true;
     {
         // 这里必须是 unique_lock：下面的等待要用它。
         std::unique_lock<std::mutex> guard(g_state.mutex);
@@ -666,12 +670,15 @@ void xaml_tap_stop() {
         // 已经越过标志位的 SetSite 此刻正在跑本模块的代码（它在离开锁之后还要写日志）。在它
         // 返回之前归还引用可能把模块从它脚下抽走，所以要等它——但有界：一条永远结束不了的连接
         // 不能把拆除拖死。模块多留一份可以恢复，崩了不行。
-        constexpr int kSetSiteDrainMs = 2000;
-        if (!g_state.sites_changed.wait_for(guard, std::chrono::milliseconds(kSetSiteDrainMs),
-                                            [] { return g_state.set_site_depth == 0; })) {
-            log_format(L"a site attach is still inside SetSite after %d ms (%u in flight); giving the "
-                       L"%zu site reference(s) back anyway",
-                       kSetSiteDrainMs, g_state.set_site_depth, sites.size());
+        unsigned const drain_ms = timeout_ms == 0 ? 1u : timeout_ms;
+        drained = g_state.sites_changed.wait_for(guard, std::chrono::milliseconds(drain_ms),
+                                                 [] { return g_state.set_site_depth == 0; });
+        if (!drained) {
+            detail = L"还有 SetSite 调用在期限内没有返回（在途 " +
+                     std::to_wstring(g_state.set_site_depth) + L"）";
+            log_format(L"a site attach is still inside SetSite after %u ms (%u in flight); the "
+                       L"module must stay loaded",
+                       drain_ms, static_cast<unsigned>(g_state.set_site_depth));
         }
     }
 
@@ -705,6 +712,7 @@ void xaml_tap_stop() {
     // 站点最后才销毁，而且在归还引用之后：上面释放最后一份 IXamlDiagnostics 不能是本模块
     // 失去映射之前做的最后一件事，而在这里清 shared_ptr 会跑到本模块里的删除器。
     sites.clear();
+    return drained;
 }
 
 }  // namespace deskfeed::payload

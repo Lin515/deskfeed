@@ -24,4 +24,11 @@ bool action_worker_stop(unsigned timeout_ms);
 
 bool action_worker_running();
 
+#ifdef DESKFEED_NATIVE_TESTS
+// **测试专用**（只在 `DESKFEED_NATIVE_TESTS` 的用例目标里编译，成品 DLL 里没有这个符号）：
+// 让工作线程每一轮真正醒来之后先停住若干毫秒，用来确定性地制造"stop 在期限内等不到线程句柄"。
+// 线程是真的没退出，重试路径随后必须能真的把它等回来。
+void action_worker_probe_set_test_sleep_ms(unsigned ms);
+#endif
+
 }  // namespace deskfeed::payload

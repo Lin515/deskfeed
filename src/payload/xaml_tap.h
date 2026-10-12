@@ -56,8 +56,10 @@ bool xaml_tap_resolve(size_t index, winrt::Windows::Foundation::IInspectable& el
 // 把走查上报过的每一个句柄还回去。在它跑之前，诊断一直持有每个上报元素的一份引用。
 void xaml_tap_release_walk(size_t index);
 
-// 释放所有站点。没有连接时调用是安全的。
-void xaml_tap_stop();
+// 释放所有站点，并给出**真实证据**：站点引用按实际交出的核心数归还，且 SetSite 已经排空到零。
+// 返回 false 表示有 SetSite 在期限内没有返回（那一刻不宣称退休），detail 写明原因。
+// 没有连接时调用是安全的，返回 true；重复调用同样安全。
+bool xaml_tap_stop(unsigned timeout_ms, std::wstring& detail);
 
 // TAP 的类对象，由 XAML 经本模块的 DllGetClassObject 调用。
 HRESULT tap_get_class_object(REFCLSID class_id, REFIID interface_id, void** object);

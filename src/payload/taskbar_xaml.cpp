@@ -1081,7 +1081,10 @@ bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
     // 解析阶段到此结束：诊断这条线整条关掉（成功、失败、没走成都关），并且**立刻**恢复导入表——
     // 那层规避只需要覆盖走查这一段。
     xaml_tap_release_walk(g_state.site_index);
-    xaml_tap_stop();
+    std::wstring tap_detail;
+    if (!xaml_tap_stop(2000, tap_detail)) {
+        log_format(L"diagnostics teardown is incomplete: %s", tap_detail.c_str());
+    }
     g_diagnostics_closed.store(true);
 
     std::wstring restore_error;
@@ -1146,12 +1149,15 @@ bool taskbar_xaml_detach(unsigned timeout_ms, std::wstring& detail) {
         remove_task(faulted);
     }
 
-    // 第三步：钩子的静止证明（完成事件 + 对 T 的窗口做一次非排队 ping），拿到才归还自引用。
+    // 钩子的静止证明（完成事件 + 对 T 的窗口做一次非排队 ping），拿到才归还自引用。
     std::wstring hook_detail;
-    if (!hook_post_retire(g_ack_window_override, g_state.tray != nullptr
-                                                      ? ::GetWindowThreadProcessId(g_state.tray, nullptr)
-                                                      : 0,
-                          timeout_ms, hook_detail)) {
+    bool const hook_proven =
+        hook_post_retire(g_ack_window_override,
+                         g_state.tray != nullptr
+                             ? ::GetWindowThreadProcessId(g_state.tray, nullptr)
+                             : 0,
+                         timeout_ms, hook_detail);
+    if (!hook_proven) {
         safe = false;
         if (!detail.empty()) {
             detail += L"; ";
@@ -1159,7 +1165,11 @@ bool taskbar_xaml_detach(unsigned timeout_ms, std::wstring& detail) {
         detail += hook_detail;
     }
 
-    g_state.tray = nullptr;
+    // 只有 ping 证明拿到之后才允许丢掉"确认窗口属于哪条 T"这份身份：失败时保留它，下一次重试才
+    // 能对同一条 T 再发一次 ack。这里只是把指针放下，绝不从工作线程去动 XAML 结构。
+    if (hook_proven) {
+        g_state.tray = nullptr;
+    }
     g_attached.store(false);
     return safe;
 }

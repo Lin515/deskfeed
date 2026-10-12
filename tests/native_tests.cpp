@@ -10,9 +10,12 @@
 //   deskfeed-native-tests                     跑全部用例
 //   deskfeed-native-tests --filter feed       只跑名字里含 feed 的用例
 //   deskfeed-native-tests --audit <dll>       只跑成品审计（CTest 单独注册一条）
+#include "payload/action_worker.h"
 #include "payload/feed.h"
 #include "payload/hook_post.h"
 #include "payload/reg_hook.h"
+#include "payload/retire_gates.h"
+#include "payload/status_pod.h"
 #include "platform/log.h"
 
 #include <windows.h>
@@ -580,6 +583,144 @@ void test_reg_hook() {
     check(status.in_flight == 0, "reghook: no replacement call is left in flight");
 }
 
+// ---------------------------------------------------------------- 回收门：真实 failedWorker + 粘性
+//
+// 两条互补的证据：
+//   1) **真实的失败**：只在本用例目标里编译的测试开关让动作工作线程每次醒来后真的停住，于是
+//      `action_worker_stop(150)` 真的等不到线程句柄——不是把结果 mock 掉；
+//   2) **粘性/派生**：把这个真实结果按生产路径记进门位，断言"其它门全过、且调用方声称没崩"之后
+//      `derived_unload_safe()` **仍然是 0**。旧代码那条"最后一次赋值把 0 覆盖成 1"在这里必红。
+void test_retire_gates() {
+    if (!name_matches("retire")) {
+        return;
+    }
+
+    std::wstring error;
+    check(deskfeed::payload::action_worker_start(L"nativecheck", error),
+          "retire: the action worker starts");
+    deskfeed::payload::action_worker_probe_set_test_sleep_ms(1500);
+    deskfeed::payload::action_worker_post_refresh();  // 叫醒线程，让它进入那次真实的睡眠
+    ::Sleep(60);
+
+    bool const stopped_in_time = deskfeed::payload::action_worker_stop(150);
+    check(!stopped_in_time, "retire: a really-still-running worker misses the deadline");
+
+    // 与 host.cpp 的 retire_gates 用的是同一份门位代码。
+    deskfeed::payload::RetirementGates gates;
+    if (stopped_in_time) {
+        gates.worker.store(true);  // 只有在真的等到了线程句柄时才记
+    }
+    // 其余门先都当作已经拿到——这是对"结论会不会被别的东西盖住"最有利的情形。
+    gates.xaml.store(true);
+    gates.tap.store(true);
+    gates.iat.store(true);
+    gates.consumer.store(true);
+    gates.thread_done.store(true);
+    check(gates.derived_unload_safe() == 0,
+          "retire: one failed worker gate keeps unload_safe at 0 even with every other gate passed");
+
+    // 恢复：线程真的退出之后，重试必须能拿到证据并让派生结论变成可卸载。
+    deskfeed::payload::action_worker_probe_set_test_sleep_ms(0);
+    bool const stopped_on_retry = deskfeed::payload::action_worker_stop(4000);
+    check(stopped_on_retry, "retire: the retry really waits the thread out");
+    if (stopped_on_retry) {
+        gates.worker.store(true);
+    }
+    check(gates.derived_unload_safe() == 1,
+          "retire: the retry completes the gate set and the derived conclusion becomes unloadable");
+
+    // crash 粘性：全部门都过了也不能把故障抹掉；只有新一代才清。
+    gates.crashed.store(true);
+    check(gates.derived_unload_safe() == 0, "retire: a recorded crash is sticky");
+    gates.crashed.store(false);
+    check(gates.derived_unload_safe() == 1, "retire: clearing is a new-generation action");
+}
+
+// ---------------------------------------------------------------- 状态 ABI 与回收（端到端，离线）
+//
+// 这一段**真的把成品负载 DLL 加载进本进程**：不起 XAML、不碰任务栏、不注入 explorer。这一轮注入
+// 必然在"打不开显示邮箱"处提前返回（本进程里没有生产者），但它把三条硬路径真的跑了一遍：
+//   * `DeskFeedStart` **实际接受**的 scope 必须出现在状态 POD 里（从前这里恒为空串）；
+//   * `DeskFeedGetStatus` 在没有消费者的进程里必须安全返回（从前它解引用指向栈上对象的裸指针）；
+//   * `DeskFeedStop` 的结论必须来自"真实线程句柄已触发 + 模块侧门位全过"，而不是最后一次赋值。
+
+using StatusStartFn = DWORD(WINAPI*)(void*);
+using StatusStopFn = DWORD(WINAPI*)(void*);
+using StatusGetFn = DWORD(WINAPI*)(void*);
+
+std::wstring sibling_file_path(wchar_t const* file_name) {
+    wchar_t buffer[MAX_PATH]{};
+    DWORD const length = ::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) {
+        return std::wstring(file_name);
+    }
+    std::wstring path(buffer, length);
+    std::size_t const separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return std::wstring(file_name);
+    }
+    return path.substr(0, separator + 1) + file_name;
+}
+
+bool query_status(StatusGetFn get, deskfeed::payload::PayloadStatusPod& pod) {
+    pod = deskfeed::payload::PayloadStatusPod{};
+    pod.size = deskfeed::payload::kPayloadStatusSize;
+    pod.abi = deskfeed::payload::kPayloadStatusAbi;
+    return get(&pod) == 1;
+}
+
+void test_status_abi() {
+    if (!name_matches("status")) {
+        return;
+    }
+    HMODULE const module = ::LoadLibraryW(sibling_file_path(L"deskfeed-payload.dll").c_str());
+    check(module != nullptr, "status: the payload DLL loads into this process");
+    if (module == nullptr) {
+        return;
+    }
+    auto const start = reinterpret_cast<StatusStartFn>(::GetProcAddress(module, "DeskFeedStart"));
+    auto const stop = reinterpret_cast<StatusStopFn>(::GetProcAddress(module, "DeskFeedStop"));
+    auto const get = reinterpret_cast<StatusGetFn>(::GetProcAddress(module, "DeskFeedGetStatus"));
+    check(start != nullptr && stop != nullptr && get != nullptr,
+          "status: Start/Stop/GetStatus all resolve");
+    if (start != nullptr && stop != nullptr && get != nullptr) {
+        deskfeed::payload::PayloadStatusPod pod{};
+        check(query_status(get, pod), "status: GetStatus answers before any start");
+        check(pod.started == 0, "status: nothing has been started yet");
+
+        // scope 缓冲必须活到负载线程真的退出（负载会先复制一份，这里保守地一直留着）。
+        std::wstring const scope = L"nativecheck";
+        check(start(const_cast<wchar_t*>(scope.c_str())) == 1, "status: Start accepts the scope");
+
+        bool scope_seen = false;
+        for (int attempt = 0; attempt < 600; ++attempt) {
+            deskfeed::payload::PayloadStatusPod view{};
+            if (query_status(get, view) && view.started == 1) {
+                if (std::wstring(view.scope) == scope) {
+                    scope_seen = true;
+                }
+                if (view.thread_alive == 0) {
+                    break;  // 负载线程已经结束（本进程没有生产者，它会立刻拆干净）
+                }
+            }
+            ::Sleep(10);
+        }
+        check(scope_seen, "status: GetStatus reports the scope Start actually accepted");
+
+        check(stop(reinterpret_cast<void*>(static_cast<std::uintptr_t>(5000))) == 1,
+              "status: Stop retires it (thread handle + all module-side gates)");
+
+        deskfeed::payload::PayloadStatusPod after{};
+        check(query_status(get, after), "status: GetStatus answers after retirement");
+        check(after.thread_alive == 0, "status: the payload thread really exited");
+        check(after.unload_safe == 1,
+              "status: unload_safe is derived from the gate set (not from the last write)");
+        check(std::wstring(after.scope) == scope, "status: the scope survives into retirement");
+        check(after.frame_generation == 0, "status: frame_generation stays reserved/unknown");
+    }
+    ::FreeLibrary(module);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -599,6 +740,8 @@ int main(int argc, char** argv) {
         test_seh_boundary();
         test_hook_gate();
         test_reg_hook();
+        test_retire_gates();
+        test_status_abi();
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

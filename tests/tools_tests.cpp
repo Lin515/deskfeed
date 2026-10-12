@@ -18,6 +18,7 @@
 #include "display/mailbox.h"
 #include "display/reading.h"
 #include "inject/actions.h"
+#include "inject/guard.h"
 #include "inject/payload_status.h"
 #include "inject/pe_export.h"
 #include "inject/remote.h"
@@ -28,12 +29,15 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <functional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1279,12 +1283,14 @@ void run_remote_late_write_case() {
               "remote/late-write POD header written");
 
         // 真实的远程调用超时：线程已创建、250ms 内不退出，而写发生在 800ms 之后。
-        RemoteCall const call = call_remote_export(child_pid, dll_base, info.rva,
-                                                   reinterpret_cast<void*>(buffer.address), 250);
+        RemoteCall call = call_remote_export(child_pid, dll_base, info.rva,
+                                             reinterpret_cast<void*>(buffer.address), 250);
         check(call.thread_created, "remote/late-write remote thread created");
         check(!call.signaled, "remote/late-write the call really timed out");
+        check(call.thread != nullptr, "remote/late-write the unresolved call keeps its thread handle");
         check(!may_release_remote_buffer(call.thread_created, call.signaled),
               "remote/late-write the condition policy retains the buffer after a timeout");
+        release_remote_call(call);
 
         // 直接走被修的那个函数：短超时必须返回 false，并且如实报告"缓冲区保留"。
         RemoteCall pod_call;
@@ -1294,6 +1300,7 @@ void run_remote_late_write_case() {
               "remote/late-write remote_fetch_pod times out");
         check(pod_error.find(L"stays allocated") != std::wstring::npos,
               "remote/late-write remote_fetch_pod reports the retained buffer");
+        release_remote_call(pod_call);
 
         ::Sleep(1200);  // 让两个远程写者都完成它们那 144 字节
         unsigned char read_back[144]{};
@@ -1316,12 +1323,374 @@ void run_remote_late_write_case() {
         check(remote_fetch_pod(child_pid, dll_base, info.rva, header, sizeof(header), 5000, settled,
                                settled_error),
               "remote/late-write remote_fetch_pod succeeds once the writer returns");
+        check(settled.signaled && remote_call_actual(settled),
+              "remote/late-write the settled fetch is an actual result");
+        release_remote_call(settled);
     }
 
     ::TerminateProcess(process.hProcess, 0);
     ::WaitForSingleObject(process.hProcess, 5000);
     ::CloseHandle(process.hThread);
     ::CloseHandle(process.hProcess);
+}
+
+// ---------------------------------------------------------------------------
+// M4 原语：超时**不** CloseHandle；park 到真实 signal 或真实目标死亡
+//
+// 这一组用例咬的是"不丢事实"：未决调用必须把真实线程句柄留住，并且只能在 park 拿到**实际**
+// 结论（线程真退出 / 目标真死亡）之后才允许释放那块远程缓冲。全部用自己的 hidden 子进程与
+// 交付的延迟写 DLL，不碰 explorer、不起窗口。
+// ---------------------------------------------------------------------------
+
+// 一个"装着延迟写 DLL 并停在那里"的子进程，连同父进程要用的模块基址与导出 RVA。
+struct WriterChild {
+    PROCESS_INFORMATION process{};
+    unsigned long pid = 0;
+    unsigned long long dll_base = 0;
+    deskfeed::inject::PeExportInfo export_info;
+    bool ready = false;
+};
+
+bool spawn_writer_child(WriterChild& child) {
+    using namespace deskfeed::inject;
+    child = WriterChild{};
+
+    std::wstring const dll = test_writer_dll_path();
+    if (::GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    wchar_t self[MAX_PATH]{};
+    if (::GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) {
+        return false;
+    }
+
+    std::wstring command = L"\"" + std::wstring(self) + L"\" --remote-writer";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    if (::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                         nullptr, &startup, &child.process) == FALSE) {
+        return false;
+    }
+    child.pid = child.process.dwProcessId;
+
+    for (int attempt = 0; attempt < 100 && child.dll_base == 0; ++attempt) {
+        ::Sleep(50);
+        std::vector<ModuleEntry> modules;
+        std::wstring list_error;
+        if (list_modules(child.pid, modules, list_error)) {
+            for (ModuleEntry const& entry : modules) {
+                if (module_path_matches(entry.path, dll)) {
+                    child.dll_base = entry.base;
+                }
+            }
+        }
+    }
+    if (child.dll_base == 0) {
+        return false;
+    }
+
+    std::wstring error;
+    PeExportError kind = PeExportError::None;
+    child.ready = pe_export_rva(dll, "DeskFeedTestDelayedWrite", child.export_info, error, &kind);
+    return child.ready;
+}
+
+// 只终止**本用例自己** CreateProcessW 出来的那个 PID，绝不按镜像名杀进程。
+void kill_writer_child(WriterChild& child) {
+    if (child.process.hProcess != nullptr) {
+        ::TerminateProcess(child.process.hProcess, 0);
+        ::WaitForSingleObject(child.process.hProcess, 5000);
+    }
+    if (child.process.hThread != nullptr) {
+        ::CloseHandle(child.process.hThread);
+    }
+    if (child.process.hProcess != nullptr) {
+        ::CloseHandle(child.process.hProcess);
+    }
+    child = WriterChild{};
+}
+
+unsigned char const kLateWriteMagic[8] = {0x44, 0x46, 0x4C, 0x41, 0x54, 0x45, 0x01, 0x00};
+
+// 在一个短命线程里等一会儿再结束目标：制造"park 期间目标死亡"这条真实路径。
+struct KillerArgs {
+    HANDLE process = nullptr;
+    DWORD delay_ms = 0;
+};
+
+DWORD WINAPI kill_target_after_delay(void* raw) {
+    KillerArgs* const args = static_cast<KillerArgs*>(raw);
+    ::Sleep(args->delay_ms);
+    ::TerminateProcess(args->process, 0);
+    return 0;
+}
+
+void run_park_cases() {
+    using namespace deskfeed::inject;
+
+    // 每个子用例各自可过滤（`--filter park/target-death`）：出问题时要能把范围缩到一段。
+    if (wanted("park/identity")) {
+        TargetProcess target;
+        std::wstring error;
+        check(!open_target_process(::GetCurrentProcessId(), 1, target, error),
+              "park/identity rejects a mismatched creation time");
+        check(!error.empty(), "park/identity explains the identity mismatch");
+        check(target.process == nullptr, "park/identity leaves no handle behind on rejection");
+
+        error.clear();
+        check(open_target_process(::GetCurrentProcessId(), 0, target, error),
+              "park/identity captures the current process");
+        check(target.creation_time != 0, "park/identity captured a creation-time identity");
+        check(target_process_alive(target), "park/identity the captured process is alive");
+        close_target_process(target);
+        check(target.process == nullptr, "park/identity close resets the captured handle");
+    }
+
+    if (wanted("park/no-target-handle")) {
+        RemoteCall fake;
+        fake.thread_created = true;
+        check(park_remote_call(fake, nullptr, 10) == ParkResult::Error,
+              "park/no-target-handle refuses to pretend it can observe the outcome");
+        check(remote_call_unresolved(fake), "park/no-target-handle leaves the call unresolved");
+    }
+
+    if (wanted("park/never-executed")) {
+        // 真实的"从未执行"：目标是**已经退出的**进程，CreateRemoteThread 被拒（实测 ERROR_ACCESS_DENIED）。
+        // 刻意不用"权限不足的句柄"来构造失败：本机实测只有
+        // PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE 的句柄**照样能** CreateRemoteThread
+        // （对其他进程也一样），线程会在目标里跳到坏地址——那不是"必然失败"的构造。
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/never-executed could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/never-executed captured the target process handle");
+            ::TerminateProcess(child.process.hProcess, 0);
+            ::WaitForSingleObject(child.process.hProcess, 5000);
+            check(!target_process_alive(target), "park/never-executed the target is really gone");
+
+            RemoteCall call = call_remote_export_on(target.process, child.dll_base,
+                                                    child.export_info.rva, nullptr, 100);
+            check(!call.thread_created, "park/never-executed the remote thread was never created");
+            check(!call.completed_late, "park/never-executed is not a late completion");
+            check(!call.target_died, "park/never-executed is not a target death (no call happened)");
+            check(remote_call_actual(call), "park/never-executed is an actual (never executed) result");
+            check(!remote_call_unresolved(call), "park/never-executed is not unresolved");
+            check(may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/never-executed may release its buffer (nothing ever ran)");
+            check(park_remote_call(call, target.process, 10) == ParkResult::NotPending,
+                  "park/never-executed has nothing to park");
+
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
+
+    if (wanted("park/late-write")) {
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/late-write could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/late-write captured the target process handle");
+
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/late-write buffer allocated");
+
+            RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
+                                                    reinterpret_cast<void*>(buffer.address), 250);
+            check(call.thread_created, "park/late-write the remote thread was created");
+            check(!call.signaled, "park/late-write the call really timed out first");
+            check(remote_call_unresolved(call), "park/late-write the call is unresolved after the timeout");
+            check(call.thread != nullptr,
+                  "park/late-write the thread handle is kept open (not CloseHandle'd)");
+            check(call.thread_id != 0, "park/late-write the real remote tid was captured");
+            check(!remote_call_actual(call), "park/late-write an unresolved call is not an actual result");
+            check(!may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/late-write the buffer must stay while the call is unresolved");
+
+            ParkResult const parked = park_remote_call(call, target.process, 100);
+            check(parked == ParkResult::ThreadSignaled,
+                  "park/late-write parking observed the real signal");
+            check(call.signaled && call.completed_late,
+                  "park/late-write the completion is actual and marked as late");
+            check(call.exit_code == 1, "park/late-write the real exit code was read");
+            check(remote_call_actual(call), "park/late-write the parked call is an actual result");
+            check(may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/late-write the buffer may be released only now");
+
+            unsigned char read_back[144]{};
+            bool const read_ok =
+                remote_read(child.pid, buffer.address, read_back, sizeof(read_back), buffer_error);
+            check(read_ok && std::memcmp(read_back, kLateWriteMagic, sizeof(kLateWriteMagic)) == 0,
+                  "park/late-write the late 144-byte write landed intact");
+
+            remote_free(child.pid, buffer);
+            release_remote_call(call);
+            check(call.thread == nullptr, "park/late-write release closes the kept thread handle");
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
+
+    if (wanted("park/interrupted")) {
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/interrupted could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/interrupted captured the target process handle");
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/interrupted buffer allocated");
+
+            HANDLE stop_event = ::CreateEventW(nullptr, TRUE, TRUE, nullptr);
+            RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
+                                                    reinterpret_cast<void*>(buffer.address), 250);
+            check(call.thread_created && !call.signaled, "park/interrupted the call timed out first");
+            ParkResult const parked = park_remote_call(call, target.process, 50, stop_event);
+            check(parked == ParkResult::Interrupted, "park/interrupted reports the interruption");
+            check(remote_call_unresolved(call), "park/interrupted leaves the call unresolved");
+            check(!call.target_died, "park/interrupted is not a target death");
+            check(!may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/interrupted keeps the buffer (unknown is not clean)");
+
+            release_remote_call(call);
+            ::CloseHandle(stop_event);
+            remote_free(child.pid, buffer);
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
+
+    if (wanted("park/target-death")) {
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/target-death could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/target-death captured the target process handle");
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/target-death buffer allocated");
+
+            RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
+                                                    reinterpret_cast<void*>(buffer.address), 250);
+            check(call.thread_created && !call.signaled,
+                  "park/target-death the call is still unresolved when the target is killed");
+
+            // 在写者那 800ms 睡完之前杀掉**自己 spawn 的**目标进程，并等进程对象真的 signal：
+            // 这样 park 的第一轮判定就同时看到"线程句柄 signal + 进程句柄 signal"，用来钉住
+            // "目标死亡优先于入口返回"这条规则（不靠时间竞态取胜）。
+            ::TerminateProcess(child.process.hProcess, 0);
+            ::WaitForSingleObject(child.process.hProcess, 5000);
+
+            ParkResult const parked = park_remote_call(call, target.process, 100);
+            check(parked == ParkResult::TargetDied,
+                  "park/target-death parking reports the target death");
+            check(call.target_died && !call.signaled,
+                  "park/target-death is not reported as a clean thread exit");
+            check(!remote_call_actual(call), "park/target-death is not an actual per-call result");
+            check(!may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/target-death keeps the buffer rule closed");
+            check(!target_process_alive(target), "park/target-death the captured target is dead");
+
+            release_remote_call(call);
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
+
+    // 边等边死：park 正在进行时由另一个线程结束目标——"线程先 signal、进程后收尾"的窗口。
+    if (wanted("park/target-death-mid-park")) {
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/target-death-mid-park could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/target-death-mid-park captured the target process handle");
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc(child.pid, 144, buffer, buffer_error),
+                  "park/target-death-mid-park buffer allocated");
+
+            RemoteCall call = call_remote_export_on(target.process, child.dll_base,
+                                                    child.export_info.rva,
+                                                    reinterpret_cast<void*>(buffer.address), 250);
+            check(call.thread_created && !call.signaled,
+                  "park/target-death-mid-park the call is unresolved before the kill");
+
+            KillerArgs args{child.process.hProcess, 200};
+            HANDLE killer = ::CreateThread(nullptr, 0, kill_target_after_delay, &args, 0, nullptr);
+            check(killer != nullptr, "park/target-death-mid-park spawned the killer thread");
+
+            ParkResult const parked = park_remote_call(call, target.process, 50);
+            if (killer != nullptr) {
+                ::WaitForSingleObject(killer, 5000);
+                ::CloseHandle(killer);
+            }
+            check(parked == ParkResult::TargetDied,
+                  "park/target-death-mid-park reports the target death, not a clean thread exit");
+            check(call.target_died && !call.signaled,
+                  "park/target-death-mid-park is not reported as an actual thread exit");
+            check(!may_release_remote_buffer(call.thread_created, call.signaled),
+                  "park/target-death-mid-park keeps the buffer rule closed");
+
+            release_remote_call(call);
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
+
+    if (wanted("park/handle-no-leak")) {
+        WriterChild child;
+        if (!spawn_writer_child(child)) {
+            check(false, "park/handle-no-leak could not spawn the delayed-writer child");
+        } else {
+            TargetProcess target;
+            std::wstring error;
+            check(open_target_process(child.pid, 0, target, error),
+                  "park/handle-no-leak captured the target process handle");
+            RemoteBuffer buffer;
+            std::wstring buffer_error;
+            check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/handle-no-leak buffer allocated");
+
+            DWORD before = 0;
+            DWORD after = 0;
+            int created = 0;
+            // 第一轮当预热：进程里第一次 CreateRemoteThread 可能触发一次性的内部结构分配，把它
+            // 排除在计数窗口之外，断言才能保持"精确相等"，而不是靠一个容差把真泄漏也放过去。
+            for (int index = 0; index < 6; ++index) {
+                RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
+                                                        reinterpret_cast<void*>(buffer.address), 30);
+                if (call.thread_created) {
+                    ++created;
+                }
+                release_remote_call(call);
+                if (index == 0) {
+                    ::GetProcessHandleCount(::GetCurrentProcess(), &before);
+                }
+            }
+            ::GetProcessHandleCount(::GetCurrentProcess(), &after);
+            check(created == 6, "park/handle-no-leak all six remote calls were created");
+            check(after <= before, "park/handle-no-leak releasing unresolved calls leaks no handle");
+
+            // 缓冲不释放：那五个写者可能还在写它（进程马上会被结束）。
+            close_target_process(target);
+            kill_writer_child(child);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1743,619 @@ void run_state_gate_cases() {
              std::string("mapped-unverifiable"), "stategate/unverifiable name");
 }
 
+// ---------------------------------------------------------------------------
+// N3 租约（guard）：记录状态机、abandoned 恢复、单一释放谓词
+//
+// 全部离线：三个命名内核对象由**本进程**（keeper，扮演"负载 DLL 长期持有这三份引用"的角色）
+// 持有；actor 跑在自己的短命线程里——线程在持锁时退出，内核就把它标成 abandoned，这是真的
+// `WAIT_ABANDONED`，不是模拟。TID 存活事实用真的 Toolhelp。
+// ---------------------------------------------------------------------------
+
+// 扮演"负载侧长期持有三份引用"的那一方：只 open/create + 持有句柄，不抢租约。
+using namespace deskfeed::inject;  // 本段（到本匿名 namespace 结束）全部是工具侧用例
+
+struct GuardObjects {
+    HANDLE mutex = nullptr;
+    HANDLE event = nullptr;
+    HANDLE mapping = nullptr;
+    deskfeed::payload::GuardRecord* record = nullptr;
+    GuardTarget target{};
+
+    ~GuardObjects() { close(); }
+
+    bool open(GuardTarget const& wanted, bool init_record, std::wstring& error) {
+        namespace payload = deskfeed::payload;
+        target = wanted;
+        wchar_t buffer[payload::kGuardNameCapacity]{};
+        auto const name = [&](wchar_t const* suffix, std::wstring& out) {
+            if (!payload::guard_format_object_name(buffer, std::size(buffer), suffix,
+                                                   wanted.process_id, wanted.creation_time)) {
+                error = L"cannot format a guard object name";
+                return false;
+            }
+            out.assign(buffer);
+            return true;
+        };
+        std::wstring mutex_name;
+        std::wstring event_name;
+        std::wstring record_name;
+        if (!name(payload::kGuardSuffixMutex, mutex_name) ||
+            !name(payload::kGuardSuffixEvent, event_name) ||
+            !name(payload::kGuardSuffixRecord, record_name)) {
+            return false;
+        }
+
+        mutex = ::CreateMutexW(nullptr, FALSE, mutex_name.c_str());
+        event = ::CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
+        ::SetLastError(0);
+        mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                       payload::kGuardRecordSize, record_name.c_str());
+        bool const created_now = mapping != nullptr && ::GetLastError() != ERROR_ALREADY_EXISTS;
+        if (mutex == nullptr || event == nullptr || mapping == nullptr) {
+            error = L"cannot create the guard objects";
+            return false;
+        }
+        void* const view =
+            ::MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, payload::kGuardRecordSize);
+        if (view == nullptr) {
+            error = L"cannot map the guard record";
+            return false;
+        }
+        record = static_cast<payload::GuardRecord*>(view);
+        if (created_now && init_record) {
+            // 扮演"actor 先 create + init 再 LoadLibraryW"那条规约。不 init 的路径留给
+            // `guard/zero-header`：那时的零头必须被当成未知。
+            payload::guard_init_new_record(*record, 1);
+        }
+        return true;
+    }
+
+    void close() {
+        if (record != nullptr) {
+            ::UnmapViewOfFile(record);
+            record = nullptr;
+        }
+        if (mapping != nullptr) {
+            ::CloseHandle(mapping);
+            mapping = nullptr;
+        }
+        if (event != nullptr) {
+            ::CloseHandle(event);
+            event = nullptr;
+        }
+        if (mutex != nullptr) {
+            ::CloseHandle(mutex);
+            mutex = nullptr;
+        }
+    }
+
+    bool event_signaled() const {
+        return event != nullptr && ::WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    }
+
+    void set_event() const {
+        if (event != nullptr) {
+            ::SetEvent(event);
+        }
+    }
+};
+
+struct ActorOutcome {
+    GuardAcquire outcome = GuardAcquire::Error;
+    std::wstring error;
+    GuardSnapshot snapshot_after = GuardSnapshot::Unknown;
+    bool event_set_after = false;
+    bool concluded = false;
+};
+
+// actor 在拿到租约之后、收尾之前要做的事（记录它自己那次远程调用）。
+using guard_actor_setup = std::function<void(GuardLease&, ActorOutcome&)>;
+
+// 一个 actor 的完整生命周期，跑在自己的线程里：
+//   acquired -> （可选）记录一个 pending 状态 -> 收尾。
+// `conclude` 为真时用谓词 `conclude_clean` 收尾；为假时**什么都不做**（线程退出 ⇒ abandoned），
+// 这正是"崩溃的 actor"在核心里留下的样子。
+void run_actor_thread(GuardTarget const& target, bool conclude, bool conclusive,
+                      guard_actor_setup setup, ActorOutcome& out) {
+    std::thread worker([&]() {
+        GuardLease lease;
+        std::wstring error;
+        out.outcome = lease.acquire(target, error);
+        out.error = error;
+        if (!guard_acquire_allows_action(out.outcome)) {
+            // Unknown/Busy：绝不动作，也绝不释放。
+            lease.abandon_unknown();
+            out.snapshot_after = lease.snapshot();
+            return;
+        }
+        setup(lease, out);
+        lease.note_action_conclusive(conclusive);
+        if (conclude) {
+            std::wstring conclude_error;
+            out.concluded = lease.conclude_clean(conclude_error);
+            if (!out.concluded) {
+                out.error = conclude_error;
+            }
+        } else {
+            lease.abandon_unknown();
+        }
+        out.snapshot_after = lease.snapshot();
+    });
+    worker.join();
+}
+
+// 直接读一次命名事件（不经过租约）：给"粘性事件真的被置位/清掉"当独立证据。
+bool guard_event_signaled(GuardTarget const& target) {
+    namespace payload = deskfeed::payload;
+    wchar_t buffer[payload::kGuardNameCapacity]{};
+    if (!payload::guard_format_object_name(buffer, std::size(buffer), payload::kGuardSuffixEvent,
+                                           target.process_id, target.creation_time)) {
+        return false;
+    }
+    HANDLE event = ::OpenEventW(SYNCHRONIZE, FALSE, buffer);
+    if (event == nullptr) {
+        return false;
+    }
+    bool const signaled = ::WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    ::CloseHandle(event);
+    return signaled;
+}
+
+std::uint64_t synthetic_creation(int index) {
+    return 0x01DA000000000000ull + static_cast<std::uint64_t>(index) * 0x1000ull;
+}
+
+// 跑一个 actor（自己的线程）并返回它读到的记录形状。
+ActorOutcome run_guard_actor(GuardTarget const& target, bool conclude, bool conclusive,
+                             guard_actor_setup setup) {
+    ActorOutcome out;
+    run_actor_thread(target, conclude, conclusive, setup, out);
+    out.event_set_after = guard_event_signaled(target);
+    return out;
+}
+
+void run_guard_cases() {
+    namespace payload = deskfeed::payload;
+
+    // ---- 纯判定表：记录语义 + 名字格式 + 恢复映射 -------------------------------
+    if (wanted("guard/table")) {
+        // 名字：唯一出处生成，pid 十进制无前导零，creation 恰好 16 位小写十六进制。
+        wchar_t buffer[payload::kGuardNameCapacity]{};
+        check(payload::guard_format_object_name(buffer, std::size(buffer),
+                                                payload::kGuardSuffixMutex, 4321,
+                                                0x01DA123456789ABCull),
+              "guard/table formats a mutex object name");
+        std::wstring const expected =
+            L"Local\\DeskFeed-payload-guard-4321-01da123456789abc-mutex";
+        check(std::wstring(buffer) == expected, "guard/table the name is exactly the frozen format");
+        check(payload::guard_format_object_name(buffer, 10, payload::kGuardSuffixMutex, 4321,
+                                                0x01DA123456789ABCull) == false,
+              "guard/table refuses to truncate a name into a different object");
+        check(!payload::guard_format_object_name(nullptr, 64, payload::kGuardSuffixMutex, 1, 1),
+              "guard/table rejects a null buffer");
+
+        // 记录：init 之后是可信 Idle；三个写函数只改快照、头保持不变。
+        payload::GuardRecord record{};
+        payload::guard_init_new_record(record, 1);
+        check(payload::guard_header_ok(record), "guard/table a new record has a good header");
+        check(payload::guard_snapshot_ok(record), "guard/table a new record has a good snapshot");
+        check(payload::guard_classify(record) == GuardSnapshot::Idle,
+              "guard/table a new record classifies as Idle");
+
+        payload::guard_make_pending_no_tid(record, 2);
+        check(payload::guard_classify(record) == GuardSnapshot::PendingNoTid,
+              "guard/table pending-no-tid classifies");
+        check(record.tid == 0, "guard/table pending-no-tid carries no tid");
+        payload::guard_make_pending_tid(record, 0x1234, 3);
+        check(payload::guard_classify(record) == GuardSnapshot::PendingTid,
+              "guard/table pending-tid classifies");
+        check(record.tid == 0x1234, "guard/table pending-tid carries the tid");
+
+        // 逐项拒绝：头、reserved、state、tid 自洽、checksum。
+        payload::GuardRecord bad = record;
+        bad.size = 39;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects a wrong record size");
+        bad = record;
+        bad.version = 2;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects an unknown record version");
+        bad = record;
+        bad.reserved = 1;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects a non-zero reserved field");
+        bad = record;
+        bad.reserved2 = 1;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects a non-zero reserved2 field");
+        bad = record;
+        bad.state = 3;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects an unknown state value");
+        bad = record;
+        bad.tid = 0;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects pending-tid without a tid");
+        bad = record;
+        bad.tid = payload::kGuardMaxTid + 1;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects a tid above 32 bits (cannot be probed honestly)");
+        bad = record;
+        bad.tid = 0x99;
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects a torn snapshot (checksum mismatch)");
+        bad = record;
+        payload::guard_make_idle(bad, 9);
+        bad.tid = 7;
+        bad.checksum = payload::guard_snapshot_fnv(bad);
+        check(payload::guard_classify(bad) == GuardSnapshot::Unknown,
+              "guard/table rejects Idle carrying a tid");
+        payload::GuardRecord zero{};
+        check(payload::guard_classify(zero) == GuardSnapshot::Unknown,
+              "guard/table classifies an all-zero record as Unknown (fail closed)");
+
+        // 恢复表：唯一出处 guard_recovery + actor 侧的获取映射。
+        check(payload::guard_recovery(GuardSnapshot::Idle, GuardTidProbe::NotQueried) ==
+                  GuardRecovery::ClearAndContinue,
+              "guard/table Idle recovers");
+        check(payload::guard_recovery(GuardSnapshot::PendingTid, GuardTidProbe::Absent) ==
+                  GuardRecovery::ClearAndContinue,
+              "guard/table a gone entry thread recovers");
+        check(payload::guard_recovery(GuardSnapshot::PendingTid, GuardTidProbe::Present) ==
+                  GuardRecovery::KeepUncertain,
+              "guard/table a live entry thread stays uncertain");
+        check(payload::guard_recovery(GuardSnapshot::PendingTid, GuardTidProbe::LookupFailed) ==
+                  GuardRecovery::KeepUncertain,
+              "guard/table a failed tid lookup stays uncertain");
+        check(payload::guard_recovery(GuardSnapshot::PendingTid, GuardTidProbe::NotQueried) ==
+                  GuardRecovery::KeepUncertain,
+              "guard/table pending-tid without a probe stays uncertain");
+        check(payload::guard_recovery(GuardSnapshot::PendingNoTid, GuardTidProbe::Absent) ==
+                  GuardRecovery::KeepUncertain,
+              "guard/table pending-no-tid never recovers by itself");
+        check(payload::guard_recovery(GuardSnapshot::Unknown, GuardTidProbe::Absent) ==
+                  GuardRecovery::KeepUncertain,
+              "guard/table an unreadable record never recovers");
+
+        check(guard_acquire_from_recovery(GuardSnapshot::Idle, GuardTidProbe::NotQueried) ==
+                  GuardAcquire::Recovered,
+              "guard/table Idle maps to Recovered");
+        check(guard_acquire_from_recovery(GuardSnapshot::PendingNoTid, GuardTidProbe::Absent) ==
+                  GuardAcquire::Unknown,
+              "guard/table pending-no-tid maps to Unknown");
+        check(guard_acquire_allows_action(GuardAcquire::Acquired) &&
+                  guard_acquire_allows_action(GuardAcquire::Recovered),
+              "guard/table only Acquired/Recovered allow the action");
+        check(!guard_acquire_allows_action(GuardAcquire::Busy) &&
+                  !guard_acquire_allows_action(GuardAcquire::Unknown) &&
+                  !guard_acquire_allows_action(GuardAcquire::Error),
+              "guard/table Busy/Unknown/Error never allow the action");
+
+        // Toolhelp 事实：零/超限 TID 一律不可证；不存在的 TID 是 Absent。
+        check(guard_probe_thread(::GetCurrentProcessId(), 0) == GuardTidProbe::LookupFailed,
+              "guard/table a zero tid is not provably absent");
+        check(guard_probe_thread(::GetCurrentProcessId(), payload::kGuardMaxTid + 1) ==
+                  GuardTidProbe::LookupFailed,
+              "guard/table an over-wide tid is not provably absent");
+        check(guard_probe_thread(::GetCurrentProcessId(), 0xF0000000ull) == GuardTidProbe::Absent,
+              "guard/table a tid that cannot exist is absent");
+        check(guard_probe_thread(::GetCurrentProcessId(), ::GetCurrentThreadId()) ==
+                  GuardTidProbe::Present,
+              "guard/table the current thread is present in its own process");
+    }
+
+    // ---- 崩掉的 actor 留下 really-abandoned：Idle 可以解除 ----------------------
+    if (wanted("guard/abandoned-idle")) {
+        GuardTarget const target{39001, synthetic_creation(1)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error), "guard/abandoned-idle keeper holds the objects");
+
+        ActorOutcome const crasher = run_guard_actor(
+            target, false, false, [](GuardLease& lease, ActorOutcome& out) {
+                std::wstring write_error;
+                if (!lease.note_remote_call_settled(write_error)) {
+                    out.error = write_error;
+                }
+            });
+        check(crasher.outcome == GuardAcquire::Acquired,
+              "guard/abandoned-idle the first actor acquired the lease");
+        keeper.set_event();  // 模拟"上一次未知"残留：干净恢复必须把它清掉
+
+        ActorOutcome const recovered = run_guard_actor(
+            target, true, true, [](GuardLease&, ActorOutcome&) {});
+        check(recovered.outcome == GuardAcquire::Recovered,
+              "guard/abandoned-idle a crashed-actor Idle record recovers");
+        check(recovered.concluded, "guard/abandoned-idle the recovering actor concludes clean");
+        check(!guard_event_signaled(target),
+              "guard/abandoned-idle recovery clears the sticky uncertainty event");
+        check(keeper.record->state == payload::kGuardStateIdle,
+              "guard/abandoned-idle the record is rewritten to Idle");
+    }
+
+    // ---- PendingNoTid：本会话永久不确定，事件保持 ------------------------------
+    if (wanted("guard/abandoned-pending-no-tid")) {
+        GuardTarget const target{39002, synthetic_creation(2)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error), "guard/abandoned-pending-no-tid keeper holds objects");
+
+        ActorOutcome const crasher = run_guard_actor(
+            target, false, false, [](GuardLease& lease, ActorOutcome& out) {
+                std::wstring write_error;
+                if (!lease.note_remote_call_pending(write_error)) {
+                    out.error = write_error;
+                }
+            });
+        check(crasher.outcome == GuardAcquire::Acquired,
+              "guard/abandoned-pending-no-tid the first actor acquired");
+
+        ActorOutcome const blocked = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(blocked.outcome == GuardAcquire::Unknown,
+              "guard/abandoned-pending-no-tid a pending-no-tid crash stays Unknown");
+        check(!guard_acquire_allows_action(blocked.outcome),
+              "guard/abandoned-pending-no-tid the next actor must not touch the target");
+        check(guard_event_signaled(target),
+              "guard/abandoned-pending-no-tid the sticky uncertainty event is set");
+        check(keeper.record->state == payload::kGuardStatePendingNoTid &&
+                  keeper.record->tid == 0,
+              "guard/abandoned-pending-no-tid the pending record is left untouched");
+    }
+
+    // ---- PendingTid + 该 TID 真的没了：可以解除 --------------------------------
+    if (wanted("guard/abandoned-pending-tid-dead")) {
+        GuardTarget const target{39003, synthetic_creation(3)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error),
+              "guard/abandoned-pending-tid-dead keeper holds objects");
+
+        // 记录的是 crasher 那条线程自己的 TID：线程退出后它必然不在。
+        ActorOutcome const crasher = run_guard_actor(
+            target, false, false, [](GuardLease& lease, ActorOutcome& out) {
+                std::wstring write_error;
+                if (!lease.note_remote_call_started(::GetCurrentThreadId(), write_error)) {
+                    out.error = write_error;
+                }
+            });
+        check(crasher.outcome == GuardAcquire::Acquired,
+              "guard/abandoned-pending-tid-dead the first actor acquired");
+        check(keeper.record->state == payload::kGuardStatePendingTid,
+              "guard/abandoned-pending-tid-dead the record names the entry thread");
+
+        ActorOutcome const recovered = run_guard_actor(
+            target, true, true, [](GuardLease&, ActorOutcome&) {});
+        check(recovered.outcome == GuardAcquire::Recovered,
+              "guard/abandoned-pending-tid-dead a gone entry thread recovers");
+        check(!guard_event_signaled(target),
+              "guard/abandoned-pending-tid-dead recovery clears the sticky event");
+    }
+
+    // ---- PendingTid + 该 TID 仍然活着：拒绝，直到它真的没了 --------------------
+    if (wanted("guard/abandoned-pending-tid-live")) {
+        GuardTarget target{};
+        std::wstring error;
+        check(guard_target_identity(::GetCurrentProcessId(), target, error),
+              "guard/abandoned-pending-tid-live captured this process identity");
+
+        // 一条真的活着、而且稍后会被结束的线程：它扮演"还在模块里执行的入口线程"。
+        HANDLE victim = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::atomic<bool> stop_victim{false};
+        std::thread victim_thread([&]() {
+            while (!stop_victim.load()) {
+                ::WaitForSingleObject(victim, 10);
+            }
+        });
+        unsigned long const victim_tid = ::GetThreadId(victim_thread.native_handle());
+
+        GuardObjects keeper;
+        check(keeper.open(target, true, error),
+              "guard/abandoned-pending-tid-live keeper holds objects");
+
+        ActorOutcome const crasher = run_guard_actor(
+            target, false, false, [victim_tid](GuardLease& lease, ActorOutcome& out) {
+                std::wstring write_error;
+                if (!lease.note_remote_call_started(victim_tid, write_error)) {
+                    out.error = write_error;
+                }
+            });
+        check(crasher.outcome == GuardAcquire::Acquired,
+              "guard/abandoned-pending-tid-live the first actor acquired");
+
+        ActorOutcome const blocked = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(blocked.outcome == GuardAcquire::Unknown,
+              "guard/abandoned-pending-tid-live a live entry thread keeps the target uncertain");
+        check(guard_event_signaled(target),
+              "guard/abandoned-pending-tid-live the sticky event is set");
+
+        // 让那条入口线程真的退出，再试一次：这一次记录能证明干净。
+        stop_victim.store(true);
+        victim_thread.join();
+        ::CloseHandle(victim);
+
+        ActorOutcome const recovered = run_guard_actor(
+            target, true, true, [](GuardLease&, ActorOutcome&) {});
+        check(recovered.outcome == GuardAcquire::Recovered,
+              "guard/abandoned-pending-tid-live recovery happens once the entry thread is gone");
+        check(!guard_event_signaled(target),
+              "guard/abandoned-pending-tid-live recovery clears the sticky event");
+    }
+
+    // ---- 零 header：未知，绝不当成"没有不确定性"也不许覆盖 ---------------------
+    if (wanted("guard/zero-header")) {
+        GuardTarget const target{39004, synthetic_creation(4)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, false, error), "guard/zero-header keeper created a zero record");
+
+        ActorOutcome const blocked = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(blocked.outcome == GuardAcquire::Unknown,
+              "guard/zero-header a zero record is Unknown");
+        check(guard_event_signaled(target),
+              "guard/zero-header the sticky event is set for a zero record");
+        check(keeper.record->size == 0 && keeper.record->version == 0,
+              "guard/zero-header the unknown record is left exactly as it was");
+    }
+
+    // ---- 坏 version：未知，且不许自愈覆盖 --------------------------------------
+    if (wanted("guard/bad-version")) {
+        GuardTarget const target{39005, synthetic_creation(5)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error), "guard/bad-version keeper created a good record");
+        keeper.record->version = 99;  // 模拟旧格式/别人写的记录
+        keeper.record->checksum = payload::guard_snapshot_fnv(*keeper.record);
+
+        ActorOutcome const blocked = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(blocked.outcome == GuardAcquire::Unknown,
+              "guard/bad-version an unknown record version is Unknown");
+        check(keeper.record->version == 99,
+              "guard/bad-version the unknown record is never self-healed or overwritten");
+        check(guard_event_signaled(target),
+              "guard/bad-version the sticky event is set for a bad version");
+    }
+
+    // ---- 释放谓词：只有一个释放点，而且要有可观测量 ----------------------------
+    if (wanted("guard/release-predicate")) {
+        GuardTarget const target{39006, synthetic_creation(6)};
+        GuardLease holder;
+        std::wstring error;
+        check(holder.acquire(target, error) == GuardAcquire::Acquired,
+              "guard/release-predicate the first actor acquired");
+
+        // 第二个 actor 用 0 超时去抢：拿不到就是"上一位还没释放"的可观测证据。
+        ActorOutcome const busy = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(busy.outcome == GuardAcquire::Busy,
+              "guard/release-predicate a second actor cannot enter while the lease is held");
+
+        // 有未决远程调用：谓词不成立，绝不释放。
+        std::wstring write_error;
+        check(holder.note_remote_call_pending(write_error),
+              "guard/release-predicate recorded a pending remote call");
+        holder.note_action_conclusive(true);
+        std::wstring conclude_error;
+        check(!holder.conclude_clean(conclude_error),
+              "guard/release-predicate refuses to release while a call is pending");
+        ActorOutcome const still_busy = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(still_busy.outcome == GuardAcquire::Busy,
+              "guard/release-predicate a refused release really did not release");
+
+        // 动作没定论：同样不释放。
+        check(holder.note_remote_call_settled(write_error),
+              "guard/release-predicate the pending call settled");
+        holder.note_action_conclusive(false);
+        check(!holder.conclude_clean(conclude_error),
+              "guard/release-predicate refuses to release an inconclusive action");
+        ActorOutcome const busy_again = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(busy_again.outcome == GuardAcquire::Busy,
+              "guard/release-predicate an inconclusive action keeps holding the lease");
+
+        // 谓词成立：释放，第二个 actor 立刻能进来。
+        holder.note_action_conclusive(true);
+        check(holder.conclude_clean(conclude_error),
+              "guard/release-predicate releases once the predicate holds");
+        ActorOutcome const admitted = run_guard_actor(
+            target, true, true, [](GuardLease&, ActorOutcome&) {});
+        check(admitted.outcome == GuardAcquire::Acquired,
+              "guard/release-predicate the next actor is admitted after a clean release");
+    }
+
+    // ---- 同线程递归 acquire 不能把粘性未知抹掉（Win32 mutex 是递归的） -------------
+    if (wanted("guard/recursive-same-thread")) {
+        GuardTarget const target{39007, synthetic_creation(7)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error), "guard/recursive-same-thread keeper holds objects");
+
+        ActorOutcome first;
+        GuardAcquire second_outcome = GuardAcquire::Error;
+        std::wstring second_error;
+        std::atomic<bool> ready{false};
+        std::atomic<bool> proceed{false};
+
+        std::thread t1([&]() {
+            GuardLease lease1;
+            std::wstring acquire_error;
+            first.outcome = lease1.acquire(target, acquire_error);
+            first.error = acquire_error;
+            if (first.outcome != GuardAcquire::Acquired) {
+                ready.store(true);  // 失败也要放主线程往下走，绝不挂住用例
+                return;
+            }
+            // 记录留在 Idle，但这一次动作**没有定论**：这正是"watch 第一轮崩在收尾之前"的形状。
+            lease1.abandon_unknown();
+            ready.store(true);
+            while (!proceed.load()) {
+                ::Sleep(1);  // 先让主线程观察到"另一条线程被挡在外面"
+            }
+            // 同一条线程再来一次：这里拿到的是 WAIT_OBJECT_0（递归），绝不能被当成"良性残留"。
+            GuardLease lease2;
+            std::wstring second_acquire_error;
+            second_outcome = lease2.acquire(target, second_acquire_error);
+            second_error = second_acquire_error;
+            if (lease2.held()) {
+                lease2.abandon_unknown();
+            }
+        });
+
+        while (!ready.load()) {
+            ::Sleep(1);
+        }
+        ActorOutcome const held_out = run_guard_actor(
+            target, false, false, [](GuardLease&, ActorOutcome&) {});
+        check(held_out.outcome == GuardAcquire::Busy,
+              "guard/recursive-same-thread another thread is held out while the owner thread lives");
+
+        proceed.store(true);
+        t1.join();  // 原线程真的结束：内核这才把 mutex 标成 abandoned
+
+        check(first.outcome == GuardAcquire::Acquired,
+              "guard/recursive-same-thread the first acquire succeeded");
+        check(second_outcome == GuardAcquire::Unknown,
+              "guard/recursive-same-thread a same-thread recursive acquire must not treat the sticky "
+              "event as a benign leftover");
+        check(guard_event_signaled(target),
+              "guard/recursive-same-thread the sticky event survives the recursive acquire");
+        check(keeper.record->state == payload::kGuardStateIdle,
+              "guard/recursive-same-thread the record is still the abandoned Idle (no self-heal)");
+
+        ActorOutcome const recovered = run_guard_actor(
+            target, true, true, [](GuardLease&, ActorOutcome&) {});
+        check(recovered.outcome == GuardAcquire::Recovered,
+              "guard/recursive-same-thread recovery happens only after the owner thread really ended");
+        check(!guard_event_signaled(target),
+              "guard/recursive-same-thread recovery clears the sticky event");
+    }
+
+    // ---- abandon 过的实例绝不允许复用（复用会关掉事实句柄 + 同线程递归） -----------
+    if (wanted("guard/no-instance-reuse")) {
+        GuardTarget const target{39008, synthetic_creation(8)};
+        GuardObjects keeper;
+        std::wstring error;
+        check(keeper.open(target, true, error), "guard/no-instance-reuse keeper holds objects");
+
+        GuardLease instance;
+        check(instance.acquire(target, error) == GuardAcquire::Acquired,
+              "guard/no-instance-reuse acquired once");
+        instance.abandon_unknown();
+
+        std::wstring reuse_error;
+        check(instance.acquire(target, reuse_error) == GuardAcquire::Error,
+              "guard/no-instance-reuse refuses to reuse an abandoned instance");
+        check(reuse_error.find(L"must not be reused") != std::wstring::npos,
+              "guard/no-instance-reuse explains why it must not be reused");
+        check(guard_event_signaled(target),
+              "guard/no-instance-reuse the refused reuse left the fact handles (and the event) alone");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1404,6 +2386,8 @@ int main(int argc, char** argv) {
     run_mailbox_latest_cases();
     run_mailbox_owner_death_case();
     run_remote_late_write_case();
+    run_park_cases();
+    run_guard_cases();
     run_state_gate_cases();
     run_frame_cases();
     run_gate_cases();

@@ -239,8 +239,13 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
 
     RemoteCall call;
     std::wstring fetch_error;
-    if (!remote_fetch_pod(process_id, module.base, verified_rva, &pod, sizeof(pod), 5000, call,
-                          fetch_error)) {
+    bool const fetched = remote_fetch_pod(process_id, module.base, verified_rva, &pod, sizeof(pod),
+                                          5000, call, fetch_error);
+    // 本批（primitive）：这条路径仍按"未知即报告"收尾，句柄在这里显式收掉（缓冲的释放规则由
+    // `remote_fetch_pod` 自己守，与句柄无关）。N3a 的 actor 会在持有租约的同一条线程上改用
+    // `park_remote_call()`，把"有一次入口调用没有回来"变成实际的 signal 或目标死亡。
+    release_remote_call(call);
+    if (!fetched) {
         // 超时/未创建/读回失败：结论未知。绝不能当成 Inactive（那会让调用方去 Stop 一个可能正有
         // 远程线程在它代码里执行的模块）。
         out.state = PayloadState::MappedUnverifiable;

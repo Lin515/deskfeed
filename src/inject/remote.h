@@ -34,12 +34,64 @@ struct ModuleEntry {
 //
 // `signaled == false` 表示线程在超时内没有退出——**这不等于"动作没有发生"**：调用方不得据此
 // 重试、强卸或认为目标进程状态未变。`exit_code` 只在线程确实退出后有效。
+//
+// 句柄归属：线程没在等待期内退出时，`thread` **保持打开**（M4：不许用"超时 + CloseHandle"把
+// "有一次入口调用没回来"这个事实扔掉）。每一个未决的调用都必须被恰好一次地收尾：
+//   * `park_remote_call(...)`——等到真实 signal 或真实目标死亡，拿到**实际**结论；
+//   * `release_remote_call(...)`——放弃观察，只关句柄（事实由调用方按"未知"记录）。
+// 本结构返回时是移动语义的事实来源，**不要拷贝**（拷贝会让两个对象都认为自己拥有 `thread`）。
 struct RemoteCall {
     bool thread_created = false;
-    bool signaled = false;
+    bool signaled = false;       // 线程确实退出（可能是在 parking 期间观察到的）
+    bool completed_late = false; // 等待期内没退出，是后来 parking 观察到真实退出的
+    bool target_died = false;    // parking 期间捕获的那个目标进程先死了：入口线程随进程消失
     DWORD exit_code = 0;
+    unsigned long thread_id = 0; // CreateRemoteThread 拿到的真实 TID（记录 pending 用）
+    HANDLE thread = nullptr;     // 未决调用持有的真实线程句柄；见上面的收尾规则
     std::wstring error;
 };
+
+// "这次远程调用还没有结论"（线程已创建、但没观察到它退出）。这样的调用必须 park 或显式释放。
+bool remote_call_unresolved(RemoteCall const& call);
+
+// "这次调用的结论是实际的"：要么从未执行（CreateRemoteThread 失败），要么线程真的退出了。
+// `completed_late` 用来把"迟到但真实的完成"与"从未执行"区分开——两者都不是 Unknown。
+bool remote_call_actual(RemoteCall const& call);
+
+// 目标进程句柄：一次动作**只开一次**，并把打开时读到的创建时间当作身份。PID 会被复用，所以
+// "还是当初那个进程"的判断一律基于这个真实的 hProcess + creation_time，而不是后来按 PID 重开。
+// 句柄带 SYNCHRONIZE，所以 parking 能观察到"目标进程死亡"这个独立事实。
+struct TargetProcess {
+    HANDLE process = nullptr;
+    unsigned long process_id = 0;
+    std::uint64_t creation_time = 0;
+};
+
+// 打开并捕获身份。`expected_creation_time != 0` 时核对（对不上 = PID 复用/换了一个进程，拒绝）。
+// 目标刚刚死亡时仍会成功：句柄有效、创建时间可读，"是否活着"用 `target_process_alive` 单独问。
+bool open_target_process(unsigned long process_id, std::uint64_t expected_creation_time,
+                         TargetProcess& out, std::wstring& error);
+void close_target_process(TargetProcess& target);
+bool target_process_alive(TargetProcess const& target);
+
+// Parking 的结论。**除 `ThreadSignaled` 外，一律不得当成"卸载可以继续"**。
+enum class ParkResult {
+    ThreadSignaled,  // 真实 signal：`signaled/exit_code/completed_late` 已更新，结论是实际的
+    TargetDied,      // 捕获的那个目标进程先死了：模块已随进程消失（不等于"已卸载"）
+    Interrupted,     // 打断事件置位：结论**仍然未知**，句柄与缓冲一律保留
+    NotPending,      // 没有未决的调用（从未创建 / 已经退出）：无需 park
+    Error,           // 参数或系统调用失败：结论未知，保留事实
+};
+
+// 在**持有租约的同一条线程**上等到真实结论：真实线程 signal 或真实目标进程死亡。`tick_ms` 只是
+// 周期性日志/让出时间片的粒度，**不是**放弃等待的期限——到点继续等，绝不 CloseHandle 之后当成功。
+// `target_process` 必须是带 SYNCHRONIZE 的捕获句柄（nullptr 直接 Error：不假装能观察目标死亡）。
+// `interrupt_event` 非空时置位会让它返回 `Interrupted`（结论仍然未知，调用方必须保留）。
+ParkResult park_remote_call(RemoteCall& call, HANDLE target_process, DWORD tick_ms,
+                            HANDLE interrupt_event = nullptr);
+
+// 关闭未决调用持有的线程句柄（幂等）。**不等于**把结论变干净：调用方仍须按"未知"记录事实。
+void release_remote_call(RemoteCall& call);
 
 std::wstring file_name_of(std::wstring const& path);
 
@@ -116,6 +168,11 @@ bool eject_library(unsigned long process_id, unsigned long long module_base, std
 // 已写好的缓冲地址（状态 POD 就是后者）。
 RemoteCall call_remote_export(unsigned long process_id, unsigned long long module_base,
                               unsigned long export_rva, void* parameter, DWORD wait_ms);
+
+// 同一件事，但在**已经打开的**目标进程句柄上做（不再按 PID 重开一次）。这是 parking 需要的形状：
+// "这次调用属于哪个进程"由捕获的那个 hProcess 决定，而不是由稍后可能被复用的 PID 决定。
+RemoteCall call_remote_export_on(HANDLE target_process, unsigned long long module_base,
+                                 unsigned long export_rva, void* parameter, DWORD wait_ms);
 
 // 目标进程里的一块定长缓冲。定长 + 调用方给它填 `size`/`abi` 的头部，是"不跨进程传指针"的
 // 安全 ABI：远程函数只写这块缓冲，调用方再读回来。

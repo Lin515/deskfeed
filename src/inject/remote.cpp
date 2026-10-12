@@ -108,19 +108,24 @@ std::uint64_t file_time_value(FILETIME const& time) {
 
 RemoteCall run_remote_thread(HANDLE process, void* start, void* parameter, DWORD wait_ms) {
     RemoteCall result;
+    DWORD thread_id = 0;
     HANDLE thread = ::CreateRemoteThread(process, nullptr, 0,
                                          reinterpret_cast<LPTHREAD_START_ROUTINE>(start), parameter,
-                                         0, nullptr);
+                                         0, &thread_id);
     if (thread == nullptr) {
         result.error = L"CreateRemoteThread failed: " + deskfeed::last_error_text();
         return result;
     }
     result.thread_created = true;
+    result.thread_id = thread_id;
 
     if (::WaitForSingleObject(thread, wait_ms) != WAIT_OBJECT_0) {
-        // 线程没在期限内退出：不关线程句柄就直接返回会让句柄泄漏，关掉它不会结束线程。
-        result.error = L"the remote thread did not exit within the timeout";
-        ::CloseHandle(thread);
+        // 线程没在期限内退出：**保留句柄**。M4 的要点就在这里——"有一次入口调用没有回来"是必须
+        // 被带进决策的事实，关掉句柄就等于把它扔掉。调用方必须 park（等到真实 signal 或目标进程
+        // 死亡）或显式 release，二者必居其一。
+        result.thread = thread;
+        result.error = L"the remote thread did not exit within the timeout; its handle is kept open "
+                       L"so the caller can wait for the real result or report it as unknown";
         return result;
     }
 
@@ -476,7 +481,7 @@ bool inject_library(unsigned long process_id, std::wstring const& dll_path, Modu
         // 装载可能比 30 秒更久（网络驱动器上的 DLL、安全软件扫描），但**超时不算成功**：
         // 线程没退出时 DllMain 可能还在跑，调用方接着调 DeskFeedStart 就是在没初始化完的模块里
         // 执行代码。这里只报告"结论不确定"，模块保持映射，由调用方稍后复查。
-        RemoteCall const call = run_remote_thread(process, load_library, remote_path, 30000);
+        RemoteCall call = run_remote_thread(process, load_library, remote_path, 30000);
 
         // 远程缓冲只在"线程从未创建"或"线程确实退出"后释放。超时释放就是 use-after-free：
         // 目标进程里的 LoadLibraryW 可能还在读那个路径串。短命注入器可以安全地把它泄露到
@@ -489,6 +494,11 @@ bool inject_library(unsigned long process_id, std::wstring const& dll_path, Modu
                                  static_cast<unsigned long long>(
                                      reinterpret_cast<unsigned long long>(remote_path)));
         }
+
+        // 本批（primitive）：这条路径仍按"未知即报告"收尾，句柄在这里显式收掉。N3a 的 actor 会在
+        // 持有租约的同一条线程上改用 park_remote_call()，把"有一次入口调用没回来"变成实际的
+        // signal 或目标死亡，而不是在这里放弃观察。
+        release_remote_call(call);
 
         if (!call.thread_created) {
             error = call.error;
@@ -547,8 +557,11 @@ bool eject_library(unsigned long process_id, unsigned long long module_base, std
             break;
         }
 
-        RemoteCall const call = run_remote_thread(
-            process, free_library, reinterpret_cast<void*>(module_base), 15000);
+        RemoteCall call =
+            run_remote_thread(process, free_library, reinterpret_cast<void*>(module_base), 15000);
+        // 同上：本批先把句柄显式收掉（事实按"未知"报告）；N3a 的 actor 在持有租约时会 park 到
+        // 真实 signal 或目标死亡，再决定模块是否真的消失。
+        release_remote_call(call);
         if (!call.thread_created) {
             error = call.error;
             break;
@@ -591,6 +604,180 @@ RemoteCall call_remote_export(unsigned long process_id, unsigned long long modul
                               unsigned long export_rva, void* parameter, DWORD wait_ms) {
     void* const start = reinterpret_cast<void*>(module_base + export_rva);
     return call_remote_thread(process_id, start, parameter, wait_ms);
+}
+
+RemoteCall call_remote_export_on(HANDLE target_process, unsigned long long module_base,
+                                 unsigned long export_rva, void* parameter, DWORD wait_ms) {
+    RemoteCall result;
+    if (target_process == nullptr) {
+        result.error = L"no target process handle was captured for this action";
+        return result;
+    }
+    void* const start = reinterpret_cast<void*>(module_base + export_rva);
+    return run_remote_thread(target_process, start, parameter, wait_ms);
+}
+
+bool remote_call_unresolved(RemoteCall const& call) {
+    return call.thread_created && !call.signaled;
+}
+
+bool remote_call_actual(RemoteCall const& call) {
+    // 只有两种情况是"实际的"：从未执行（线程没有创建），或线程真的退出（含 parking 观察到的）。
+    // 未决的调用、以及停车期间目标死亡，都不是"这次调用有结论"。
+    return !call.thread_created || call.signaled;
+}
+
+bool open_target_process(unsigned long process_id, std::uint64_t expected_creation_time,
+                         TargetProcess& out, std::wstring& error) {
+    out = TargetProcess{};
+
+    TargetProcess target;
+    target.process = ::OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION |
+                                       PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+                                       SYNCHRONIZE,
+                                   FALSE, process_id);
+    if (target.process == nullptr) {
+        error = L"OpenProcess failed: " + deskfeed::last_error_text();
+        return false;
+    }
+
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (::GetProcessTimes(target.process, &created, &exited, &kernel, &user) == FALSE) {
+        error = L"GetProcessTimes failed: " + deskfeed::last_error_text();
+        ::CloseHandle(target.process);
+        return false;
+    }
+
+    target.process_id = process_id;
+    target.creation_time = file_time_value(created);
+    if (target.creation_time == 0) {
+        // 没有创建时间就没有身份：任何"还是当初那个进程"的判断都失去依据。
+        error = L"the target process creation time reads as 0; refusing to treat this pid as an "
+                L"identity";
+        ::CloseHandle(target.process);
+        return false;
+    }
+    if (expected_creation_time != 0 && target.creation_time != expected_creation_time) {
+        error = L"pid " + std::to_wstring(process_id) +
+                L" is not the process that was captured: creation time " +
+                deskfeed::hex_text(target.creation_time) + L" vs expected " +
+                deskfeed::hex_text(expected_creation_time);
+        ::CloseHandle(target.process);
+        return false;
+    }
+
+    out = target;
+    return true;
+}
+
+void close_target_process(TargetProcess& target) {
+    if (target.process != nullptr) {
+        ::CloseHandle(target.process);
+    }
+    target = TargetProcess{};
+}
+
+bool target_process_alive(TargetProcess const& target) {
+    return target.process != nullptr && ::WaitForSingleObject(target.process, 0) == WAIT_TIMEOUT;
+}
+
+void release_remote_call(RemoteCall& call) {
+    if (call.thread != nullptr) {
+        ::CloseHandle(call.thread);
+        call.thread = nullptr;
+    }
+}
+
+ParkResult park_remote_call(RemoteCall& call, HANDLE target_process, DWORD tick_ms,
+                            HANDLE interrupt_event) {
+    if (!call.thread_created || call.signaled) {
+        release_remote_call(call);
+        return ParkResult::NotPending;
+    }
+    if (call.thread == nullptr || target_process == nullptr) {
+        // 没有可等的线程句柄，或没有能观察"目标死亡"的进程句柄：绝不假装等到了结论。
+        if (call.error.empty()) {
+            call.error = L"the remote call is unresolved but there is no handle to wait on";
+        }
+        return ParkResult::Error;
+    }
+    if (tick_ms == 0) {
+        tick_ms = 1000;
+    }
+
+    HANDLE waits[3] = {call.thread, target_process, interrupt_event};
+    DWORD const wait_count = interrupt_event != nullptr ? 3u : 2u;
+    unsigned long long quiet_ms = 0;
+
+    for (;;) {
+        // 目标进程死亡优先判定：线程句柄会随进程一起 signal，但"随进程消失"不是"这次调用有
+        // 结论"。先问进程，才能把 target death 与真实入口退出分开。
+        if (::WaitForSingleObject(target_process, 0) == WAIT_OBJECT_0) {
+            call.target_died = true;
+            call.error = L"the target process died while the remote entry thread was still running; "
+                         L"the module went away with it, which is not the same as a clean unload";
+            return ParkResult::TargetDied;
+        }
+
+        DWORD const waited = ::WaitForMultipleObjects(wait_count, waits, FALSE, tick_ms);
+        if (waited == WAIT_TIMEOUT) {
+            // 到点只是"让出时间片 + 打一行"，**不是**放弃等待：继续等真实结论。
+            quiet_ms += tick_ms;
+            if (quiet_ms >= 5000) {
+                quiet_ms = 0;
+                deskfeed::log_format(L"note: still waiting for the remote entry thread (tid %lu) or "
+                                     L"the target process to reach a real conclusion",
+                                     call.thread_id);
+            }
+            continue;
+        }
+        if (waited == WAIT_OBJECT_0) {
+            if (::WaitForSingleObject(target_process, 0) == WAIT_OBJECT_0) {
+                call.target_died = true;
+                call.error = L"the target process died while the remote entry thread was still "
+                             L"running; the module went away with it";
+                return ParkResult::TargetDied;
+            }
+            // 进程被结束时，线程句柄先 signal、进程对象后收尾，两者相差几毫秒。这段时间里报"入口
+            // 自己返回了"就是把"目标没了"说成"调用有结论"。所以下结论前给进程一个很短的收尾窗口：
+            // 窗口内进程 signal 一律按 TargetDied 处理——方向是 fail closed（宁可少报一次"入口
+            // 正常返回"，也不把目标消失当成干净的调用结论）。
+            for (int settle = 0; settle < 5; ++settle) {
+                if (::WaitForSingleObject(target_process, 20) == WAIT_OBJECT_0) {
+                    call.target_died = true;
+                    call.error = L"the target process died while the remote entry thread was still "
+                                 L"running; the module went away with it";
+                    return ParkResult::TargetDied;
+                }
+            }
+            DWORD exit_code = 0;
+            if (::GetExitCodeThread(call.thread, &exit_code) == FALSE) {
+                call.error = L"the remote thread signalled but its exit code could not be read: " +
+                             deskfeed::last_error_text();
+                return ParkResult::Error;
+            }
+            call.signaled = true;
+            call.completed_late = true;
+            call.exit_code = exit_code;
+            return ParkResult::ThreadSignaled;
+        }
+        if (waited == WAIT_OBJECT_0 + 1) {
+            call.target_died = true;
+            call.error = L"the target process died while the remote entry thread was still running; "
+                         L"the module went away with it";
+            return ParkResult::TargetDied;
+        }
+        if (wait_count == 3 && waited == WAIT_OBJECT_0 + 2) {
+            // 打断事件：结论仍然未知。句柄与缓冲一律保留，由调用方按"未知"记录。
+            return ParkResult::Interrupted;
+        }
+
+        call.error = L"WaitForMultipleObjects failed: " + deskfeed::last_error_text();
+        return ParkResult::Error;
+    }
 }
 
 bool remote_alloc(unsigned long process_id, std::size_t bytes, RemoteBuffer& out, std::wstring& error) {

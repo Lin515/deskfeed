@@ -9,7 +9,8 @@ explorer.exe、按需撤下来、报告它是否真的在工作。它是主进�
 | `main.cpp` | 命令行：`--load` / `--stop` / `--status` / `--watch` 与 `--payload` / `--scope` / `--dry-run` / `--no-unload` / `--interval` / `--once`；日志写 `%LOCALAPPDATA%\DeskFeed\deskfeed-inject.log`（每次截断）。 |
 | `actions.h` / `actions.cpp` | 四个动作本身：装载前的状态复查与残留清理、装载并调 `DeskFeedStart`、按门禁撤下、状态查询、watch 的一轮；`unload_decision()` 是卸载门禁的**纯函数**，可以被离线用例直接咬住。 |
 | `target.h` / `target.cpp` | 目标解析：任务栏属主（`Shell_TrayWnd`，次选 `Shell_SecondaryTrayWnd`），找不到就拒绝；`--scope` 走实例名白名单。 |
-| `remote.h` / `remote.cpp` | 远程原语：进程/模块枚举、`CreateRemoteThread` 的一次调用（返回真实退出码与"是否已退出"）、`LoadLibraryW` 装载、`FreeLibrary` 卸载、以及一块定长缓冲的读写（安全 POD ABI）。 |
+| `remote.h` / `remote.cpp` | 远程原语：进程/模块枚举、`CreateRemoteThread` 的一次调用（返回真实退出码与"是否已退出"）、`LoadLibraryW` 装载、`FreeLibrary` 卸载、以及一块定长缓冲的读写（安全 POD ABI）；未决调用**保留**真实线程句柄，并能在捕获的那个目标进程句柄上 park 到真实结论。 |
+| `guard.h` / `guard.cpp` | per-target 租约：命名 mutex + 粘性不确定事件 + 命名记录（布局唯一出处是 `src/payload/guard_record.h`），以及"崩掉的 actor 由下一位解除"的恢复判定。 |
 | `pe_export.h` / `pe_export.cpp` | 从**磁盘上的 PE 文件**解析导出函数的 RVA（经节表换算），并**拒绝转发导出**。 |
 | `status_pod.h` | 负载生命周期状态的固定 POD（提议版，见下面"状态"）。 |
 | `payload_status.h` / `payload_status.cpp` | 把"模块映射着"升级成"可证明在工作"：远程 `DeskFeedGetStatus` + 只读读一遍显示邮箱帧头里的生产者身份。 |
@@ -90,6 +91,56 @@ deskfeed-inject.exe --watch  [--scope <NAME>] [--interval <秒>] [--once] [--dry
   会被截断，绝不能当基址用。
 - **不按镜像名杀进程、不强行卸载、不替换任何窗口过程**：本工具只做"装载/卸载一个 DLL、调它
   导出的三个入口、读写它的一块定长状态缓冲"。
+
+## 租约：同一次动作只有一个 actor，崩掉的 actor 可以被解除
+
+三个命名内核对象（唯一出处 `src/payload/guard_record.h`，两侧都用它的 `guard_format_object_name`
+生成，禁止手拼）：
+
+```text
+Local\DeskFeed-payload-guard-<pid>-<creationhex>-mutex
+Local\DeskFeed-payload-guard-<pid>-<creationhex>-event
+Local\DeskFeed-payload-guard-<pid>-<creationhex>-record
+```
+
+- `<pid>`/`<creationhex>` 是**目标进程**的实际 PID 与它被捕获时的创建时间。PID 会被复用，所以
+  身份判断一律带创建时间；一次动作只开一个进程句柄（`TargetProcess`），不靠后来按 PID 重开。
+- **mutex**：一次动作只允许一个 actor；`WAIT_TIMEOUT` = 别人正在动作，**不排队、不强抢**。
+  `WAIT_ABANDONED` = 上一位 actor 崩了（内核事实），由本 actor 持锁读记录判定。
+- **event**：manual-reset **粘性**不确定事件。置位即"有未证实的入口"，此期间**绝不卸载**；只有
+  记录能证明干净时才清掉它。
+- **record**：40 字节、无指针、版本化（`size/version` 是不可变头，其余是 actor 快照 + FNV-1a）。
+  工具侧**只转发**这份布局 + `static_assert`，不再自带第二份副本。
+
+获取与恢复（全部在持锁状态下）：
+
+| 情形 | 结论 |
+| --- | --- |
+| 正常持有 + 记录 `Idle` | `Acquired`：清掉良性残留事件，开始本次动作 |
+| `WAIT_ABANDONED` + 记录 `Idle` | `Recovered`：清事件 + 把记录重写成 `Idle`，继续 |
+| `WAIT_ABANDONED` + `PendingTid{tid}` 且 Toolhelp 确认该 TID **已不在** | `Recovered`（TID 复用只会 false-retain，方向安全） |
+| `WAIT_ABANDONED` + `PendingTid` 仍在 / 查询失败 / `PendingNoTid` / 坏 header / 版本或 CRC 不认 | `Unknown`：**置粘性事件**，本次不做任何 Stop/eject/Start |
+| 正常持有却看到 `Pending*`（有人违反写序） | `Unknown`：同样 fail closed |
+
+写序（actor 是记录的唯一写者）：`PendingNoTid` 必须在 `CreateRemoteThread` **之前**写入 →
+拿到 TID 后写 `PendingTid{tid}` → 远程调用**真实返回**（线程句柄真的 signaled）或**目标进程死亡**
+之后才写 `Idle`。
+
+释放：**只有一个** `ReleaseMutex` 调用点，谓词是 `没有任何未决远程调用 && 动作已定论`；不成立时
+**不释放**、保持事实。异常、提前 `return`、对象析构的默认行为都是 **abandon（置粘性事件、不释放）**
+——没有"离开作用域自动释放"的 RAII。`ReleaseMutex` 的返回值与"是否本线程持有"都要检查，跨线程
+释放不算已释放。
+
+范围（诚实边界）：只对本协议版本的 cooperating 参与者成立（本仓库注入器与负载 DLL）。第三方工具、
+调试器、手工 `FreeLibrary`、不拿租约的调用者，以及**外部线程入口**（`DllGetClassObject` / XAML
+回调 / 探针入口）都不在这套门里——它们仍靠原有 G1/G2 的收尾证明，不因租约而"看起来更安全"。
+租约按目标 PID + 创建时间命名 ⇒ **跨 explorer 不互斥**；`Local\` ⇒ 跨会话天然隔离。
+
+> 现状：`guard.h`/`guard.cpp` 这一层（获取、恢复、记录写序、单点释放）已实现并有离线用例
+> （含"崩溃 actor 留下的 really-abandoned"与"第二个 actor 的 `WAIT_TIMEOUT` 作为释放可观测证据"，
+> 以及两个编译期变异副本证明谓词真的会咬）。`do_load`/`do_stop`/`do_status`/`--watch` 每轮
+> **接入**这一层（含把 parking 接进动作）是紧随其后的下一批，在那之前上面"每条路径都受租约保护"
+> 还不成立。
 
 ## 安全边界
 

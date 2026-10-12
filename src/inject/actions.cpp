@@ -119,9 +119,12 @@ bool stop_one(unsigned long process_id, std::wstring const& dll_path, bool no_un
 
     // 超时值按 uintptr_t 编码在参数指针本身里（不解引用），这是冻结的负载 ABI。
     void* const encoded_timeout = reinterpret_cast<void*>(static_cast<std::uintptr_t>(kStopTimeoutMs));
-    RemoteCall const call =
+    RemoteCall call =
         call_remote_export(process_id, module.base, verified_rva, encoded_timeout,
                            kStopTimeoutMs + kCallGraceMs);
+    // 本批（primitive）：这条路径仍按"未知即报告"收尾。N3a 的 actor 会在持有租约的同一条线程上
+    // 用 `park_remote_call()` 等到真实 signal 或目标死亡——那正是 FreeLibrary 那一步需要的结论。
+    release_remote_call(call);
 
     UnloadDecision const decision = unload_decision(call.exit_code, call.signaled, no_unload);
     if (decision == UnloadDecision::KeepLoaded) {
@@ -385,6 +388,8 @@ int do_load(Options const& options) {
         report(L"cannot prepare the Start call: " + start_error);
         return 1;
     }
+    // 同上：本批先把句柄显式收掉；N3a 的 actor 在这里 park 到真实结论（并把它写进租约记录）。
+    release_remote_call(start_call);
     if (!start_call.thread_created) {
         report(L"the Start call failed: " + start_call.error);
         return 1;

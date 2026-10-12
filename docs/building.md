@@ -10,7 +10,12 @@
 ## 配置与构建
 
 Windows 上必须**在同一条命令里**先设置代码页再载入 MSVC 环境（Ninja + MSVC 的头文件依赖记录
-依赖这一步，否则会丢依赖、改头文件不重编）：
+依赖这一步，否则会丢依赖、改头文件不重编）。
+
+下面的示例要在 **Visual Studio 的 Developer Command Prompt**（或已经配置好的 Developer PowerShell）
+里运行：普通 PowerShell/cmd 里 `vcvarsall.bat` 与 `ninja` 都不在 `PATH` 上。若没有用 Developer shell，
+请先定位本机 Visual Studio 安装的 `vcvarsall.bat`，在**同一条 cmd** 里用它的完整路径调用（该路径随
+VS 版本与安装位置不同，本文不硬编码）。
 
 ```powershell
 cmd /c 'chcp 65001 >nul && call vcvarsall.bat x64 && cmake -S . -B .agent/build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build .agent/build/debug'

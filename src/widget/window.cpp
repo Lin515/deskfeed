@@ -1289,12 +1289,14 @@ LRESULT CALLBACK WidgetWindow::window_proc(HWND hwnd, UINT message, WPARAM wpara
     if (self == nullptr) {
         return ::DefWindowProcW(hwnd, message, wparam, lparam);
     }
-    return self->handle_message(message, wparam, lparam);
+    return self->handle_message(hwnd, message, wparam, lparam);
 }
 
-LRESULT WidgetWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
+LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    // 一律用传进来的实际句柄，不读成员 hwnd_：destroy() 先把它置空再销毁窗口，而窗口过程
+    // 在那之后仍会收到消息（WM_DESTROY 等），读成员就会把 nullptr 交给 DefWindowProc。
     if (impl_ == nullptr) {
-        return ::DefWindowProcW(hwnd_, message, wparam, lparam);
+        return ::DefWindowProcW(hwnd, message, wparam, lparam);
     }
     WidgetState& self = *impl_;
     switch (message) {
@@ -1302,14 +1304,14 @@ LRESULT WidgetWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam)
             return 1;
         case WM_PAINT: {
             PAINTSTRUCT paint_struct{};
-            HDC const dc = ::BeginPaint(hwnd_, &paint_struct);
+            HDC const dc = ::BeginPaint(hwnd, &paint_struct);
             paint_of(self, dc);
-            ::EndPaint(hwnd_, &paint_struct);
+            ::EndPaint(hwnd, &paint_struct);
             return 0;
         }
         case WM_LBUTTONDOWN: {
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            ::ClientToScreen(hwnd_, &point);
+            ::ClientToScreen(hwnd, &point);
             on_lbutton_down_of(self, point);
             return 0;
         }
@@ -1318,13 +1320,13 @@ LRESULT WidgetWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam)
                 return 0;
             }
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            ::ClientToScreen(hwnd_, &point);
+            ::ClientToScreen(hwnd, &point);
             on_mouse_move_of(self, point);
             return 0;
         }
         case WM_LBUTTONUP: {
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            ::ClientToScreen(hwnd_, &point);
+            ::ClientToScreen(hwnd, &point);
             on_lbutton_up_of(self, point);
             return 0;
         }
@@ -1355,7 +1357,7 @@ LRESULT WidgetWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam)
                 return 0;
             }
             if (wparam == kTimerSaveState) {
-                ::KillTimer(hwnd_, kTimerSaveState);
+                ::KillTimer(hwnd, kTimerSaveState);
                 // 锚点在拖动/首次落位时改过：现在尺寸稳定了，落盘一次。
                 if (self.anchor_dirty) {
                     self.anchor_dirty = false;
@@ -1388,11 +1390,11 @@ LRESULT WidgetWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam)
             if (self.callbacks.quit != nullptr) {
                 self.callbacks.quit(self.callbacks.context);
             } else {
-                ::DestroyWindow(hwnd_);
+                ::DestroyWindow(hwnd);
             }
             return 0;
         default:
-            return ::DefWindowProcW(hwnd_, message, wparam, lparam);
+            return ::DefWindowProcW(hwnd, message, wparam, lparam);
     }
 }
 

@@ -103,7 +103,9 @@ public:
 
 private:
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
-    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam);
+    // 消息的实际窗口句柄必须显式传进来：destroy() 会先把 hwnd_ 置空、再销毁窗口，而那之后
+    // 窗口过程仍可能收到消息（WM_DESTROY 等），读成员会拿到 nullptr。
+    LRESULT handle_message(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
     // 实现细节全部留在 window.cpp：这个头是主进程依赖的稳定接口，不该随内部改动而变。
     struct Impl;

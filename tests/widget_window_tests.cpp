@@ -426,6 +426,81 @@ void test_fonts_are_non_bold_and_metrics_are_tight() {
     }
 }
 
+// 整体失效（alarm）不是“没有值”：两条目仍然排两行，不能塌成一行 ERROR 的高度。
+void test_alarm_keeps_two_rows_height() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the alarm-height gate");
+    HWND const hwnd = window.handle();
+
+    window.apply(content_frame(2));
+    SIZE const normal = window_size(hwnd);
+
+    deskfeed::Frame alarmed = content_frame(2);
+    alarmed.alarm = true;
+    alarmed.reason = "transport failed";
+    window.apply(alarmed);
+    SIZE const with_alarm = window_size(hwnd);
+    check(with_alarm.cy == normal.cy, "an alarm frame keeps the same two-row height");
+
+    deskfeed::Frame failed;
+    failed.kind = deskfeed::ViewKind::Error;
+    failed.reason = "no url";
+    window.apply(failed);
+    SIZE const with_error = window_size(hwnd);
+    check(with_error.cy < normal.cy,
+          "an ERROR frame is shorter (one row), so the alarm case really differs");
+    window.destroy();
+}
+
+// 隐藏窗口上的 WM_PAINT 冒烟：能画、不崩、不显示。
+void test_hidden_paint_smoke() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the paint smoke test");
+    HWND const hwnd = window.handle();
+    window.apply(content_frame(3));
+    ::SendMessageW(hwnd, WM_PAINT, 0, 0);
+    check(::IsWindow(hwnd), "the window survives a WM_PAINT while hidden");
+    check(!::IsWindowVisible(hwnd), "the paint smoke test never shows the window");
+    window.destroy();
+}
+
+// 拖动收尾时落盘失败：锚点必须回滚，之后成功落盘写回的是**旧**锚点。
+void test_drag_save_failure_rolls_the_anchor_back() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    preferences.anchor_known = true;
+    preferences.anchor = POINT{800, 600};
+    check(create_hidden(window, recorder, preferences, error), "create for the drag rollback gate");
+    HWND const hwnd = window.handle();
+
+    // 合成一次拖动，并在捕获被抢走之前把落盘通道打成失败。
+    // SetCapture 只在这两条 SendMessage 之间被持有，随后立刻同步释放，不移动光标。
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(10, 10));
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(80, 90));
+    recorder.save_ok = false;
+    int const saves_before = recorder.saves;
+    ::ReleaseCapture();  // 触发 WM_CAPTURECHANGED → 拖动收尾 → 落盘失败
+    check(recorder.saves == saves_before + 1, "the drag finish attempted to persist the anchor");
+    check(recorder.last_saved.anchor.x != 800 || recorder.last_saved.anchor.y != 600,
+          "the attempted value is the moved anchor");
+    recorder.save_ok = true;
+
+    // 下一次成功的落盘必须写回**旧**锚点：失败那一次已经把内存里的锚点回滚了。
+    ::SendMessageW(hwnd, WM_COMMAND, kCmdTopmost, 0);
+    check(recorder.last_saved.anchor_known && recorder.last_saved.anchor.x == 800 &&
+              recorder.last_saved.anchor.y == 600,
+          "after a failed drag save the anchor is rolled back to the old corner");
+    window.destroy();
+}
+
 }  // namespace
 
 int main() {
@@ -435,6 +510,9 @@ int main() {
     test_anchor_is_not_rewritten_by_content_churn();
     test_external_destroy_invalidates_the_object();
     test_capture_changed_ends_the_drag();
+    test_alarm_keeps_two_rows_height();
+    test_hidden_paint_smoke();
+    test_drag_save_failure_rolls_the_anchor_back();
     test_fullscreen_signal_names_and_shape();
     test_fonts_are_non_bold_and_metrics_are_tight();
 

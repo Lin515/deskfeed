@@ -514,6 +514,12 @@ TEST(command_basic_forms) {
     CHECK(command_parse({L"--quit-if-bound", L"99"}, command, error));
     CHECK(command.kind == CommandKind::QuitIfBound);
     CHECK_EQ(command.pid, 99UL);
+    CHECK_EQ(command.wait_exit_ms, 0UL);  // 缺省：只等 IPC 确认
+
+    CHECK(command_parse({L"--quit-if-bound", L"99", L"--wait-exit-ms", L"60000"}, command, error));
+    CHECK_EQ(command.wait_exit_ms, 60000UL);
+    CHECK(command_parse({L"--quit", L"--wait-exit-ms", L"1"}, command, error));
+    CHECK_EQ(command.wait_exit_ms, 1UL);
 }
 
 TEST(command_rejects_bad_forms) {
@@ -525,6 +531,12 @@ TEST(command_rejects_bad_forms) {
     CHECK(!command_parse({L"--url", L"http://x", L"--quit"}, command, error));
     CHECK(!command_parse({L"--nope"}, command, error));
     CHECK(!command_parse({L"--pid", L"abc", L"--url", L"http://x"}, command, error));
+    // --wait-exit-ms 只对退出类命令有效，且范围是 1..60000。
+    CHECK(!command_parse({L"--url", L"http://x", L"--wait-exit-ms", L"100"}, command, error));
+    CHECK(!command_parse({L"--quit", L"--wait-exit-ms", L"0"}, command, error));
+    CHECK(!command_parse({L"--quit", L"--wait-exit-ms", L"60001"}, command, error));
+    CHECK(!command_parse({L"--quit", L"--wait-exit-ms"}, command, error));
+    CHECK(!command_parse({L"--quit-if-bound", L"9", L"--wait-exit-ms", L"abc"}, command, error));
 }
 
 TEST(command_isolation_flags) {
@@ -2090,6 +2102,217 @@ std::wstring master_executable_path() {
     return dir + L"deskfeed.exe";
 }
 
+// 同目录的产物路径（假注入器就在用例同一个 bin 目录里）。
+std::wstring sibling_executable_path(wchar_t const* file_name) {
+    std::wstring const self = test_executable_path();
+    std::size_t const slash = self.find_last_of(L"\\/");
+    std::wstring const dir =
+        slash == std::wstring::npos ? std::wstring() : self.substr(0, slash + 1);
+    return dir + file_name;
+}
+
+// 假注入器产物：任务栏编排的离线量具（见 tests/fake_injector.cpp）。
+std::wstring fake_injector_path() { return sibling_executable_path(L"deskfeed-fake-injector.exe"); }
+
+bool copy_file(std::wstring const& from, std::wstring const& to, std::wstring& error) {
+    if (::CopyFileW(from.c_str(), to.c_str(), FALSE) == FALSE) {
+        error = L"复制失败：" + from + L" -> " + to;
+        return false;
+    }
+    return true;
+}
+
+// 读一个**正在被写**的文件。
+//
+// 不能直接用 read_file_bytes：平台日志用 FILE_APPEND_DATA + (SHARE_READ|SHARE_WRITE) 打开，
+// 而 read_file_bytes 的共享模式只有 FILE_SHARE_READ，不许可写者继续持有写访问，于是对活着的
+// 实例日志一律 ERROR_SHARING_VIOLATION。这里按写者的共享模式兼容地打开，才能在实例运行期间
+// 轮询日志。文件不存在时 exists=false 且返回 true。
+bool read_shared_file(std::wstring const& path, std::string& bytes, bool& exists) {
+    bytes.clear();
+    exists = false;
+    HANDLE const file = ::CreateFileW(path.c_str(), GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        DWORD const code = ::GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+            return true;
+        }
+        return false;
+    }
+    exists = true;
+    LARGE_INTEGER size{};
+    if (::GetFileSizeEx(file, &size) == FALSE) {
+        ::CloseHandle(file);
+        return false;
+    }
+    if (size.QuadPart > 4 * 1024 * 1024) {
+        ::CloseHandle(file);
+        return false;
+    }
+    bytes.resize(static_cast<std::size_t>(size.QuadPart));
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        DWORD read = 0;
+        DWORD const want = static_cast<DWORD>(bytes.size() - offset);
+        if (::ReadFile(file, bytes.data() + offset, want, &read, nullptr) == FALSE) {
+            ::CloseHandle(file);
+            return false;
+        }
+        if (read == 0) {
+            break;
+        }
+        offset += read;
+    }
+    bytes.resize(offset);
+    ::CloseHandle(file);
+    return true;
+}
+
+// 读一个文件；不存在时 exists=false 且返回 true。
+bool read_file_if_present(std::wstring const& path, std::string& bytes, bool& exists) {
+    return read_shared_file(path, bytes, exists);
+}
+
+// 轮询日志文件，等到出现某段标记为止。隔离实例在轮询期间一直在跑，所以这是“等到主进程真的
+// 走到那一步”的确定性同步点，而不是靠固定 sleep 猜它走没走到。
+bool wait_for_log_marker(std::wstring const& log_path, std::string const& marker,
+                         unsigned timeout_ms) {
+    long long const deadline = tick_ms() + timeout_ms;
+    while (tick_ms() < deadline) {
+        std::string bytes;
+        bool exists = false;
+        if (read_file_if_present(log_path, bytes, exists) && exists &&
+            bytes.find(marker) != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+// 断言日志里出现了某个标记；失败时把日志存在性与尾部一并报出来，便于诊断。
+void check_log_marker(std::wstring const& log_path, std::wstring const& marker,
+                      unsigned timeout_ms) {
+    if (wait_for_log_marker(log_path, utf8_from_wide(marker), timeout_ms)) {
+        return;
+    }
+    std::string bytes;
+    bool exists = false;
+    read_file_if_present(log_path, bytes, exists);
+    std::string const tail = bytes.size() > 1500 ? bytes.substr(bytes.size() - 1500) : bytes;
+    testing::report_failure("日志里没等到标记「" + testing::to_display(marker) + "」；exists=" +
+                            (exists ? "yes" : "no") + "；日志尾部：\n" + tail);
+}
+
+// 等到隔离实例的控制窗口真的建出来（= 互斥体已经被它持有）。用例必须在启动任何**客户端**之前
+// 先等这一步：否则那个客户端会在实例就绪前抢到互斥体、把自己变成主实例（一条常驻进程），
+// 后面的断言全部失去意义。
+bool wait_for_control_window(std::wstring const& scope, unsigned timeout_ms) {
+    std::wstring const class_name = scoped_name(kControlWindowClassBase, scope);
+    long long const deadline = tick_ms() + timeout_ms;
+    while (tick_ms() < deadline) {
+        if (control_window_exists(class_name)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+// 隔离运行目录：放一份 deskfeed.exe 副本与同目录的假 deskfeed-inject.exe。
+//
+// 为什么要复制：编排层按“与主进程模块同目录的 deskfeed-inject.exe”找注入器
+// （taskbar_supervisor.cpp 的 directory_of(module_self_path())），所以监视器必须与那份**副本**
+// 同目录，不能占用构建树里真正的 deskfeed-inject.exe。收尾只删自己复制进去的东西。
+class IsolatedRunDirectory {
+public:
+    ~IsolatedRunDirectory() { remove(); }
+
+    bool create(std::string& error) {
+        remove();
+        wchar_t base[MAX_PATH]{};
+        if (::GetTempPathW(static_cast<DWORD>(std::size(base)), base) == 0) {
+            error = "拿不到临时目录";
+            return false;
+        }
+        path_ = std::wstring(base) + L"deskfeed-tests-" +
+                std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                std::to_wstring(++g_temp_file_counter) + L"-run";
+        if (::CreateDirectoryW(path_.c_str(), nullptr) == FALSE) {
+            error = "建不了隔离运行目录";
+            path_.clear();
+            return false;
+        }
+        return true;
+    }
+
+    std::wstring const& path() const { return path_; }
+
+    void remove() {
+        if (path_.empty()) {
+            return;
+        }
+        ::DeleteFileW((path_ + L"\\deskfeed.exe").c_str());
+        ::DeleteFileW((path_ + L"\\deskfeed-inject.exe").c_str());
+        ::DeleteFileW((path_ + L"\\fake-injector.log").c_str());
+        ::RemoveDirectoryW(path_.c_str());
+        path_.clear();
+    }
+
+private:
+    std::wstring path_;
+};
+
+// 一个活的“生产者进程”替身：真实存在、可以用 SYNCHRONIZE 打开、可以被结束（用来触发绑定退出）。
+// 用系统自带的 ping 撑住时间，不引入任何新产物；绝不结束别人的进程。
+class DummyProducer {
+public:
+    ~DummyProducer() { stop(); }
+
+    bool start(std::string& error) {
+        stop();
+        wchar_t command[] = L"cmd.exe /c ping -n 120 127.0.0.1 > nul";
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info{};
+        if (::CreateProcessW(nullptr, command, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                             nullptr, &startup, &info) == FALSE) {
+            error = "起不了生产者替身进程";
+            return false;
+        }
+        ::CloseHandle(info.hThread);
+        process_ = info.hProcess;
+        pid_ = info.dwProcessId;
+        return true;
+    }
+
+    unsigned long pid() const { return pid_; }
+
+    // 结束替身进程（模拟“生产者退出”）。
+    void kill() {
+        if (process_ != nullptr && ::WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) {
+            ::TerminateProcess(process_, 0);
+            ::WaitForSingleObject(process_, 5000);
+        }
+    }
+
+    void stop() {
+        if (process_ != nullptr) {
+            kill();
+            ::CloseHandle(process_);
+            process_ = nullptr;
+            pid_ = 0;
+        }
+    }
+
+private:
+    HANDLE process_ = nullptr;
+    unsigned long pid_ = 0;
+};
+
+
 // 隔离实例自己用的临时目录。收尾只删自己写进去的东西。
 class TempDirectory {
 public:
@@ -2936,8 +3159,413 @@ TEST(master_refuses_the_explicit_mailbox_when_the_ready_name_is_taken) {
     cleanup_isolated_instance(scope, state_dir.path());
 }
 
-// ---- 主入口 ----------------------------------------------------------------
+TEST(master_without_a_display_mailbox_never_touches_the_injector) {
+    // 生产路径的“显示邮箱建不起来 ⇒ 一个注入动作都不发”端到端用例。
+    //
+    // 邮箱失败是**真的**制造出来的：就绪事件名被一个异类型内核对象占住（Windows 命名对象共用
+    // 一个命名空间）。生产者先建就绪事件、再建共享内存，所以占住它就足够，不需要任何测试注入点。
+    //
+    // 用 --hidden（**不是** --headless）：这样 taskbar_wanted 为真，才会真的去建生产邮箱；
+    // 窗口建出来但从不显示，所以不会出现可见窗口或光标。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
 
+    std::wstring const scope = L"mboxmissing-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    IsolatedRunDirectory run_dir;
+    CHECK(run_dir.create(error));
+
+    // 把主进程与假注入器复制到同一个隔离目录：编排层按“与主进程同目录的 deskfeed-inject.exe”
+    // 找注入器，所以监视器必须与那份副本同目录，绝不能占用构建树里真正的注入器。
+    std::wstring const copied_master = run_dir.path() + L"\\deskfeed.exe";
+    std::wstring const copied_injector = run_dir.path() + L"\\deskfeed-inject.exe";
+    std::wstring copy_error;
+    CHECK(copy_file(master_executable_path(), copied_master, copy_error));
+    if (!copy_file(fake_injector_path(), copied_injector, copy_error)) {
+        testing::report_failure(
+            "复制假注入器失败（deskfeed-fake-injector 是否已经构建？）：" +
+            testing::to_display(copy_error));
+    }
+    std::wstring const spy_log = run_dir.path() + L"\\fake-injector.log";
+    ScopedEnvironmentVariable const spy_log_env(L"DESKFEED_FAKE_LOG", spy_log);
+
+    std::wstring const ready_name = deskfeed::display_frame_ready_name(scope);
+    HANDLE const blocker = ::CreateMutexW(nullptr, FALSE, ready_name.c_str());
+    CHECK(blocker != nullptr);
+
+    ChildProcess master;
+    CHECK(master.start(copied_master,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--hidden",
+                        L"--url", server.url(L"/ok"), L"--poll-ms", L"1000"},
+                       error));
+    CHECK(wait_for_control_window(scope, 10000));
+
+    // 悬浮窗真的建出来了（--hidden 只控制显示，不阻止建窗），而且不可见。
+    std::wstring const widget_class = scoped_name(L"DeskFeedWidget", scope);
+    HWND widget = nullptr;
+    for (int attempt = 0; attempt < 300 && widget == nullptr; ++attempt) {
+        widget = ::FindWindowW(widget_class.c_str(), nullptr);
+        if (widget == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    CHECK(widget != nullptr);
+    CHECK(!::IsWindowVisible(widget));
+
+    // 取数照常：邮箱失败只影响任务栏那条显示面，不拦取数。
+    std::wstring const log_path = deskfeed_log_path(scope);
+    check_log_marker(log_path, L"fetch: 成功", 8000);
+
+    // 生产分支确实走到了（不是“碰巧没建邮箱”）。
+    check_log_marker(log_path, L"没有显示邮箱", 5000);
+
+    // 实例仍在运行、还能应答控制通道。
+    CHECK_EQ(master.exit_code(), -1LL);
+    ChildProcess inspect;
+    CHECK(inspect.start(copied_master, {L"--scope", scope, L"--inspect"}, error));
+    CHECK(inspect.wait(15000));
+    CHECK_EQ(inspect.exit_code(), 0LL);
+
+    // 一个注入动作都没有：假注入器一次都没被 spawn（它连日志文件都没建出来）。
+    std::string spy_bytes;
+    bool spy_exists = false;
+    CHECK(read_file_if_present(spy_log, spy_bytes, spy_exists));
+    CHECK(!spy_exists);
+
+    ChildProcess quit;
+    CHECK(quit.start(copied_master, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+
+    ::CloseHandle(blocker);
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_keeps_the_new_binding_when_a_conditional_quit_is_still_pending) {
+    // `--quit-if-bound` 只应退出“当时那个绑定”。判定发生在窗口过程里、动作却要等消息被消费，
+    // 中间可以有一次新接管。这里用测试注入点把**已投递**的退出消息延迟消费（只对 scope + headless
+    // 生效），在“已投递、尚未生效”的确定窗口里提交一次新接管：
+    //   * 条件退出此时**还没有**置 closing_，所以新接管必须被接受；
+    //   * 到期的条件退出必须被丢弃，实例继续服务新绑定（契约：被新生产者接管则不退出）。
+    // 去掉“退出消息带代次 + 消费时重核验”后，这条用例会红：实例会退出，或丢弃日志不会出现。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"quitpend-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    DummyProducer first;
+    CHECK(first.start(error));
+    DummyProducer second;
+    CHECK(second.start(error));
+
+    ChildProcess master;
+    {
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        CHECK(master.start(exe,
+                           {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                            L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                            L"10000"},
+                           error));
+    }
+    CHECK(wait_for_control_window(scope, 10000));
+
+    std::wstring const log_path = deskfeed_log_path(scope);
+
+    ChildProcess bind;
+    CHECK(bind.start(exe,
+                     {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                      std::to_wstring(first.pid())},
+                     error));
+    CHECK(bind.wait(15000));
+    CHECK_EQ(bind.exit_code(), 0LL);
+    check_log_marker(log_path, L"绑定生产者 PID", 5000);
+
+    ChildProcess quit_if_bound;
+    CHECK(quit_if_bound.start(
+        exe, {L"--scope", scope, L"--quit-if-bound", std::to_wstring(first.pid())}, error));
+    CHECK(quit_if_bound.wait(15000));
+    CHECK_EQ(quit_if_bound.exit_code(), 0LL);
+    // 同步点：主进程已经把这条条件退出投递进延迟队列。
+    check_log_marker(log_path, L"延迟消费退出消息", 5000);
+
+    ChildProcess takeover;
+    CHECK(takeover.start(exe,
+                         {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                          std::to_wstring(second.pid())},
+                         error));
+    CHECK(takeover.wait(15000));
+    CHECK_EQ(takeover.exit_code(), 0LL);
+
+    // 等过延迟窗口：到期的条件退出必须被丢弃，实例还活着。
+    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    CHECK_EQ(master.exit_code(), -1LL);
+    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 5000);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_keeps_the_new_binding_when_the_old_producer_exit_is_still_pending) {
+    // 旧生产者退出走的是同一条条件退出路径（on_binding_exit），也必须能被随后到达的新接管取消。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"bindingpend-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    DummyProducer first;
+    CHECK(first.start(error));
+    DummyProducer second;
+    CHECK(second.start(error));
+
+    ChildProcess master;
+    {
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        CHECK(master.start(exe,
+                           {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                            L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                            L"10000"},
+                           error));
+    }
+    CHECK(wait_for_control_window(scope, 10000));
+
+    std::wstring const log_path = deskfeed_log_path(scope);
+
+    ChildProcess bind;
+    CHECK(bind.start(exe,
+                     {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                      std::to_wstring(first.pid())},
+                     error));
+    CHECK(bind.wait(15000));
+    CHECK_EQ(bind.exit_code(), 0LL);
+    check_log_marker(log_path, L"绑定生产者 PID", 5000);
+
+    // 旧生产者退出：等待线程投递退出回调，主进程据此投递一条**带代次**的退出消息（被延迟消费）。
+    first.kill();
+    check_log_marker(log_path, L"延迟消费退出消息", 8000);
+
+    ChildProcess takeover;
+    CHECK(takeover.start(exe,
+                         {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                          std::to_wstring(second.pid())},
+                         error));
+    CHECK(takeover.wait(15000));
+    CHECK_EQ(takeover.exit_code(), 0LL);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    CHECK_EQ(master.exit_code(), -1LL);
+    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 5000);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_rejects_a_takeover_after_an_unconditional_quit_was_queued) {
+    // 无条件退出（`--quit`）在**返回接受之前**就置 closing_：随后到达的接管必须被拒（exit 6），
+    // 不能拿到一个“已接受”的假确认、然后实例马上消失。条件退出是另一种语义（允许被新绑定取消），
+    // 这里验的就是两者的区分。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"closingguard-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    DummyProducer producer;
+    CHECK(producer.start(error));
+
+    ChildProcess master;
+    {
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        CHECK(master.start(exe,
+                           {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                            L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                            L"10000"},
+                           error));
+    }
+    CHECK(wait_for_control_window(scope, 10000));
+    std::wstring const log_path = deskfeed_log_path(scope);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK_EQ(quit.exit_code(), 0LL);
+
+    // 退出已排定（消息被延迟消费，但 closing_ 在确认之前就置上了）。
+    ChildProcess takeover;
+    CHECK(takeover.start(exe,
+                         {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                          std::to_wstring(producer.pid())},
+                         error));
+    CHECK(takeover.wait(15000));
+    CHECK_EQ(takeover.exit_code(), 6LL);
+    check_log_marker(log_path, L"拒绝新的接管", 5000);
+
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_waits_for_the_actual_exit_only_when_asked) {
+    // `--wait-exit-ms`：确认被接受后还要等到实例进程**真的退出**。用延迟注入点把“退出被消费”
+    // 推迟约 3 s：带等待的客户端必须活到那之后才返回；不带等待（缺省 0）时只等 IPC 确认。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"waitexit-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    ChildProcess master;
+    {
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"3000");
+        CHECK(master.start(exe,
+                           {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                            L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                            L"10000"},
+                           error));
+    }
+    CHECK(wait_for_control_window(scope, 10000));
+
+    ChildProcess quit;
+    long long const started = tick_ms();
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit", L"--wait-exit-ms", L"10000"}, error));
+    CHECK(quit.wait(20000));
+    long long const elapsed = tick_ms() - started;
+    CHECK_EQ(quit.exit_code(), 0LL);
+    // 退出被延迟了 3 s 才被消费，所以“等到实例真的退出”的客户端至少也要活到那之后。
+    CHECK(elapsed >= 2500);
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_does_not_wait_when_a_conditional_quit_does_not_match) {
+    // 没有匹配的绑定：`--quit-if-bound` 报 NotBound（成功返回、什么都不做）。即使给了很大的
+    // `--wait-exit-ms`，也必须立刻返回，绝不能错误地等一个根本不会退出的实例。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"notboundwait-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                        L"10000"},
+                       error));
+    CHECK(wait_for_control_window(scope, 10000));
+
+    ChildProcess not_bound;
+    long long const started = tick_ms();
+    CHECK(not_bound.start(
+        exe, {L"--scope", scope, L"--quit-if-bound", L"999999", L"--wait-exit-ms", L"60000"},
+        error));
+    CHECK(not_bound.wait(10000));
+    long long const elapsed = tick_ms() - started;
+    CHECK_EQ(not_bound.exit_code(), 0LL);
+    CHECK(elapsed < 5000);
+    CHECK_EQ(master.exit_code(), -1LL);  // 实例不受影响
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_does_not_send_a_quit_it_cannot_confirm) {
+    // `--wait-exit-ms` 的核心纪律：**只有**真的拿到实例进程的 SYNCHRONIZE 句柄、并等它真的
+    // 触发过，才返回 0。拿不到句柄时 fail closed：返回 5（不确定）并且**不发送 IPC**——
+    // 绝不能退化成“只等确认的 0”，那会让调用方把 ACK 当成“实例已经退出”。
+    //
+    // 句柄拿不到这件事用隔离实例的注入点确定性地制造出来（模拟 OpenProcess 失败）。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"failclosed-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+    std::wstring const exe = master_executable_path();
+
+    DummyProducer producer;
+    CHECK(producer.start(error));
+
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
+                        L"10000"},
+                       error));
+    CHECK(wait_for_control_window(scope, 10000));
+
+    std::wstring const log_path = deskfeed_log_path(scope);
+
+    ChildProcess bind;
+    CHECK(bind.start(exe,
+                     {L"--scope", scope, L"--url", server.url(L"/ok"), L"--pid",
+                      std::to_wstring(producer.pid())},
+                     error));
+    CHECK(bind.wait(15000));
+    CHECK_EQ(bind.exit_code(), 0LL);
+    check_log_marker(log_path, L"绑定生产者 PID", 5000);
+
+    // 拿不到句柄：必须 exit 5，而且一个字节的 IPC 都没发出去（实例不受影响、还绑着）。
+    {
+        ScopedEnvironmentVariable const no_handle(L"DESKFEED_TEST_FAIL_WAIT_HANDLE", L"1");
+        ChildProcess blocked;
+        CHECK(blocked.start(exe,
+                            {L"--scope", scope, L"--quit-if-bound",
+                             std::to_wstring(producer.pid()), L"--wait-exit-ms", L"60000"},
+                            error));
+        CHECK(blocked.wait(15000));
+        CHECK_EQ(blocked.exit_code(), 5LL);
+    }
+    CHECK_EQ(master.exit_code(), -1LL);  // 实例没有被“已接受然后等着”的假路径影响
+
+    // 对照组：能拿到句柄时同一条命令被接受，并且等到实例真的退出才返回 0。
+    ChildProcess confirmed;
+    CHECK(confirmed.start(exe,
+                          {L"--scope", scope, L"--quit-if-bound",
+                           std::to_wstring(producer.pid()), L"--wait-exit-ms", L"60000"},
+                          error));
+    CHECK(confirmed.wait(20000));
+    CHECK_EQ(confirmed.exit_code(), 0LL);
+    CHECK(master.wait(15000));  // 实例真的退出了
+
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+// ---- 主入口 ----------------------------------------------------------------
 int wmain(int argc, wchar_t** argv) {
     // 子模式：本程序被自己再起一份，充当“另一个生产者进程”（见显示邮箱的身份用例）。
     // 必须在跑用例之前返回，否则子进程会把整套用例再递归跑一遍。

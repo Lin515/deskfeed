@@ -45,6 +45,12 @@ struct Command {
     bool has_timeout_ms = false;
     long long timeout_ms = 0;
 
+    // `--wait-exit-ms <1..60000>`：只对 `--quit` / `--quit-if-bound` 有效。缺省 0 = 原语义
+    // （只等 IPC 确认，不等实例真的退出；确认不等于实例已经退出）。非 0 时发送端在拿到
+    // `Accepted` 之后等到目标实例进程**真的退出**为止；到点还没退按“未确认退出”返回，
+    // 绝不补杀、绝不重开、绝不制造第二个常驻实例。
+    unsigned long wait_exit_ms = 0;
+
     // 隔离与本次运行的开关。
     std::wstring scope;      // 空 = 生产实例
     std::wstring state_dir;  // 空 = 默认位置

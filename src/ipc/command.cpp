@@ -141,6 +141,18 @@ bool command_parse(std::vector<std::wstring> const& args, Command& out, std::wst
             command.hidden = true;
         } else if (arg == L"--frame-mailbox") {
             command.frame_mailbox = true;
+        } else if (arg == L"--wait-exit-ms") {
+            std::wstring value;
+            if (!take_value(args, index, value)) {
+                error = L"--wait-exit-ms 后面要跟毫秒数";
+                return false;
+            }
+            long long parsed = 0;
+            if (!parse_i64(value, parsed) || parsed < 1 || parsed > 60000) {
+                error = L"--wait-exit-ms 只接受 1..60000 的毫秒数：" + value;
+                return false;
+            }
+            command.wait_exit_ms = static_cast<unsigned long>(parsed);
         } else {
             error = L"不认识的参数：" + arg;
             return false;
@@ -158,6 +170,12 @@ bool command_parse(std::vector<std::wstring> const& args, Command& out, std::wst
     }
     if (command.has_pid && !command.has_url) {
         error = L"--pid 必须与 --url 一起使用";
+        return false;
+    }
+    if (command.wait_exit_ms != 0 && command.kind != CommandKind::Quit &&
+        command.kind != CommandKind::QuitIfBound) {
+        // 只有退出类命令才有“等实例真的退出”这个语义；接管/查询等命令带上它一定是写错了。
+        error = L"--wait-exit-ms 只能与 --quit 或 --quit-if-bound 一起使用";
         return false;
     }
     if (command.headless) {
@@ -206,6 +224,8 @@ std::string command_usage() {
         "  --hidden                  本次运行保持悬浮窗隐藏\n"
         "  --frame-mailbox           按 scope 建隔离的显示邮箱（只给离线验收用；必须与\n"
         "                            --scope 以及 --headless / --no-inject 同时出现）\n"
+        "  --wait-exit-ms <1..60000> 只与 --quit / --quit-if-bound 同用：确认被接受后等到实例\n"
+        "                            真的退出；缺省 0 = 只等确认（确认不等于实例已退出）\n"
         "  -h, --help                这一段\n"
         "\n"
         "退出码: 0 命令被接受（或条件退出无需操作）；2 用法错误；3 PID 不合法；\n"

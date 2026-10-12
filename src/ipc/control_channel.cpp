@@ -144,13 +144,16 @@ void ControlServer::destroy() {
     pump_ = nullptr;
 }
 
-bool control_window_exists(std::wstring const& class_name) {
-    return ::FindWindowW(class_name.c_str(), nullptr) != nullptr;
+HWND control_find_window(std::wstring const& class_name) {
+    return ::FindWindowW(class_name.c_str(), nullptr);
 }
 
-bool control_send(std::wstring const& class_name, ControlRequest const& request,
-                  unsigned timeout_ms, ControlReply& reply, std::string& error) {
-    HWND const window = ::FindWindowW(class_name.c_str(), nullptr);
+bool control_window_exists(std::wstring const& class_name) {
+    return control_find_window(class_name) != nullptr;
+}
+
+bool control_send_window(HWND window, ControlRequest const& request, unsigned timeout_ms,
+                         ControlReply& reply, std::string& error) {
     if (window == nullptr) {
         error = "no instance is listening";
         return false;
@@ -179,6 +182,11 @@ bool control_send(std::wstring const& class_name, ControlRequest const& request,
     }
     reply = static_cast<ControlReply>(static_cast<std::intptr_t>(result));
     return true;
+}
+
+bool control_send(std::wstring const& class_name, ControlRequest const& request,
+                  unsigned timeout_ms, ControlReply& reply, std::string& error) {
+    return control_send_window(control_find_window(class_name), request, timeout_ms, reply, error);
 }
 
 }  // namespace deskfeed

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,6 +56,12 @@ constexpr wchar_t kWidgetWindowClassBase[] = L"DeskFeedWidget";
 // 一取消就释放。kMaxFetchJobs 是作业记录的硬上限，只用来兜住极端情况下的堆积。
 constexpr std::size_t kMaxLiveFetches = 2;
 constexpr std::size_t kMaxFetchJobs = 8;
+
+// 测试注入点最多同时延迟这么多条退出消息（见 Master 的 defer_quits_）：到顶就当场消费，
+// 队列不会无界增长。
+constexpr std::size_t kMaxDeferredQuits = 8;
+// 延迟注入点允许的最大毫秒数（只对 scope 非空 + headless 生效）。
+constexpr long long kMaxDeferQuitMs = 10000;
 
 long long monotonic_ms() { return static_cast<long long>(::GetTickCount64()); }
 
@@ -371,6 +378,20 @@ public:
             !scope_.empty() && read_test_environment(L"DESKFEED_TEST_FAIL_FETCH_THREAD") == L"1";
         test_refuse_outcome_ =
             !scope_.empty() && read_test_environment(L"DESKFEED_TEST_REFUSE_OUTCOME") == L"1";
+        // 第三个注入点：把**已投递**的退出消息延迟到 pump 里再消费（见 defer_quits_ 的成员说明）。
+        // 只在“隔离实例 + 无界面”里生效，生产实例（scope 恒为空）打不开。
+        if (!scope_.empty() && command_.headless) {
+            std::wstring const value = read_test_environment(L"DESKFEED_TEST_DEFER_QUIT_MS");
+            if (!value.empty()) {
+                wchar_t* end = nullptr;
+                long long const parsed = std::wcstoll(value.c_str(), &end, 10);
+                if (end != value.c_str() && *end == L'\0' && parsed > 0) {
+                    defer_quit_ms_ = static_cast<unsigned long>(
+                        std::min<long long>(parsed, kMaxDeferQuitMs));
+                    defer_quits_ = true;
+                }
+            }
+        }
     }
     ~Master();
 
@@ -408,6 +429,12 @@ private:
     Job* find_job(std::uint64_t id);
     void on_fetch_done(std::unique_ptr<FetchOutcome> outcome);
     void on_binding_exit(std::uint64_t generation);
+    // 退出请求的**唯一**消费点。`wanted` 是投递时记下的绑定代次，0 表示无条件退出。
+    // 条件退出在这里**重新核验**：代次已经被更新的接管取代（或绑定已经不在了）就丢弃，
+    // 绝不让一条旧的退出消息关掉新的绑定。核验通过才真正进入退出流程（closing_ + quit_requested_）。
+    void consume_quit(std::uint64_t wanted);
+    // 把延迟注入点里到期的退出消息按顺序交给 consume_quit（只在本隔离实例的测试里非空）。
+    void drain_pending_quits(long long now);
     // 把当前显示模型发出去：显示邮箱与悬浮窗吃**同一份** Frame（frame_from_view 只算一次），
     // 各自按自己的“已发布代次”判断要不要发。force 用于“模型没变但读端需要一帧”的场合
     // （启动时、任务栏组件被重新打开/重新注入时）。
@@ -473,6 +500,25 @@ private:
     // 那条迟到的旧消息就会误伤新绑定。
     std::uint64_t next_binding_generation_ = 1;
     bool quit_requested_ = false;
+    // “退出已经排定、本实例不会再继续服务”的硬标志。与 quit_requested_ 分开：
+    //   * 无条件退出（`--quit`、悬浮窗菜单「退出」）在**返回接受之前**就置位——不能先 ACK
+    //     “命令已接受”，随后又明知自己在退出还去接受一条新的接管；
+    //   * 条件退出（绑定生产者退出 / `--quit-if-bound`）**不**在投递时置位：那条消息带着绑定代次，
+    //     允许被随后到达的新绑定取消（契约：被新生产者接管则不退出）。只有它真的被消费、退出
+    //     已经不可撤销时才置位。
+    // 置位之后 `on_control` 拒绝新的 Apply（返回 Rejected，绝不假 Accepted）。
+    bool closing_ = false;
+    // 测试注入点：把已投递的退出消息**延迟**到 pump 里再消费（`DESKFEED_TEST_DEFER_QUIT_MS`，
+    // 只对 scope 非空 + headless 生效）。它把“退出消息已经投递、但还没被消费”这段窗口从几微秒
+    // 变成确定的若干毫秒，用例才能稳定地在这段时间里提交一次新接管，从而真正分辨
+    // “条件退出带不带代次”。生产实例（scope 恒为空）不可能打开它。
+    bool defer_quits_ = false;
+    unsigned long defer_quit_ms_ = 0;
+    struct PendingQuit {
+        std::uint64_t wanted = 0;
+        long long due_ms = 0;
+    };
+    std::vector<PendingQuit> pending_quits_;
     // 任务栏那块的双击/「打开桌面悬浮窗」把这条置起来。主循环据此请悬浮窗显示自己
     // （它会顺手把用户的隐藏意图清掉落盘）。它**不**触发一次新的取数：显示是显示，取数是取数。
     bool show_requested_ = false;
@@ -755,6 +801,8 @@ void Master::widget_quit_entry(void* context) {
 
 void Master::on_widget_quit() {
     // 同样只投递：在回调里同步销毁窗口会在窗口过程还压在栈上的时候把窗口拆掉。
+    // 菜单「退出」是**无条件**退出：先把 closing_ 置上（本实例不会再接受新接管），再投递。
+    closing_ = true;
     ::PostMessageW(server_.window(), kMsgQuit, 0, 0);
 }
 
@@ -879,13 +927,25 @@ ControlReply Master::on_control(ControlRequest const& request) {
                 return ControlReply::NotBound;
             }
             log_format(L"control: --quit-if-bound %lu 匹配；准备正常退出", command.pid);
-            ::PostMessageW(server_.window(), kMsgQuit, 0, 0);
+            // 条件退出：消息带着当前绑定代次。**不**在这里置 closing_——随后到达的新接管
+            // （新生产者）应当能取消这次退出，契约要求“被接管则不退出”。
+            ::PostMessageW(server_.window(), kMsgQuit,
+                           static_cast<WPARAM>(binding_generation_), 0);
             return ControlReply::Accepted;
         case CommandKind::Quit:
             log_line(L"control: --quit；准备正常退出");
+            // 无条件退出：在返回接受**之前**就置 closing_。这是诚实的顺序——既然这条命令已经被
+            // 接受、本实例马上要退出，就不能让紧接着到达的接管拿到一个“已接受”的假确认。
+            closing_ = true;
             ::PostMessageW(server_.window(), kMsgQuit, 0, 0);
             return ControlReply::Accepted;
         case CommandKind::Apply:
+            if (closing_) {
+                // 退出已经排定（无条件退出已确认，或条件退出已经被消费）：本实例不会再继续服务，
+                // 拒绝这条接管并如实返回 Rejected，绝不 ACK Accepted 之后马上消失。
+                log_line(L"control: 实例已在退出流程里，拒绝新的接管（不假称已接受）");
+                return ControlReply::Rejected;
+            }
             return apply_command(command, request.sender_pid);
         case CommandKind::Start:
             log_line(L"control: 无参数命令：不改变地址与绑定");
@@ -1166,7 +1226,45 @@ void Master::on_binding_exit(std::uint64_t generation) {
         return;
     }
     log_format(L"binding: 绑定生产者 PID %lu 已退出；实例准备正常退出", binding_.pid());
-    ::PostMessageW(server_.window(), kMsgQuit, 0, 0);
+    // 退出请求带着**产生它的那个绑定代次**。判定放在这里、动作却要等到消息被消费，中间可能有
+    // 一次新的接管把 binding_generation_ 推进——那时这条消息必须被丢弃（见 consume_quit）。
+    ::PostMessageW(server_.window(), kMsgQuit, static_cast<WPARAM>(generation), 0);
+}
+
+void Master::consume_quit(std::uint64_t wanted) {
+    // wanted == 0 是无条件退出（`--quit` / 悬浮窗菜单），不得被任何新绑定取消。
+    // wanted != 0 是条件退出：只有它投递时对应的绑定**仍然是当前绑定**时才作数。
+    // 这里必须重新核验，不能信任投递时的判定：中间可能已经有新生产者接管（binding_generation_
+    // 被推进、binding_ 被换成新句柄），旧生产者的退出不得关闭当前实例。
+    if (wanted != 0 && (wanted != binding_generation_ || !binding_.active())) {
+        log_format(L"quit: 丢弃已被新绑定取代的条件退出（generation %llu，当前 %llu）", wanted,
+                   binding_generation_);
+        return;
+    }
+    closing_ = true;
+    quit_requested_ = true;
+    // 悬浮窗的右键菜单用 TrackPopupMenu 在本线程上开了一个**嵌套模态循环**；主循环在它返回
+    // 之前跑不到 quit_requested_ 的判定处。EndMenu 结束的是**调用线程的**活动菜单——也就是我们
+    // 自己那个窗口的菜单；没有活动菜单时它是无操作（返回值在这里不代表任何语义，所以不据此下结论）。
+    // 它不会、也不该去动别的进程的窗口/菜单（别的进程的模态菜单本来就不阻塞我们的线程），
+    // 所以不必枚举桌面、也不对别人的 HWND 下手。
+    ::EndMenu();
+    log_line(L"quit: 已调用 EndMenu 结束本线程可能存在的活动菜单");
+}
+
+void Master::drain_pending_quits(long long now) {
+    if (pending_quits_.empty()) {
+        return;
+    }
+    std::vector<PendingQuit> ready;
+    std::vector<PendingQuit> waiting;
+    for (PendingQuit const& item : pending_quits_) {
+        (item.due_ms <= now ? ready : waiting).push_back(item);
+    }
+    pending_quits_.swap(waiting);
+    for (PendingQuit const& item : ready) {
+        consume_quit(item.wanted);  // 仍按原代次核验；被新绑定取代的照样丢弃
+    }
 }
 
 void Master::shutdown() {
@@ -1378,9 +1476,20 @@ bool Master::on_window_message(UINT message, WPARAM wparam, LPARAM lparam) {
         case kMsgBindingExit:
             on_binding_exit(static_cast<std::uint64_t>(wparam));
             return true;
-        case kMsgQuit:
-            quit_requested_ = true;
+        case kMsgQuit: {
+            // wParam = 投递时记下的绑定代次（0 = 无条件退出）。判定与动作分两处，所以真正的
+            // 核验发生在 consume_quit 里——这里只负责“要不要把它推迟消费”。
+            std::uint64_t const wanted = static_cast<std::uint64_t>(wparam);
+            if (defer_quits_ && pending_quits_.size() < kMaxDeferredQuits) {
+                pending_quits_.push_back(
+                    PendingQuit{wanted, monotonic_ms() + static_cast<long long>(defer_quit_ms_)});
+                log_format(L"quit: 测试注入点延迟消费退出消息 %lu ms（generation %llu，队列 %zu）",
+                           defer_quit_ms_, wanted, pending_quits_.size());
+                return true;
+            }
+            consume_quit(wanted);
             return true;
+        }
         case kMsgRefreshRequested:
             // 任务栏那块被双击/点「立即刷新读数」：对**当前**地址立刻取一次数。
             // 不追加任何查询参数、不改调度配置、不动绑定与地址——一次性的取数请求。
@@ -1420,6 +1529,9 @@ void Master::pump(bool from_modal_dispatch) {
     pumping_ = true;
 
     long long const now = monotonic_ms();
+    // 被测试注入点延迟的退出消息在这里到期消费：到期之前不会置 closing_/quit_requested_，
+    // 所以“退出已投递、尚未生效”的那段窗口是确定可用的。
+    drain_pending_quits(now);
     health_.tick(wall_ms());
 
     // 整次取数的墙钟预算由主进程守：到点就当场宣布失败并放弃这次取数，
@@ -1574,7 +1686,102 @@ std::wstring master_mutex_name(std::wstring const& scope) {
     return scoped_name(L"Local\\DeskFeed-master", scope);
 }
 
-int forward_command(std::vector<std::wstring> const& args, std::wstring const& class_name) {
+// 带 `--wait-exit-ms` 的退出转发：**只有**真正拿到目标实例进程的 SYNCHRONIZE 句柄、并在确认
+// 返回 `Accepted` 之后等到那个句柄真的触发，才返回 0。
+//
+// 这里刻意 fail closed：拿不到句柄、控制窗口不在、或者窗口属主在发送前发生变化，都返回 5
+// （不确定）并且**不发送 IPC**。绝不退化成“只等确认”的旧语义——那会让调用方把一次 ACK 当成
+// “实例已经退出”，从而在旧实例还活着（或正在收尾）时误判为可以另起一个。
+//
+// 句柄必须是**发送前**从控制窗口属主 PID 上拿到的那个：确认返回之后实例可能立刻销毁窗口，
+// 那时再按 PID 重新打开就是在猜“还是同一个实例”。发送前会再核一次属主 PID 与句柄存活，
+// 避免 HWND 被复用后把请求发给另一个实例。
+int forward_quit_and_wait(std::vector<std::wstring> const& args, std::wstring const& class_name,
+                          unsigned long wait_exit_ms, bool allow_test_failpoints) {
+    ControlRequest request;
+    request.op = ControlOp::Command;
+    request.sender_pid = ::GetCurrentProcessId();
+    request.args = args;
+
+    HWND const window = control_find_window(class_name);
+    if (window == nullptr) {
+        // 调用方已经确认互斥体被占（有实例），但控制窗口不在：实例正在收尾，拿不到真实 PID。
+        // 不能冒充“实例已退出”，也不去猜一个 PID。
+        console_write_stderr(L"deskfeed: 找不到实例的控制窗口，无法确认它是否真的退出（不确定）\n");
+        return 5;
+    }
+    DWORD owner_pid = 0;
+    ::GetWindowThreadProcessId(window, &owner_pid);
+    if (owner_pid == 0 || owner_pid == ::GetCurrentProcessId()) {
+        console_write_stderr(L"deskfeed: 控制窗口的属主进程不合法，无法确认目标实例（不确定）\n");
+        return 5;
+    }
+    // 测试注入点：模拟 OpenProcess 失败，用来确定性验证“拿不到句柄就不发 IPC、返回 5”这条
+    // fail-closed 路径。只在隔离实例（scope 非空）里可能生效。
+    bool const simulate_no_handle =
+        allow_test_failpoints && read_test_environment(L"DESKFEED_TEST_FAIL_WAIT_HANDLE") == L"1";
+    HANDLE const master_process =
+        simulate_no_handle ? nullptr : ::OpenProcess(SYNCHRONIZE, FALSE, owner_pid);
+    if (master_process == nullptr) {
+        // 拿不到一个能等它退出的句柄 = 没有任何“实例是否真的退出”的证据。fail closed：不发 IPC。
+        console_write_stderr(L"deskfeed: 拿不到实例进程的同步句柄，无法确认它是否真的退出（不确定）\n");
+        return 5;
+    }
+    // 发送前的第二次身份核验：窗口还在、属主还是同一个 PID、句柄还没触发。
+    DWORD recheck_pid = 0;
+    if (::IsWindow(window)) {
+        ::GetWindowThreadProcessId(window, &recheck_pid);
+    }
+    if (recheck_pid != owner_pid || ::WaitForSingleObject(master_process, 0) == WAIT_OBJECT_0) {
+        ::CloseHandle(master_process);
+        console_write_stderr(L"deskfeed: 控制窗口的属主在发送前发生变化，无法确认目标实例（不确定）\n");
+        return 5;
+    }
+
+    ControlReply reply = ControlReply::BadRequest;
+    std::string error;
+    if (!control_send_window(window, request, kControlSendTimeoutMs, reply, error)) {
+        ::CloseHandle(master_process);
+        console_write_stderr(L"deskfeed: 没有收到实例确认（" + wide_from_utf8(error) +
+                             L"）；这不代表命令没有执行\n");
+        return 5;
+    }
+    int result = 0;
+    switch (reply) {
+        case ControlReply::Accepted: {
+            // 只有这个**发送前**捕获的句柄真的触发，才算“实例已退出”。
+            DWORD const waited = ::WaitForSingleObject(master_process, wait_exit_ms);
+            if (waited != WAIT_OBJECT_0) {
+                // 到点还没退：仍然属于“未确认退出”，不能当成没执行，更不许补杀或重开。
+                console_write_stderr(L"deskfeed: 等待实例退出超时；命令已被接受，实例可能稍后退出\n");
+                result = 5;
+            }
+            break;
+        }
+        case ControlReply::NotBound:
+            result = 0;  // 条件不匹配：成功返回、什么都不做（安全 no-op），不等待
+            break;
+        case ControlReply::Rejected:
+        case ControlReply::BadRequest:
+            console_write_stderr(L"deskfeed: 运行中的实例拒绝了这条命令\n");
+            result = 6;
+            break;
+    }
+    ::CloseHandle(master_process);
+    return result;
+}
+
+// 把一条命令转发给运行中的实例。
+//
+// `wait_exit_ms == 0`（缺省）= 旧语义：只等 IPC 确认，确认不等于实例已经退出。这条路径与
+// 之前完全一致，私有调用方不写新开关时行为不变。
+// `wait_exit_ms != 0` 走上面的 fail-closed 等待路径。
+int forward_command(std::vector<std::wstring> const& args, std::wstring const& class_name,
+                    unsigned long wait_exit_ms, bool allow_test_failpoints) {
+    if (wait_exit_ms > 0) {
+        return forward_quit_and_wait(args, class_name, wait_exit_ms, allow_test_failpoints);
+    }
+
     ControlRequest request;
     request.op = ControlOp::Command;
     request.sender_pid = ::GetCurrentProcessId();
@@ -1677,14 +1884,18 @@ int master_main(std::vector<std::wstring> const& args) {
                 return 0;  // 条件退出没有实例：成功返回，不启动任何东西
             }
             {
-                int const result = forward_command(args, class_name);
+                int const result = forward_command(args, class_name, command.wait_exit_ms,
+                                                   !scope.empty());
                 // 收尾窗口：主实例正在退出，控制窗口已经销毁、互斥体还没释放（收尾顺序就是
                 // 先关窗口再退进程）。这时“没有可退的实例”与契约里的“没有实例”是同一件事，
                 // 按成功返回，而不是把一个正在消失的实例报成失败。
                 //
                 // 判据必须**同时**满足：投递失败，且控制窗口确实已经不在了。窗口还在却超时，
                 // 那是真的没应答——契约明确说这种情况是“不确定”，绝不能当成成功。
-                if (result != 0 && !control_window_exists(class_name)) {
+                //
+                // 但调用方显式要求“等到实例真的退出”时不套用这条启发式：窗口不在不代表进程
+                // 已经退出，等待超时就是“未确认退出”，必须如实返回 5，不能假报成功。
+                if (command.wait_exit_ms == 0 && result != 0 && !control_window_exists(class_name)) {
                     log_line(L"quit: 控制窗口已经不在（实例正在收尾）；按没有实例处理");
                     return 0;
                 }
@@ -1698,7 +1909,8 @@ int master_main(std::vector<std::wstring> const& args) {
             return inspect_instance(class_name, scope);
         case CommandKind::Apply:
             if (already_running) {
-                return forward_command(args, class_name);
+                // 接管命令不带“等实例退出”的语义（命令行解析也不允许），永远走 ACK 语义。
+                return forward_command(args, class_name, 0, !scope.empty());
             }
             break;
         case CommandKind::Start:

@@ -85,6 +85,17 @@ private:
 bool control_send(std::wstring const& class_name, ControlRequest const& request,
                   unsigned timeout_ms, ControlReply& reply, std::string& error);
 
+// 只找窗口（没有实例时返回 nullptr）。
+//
+// 退出类命令需要“等实例真的退出”时，发送端必须在发 `WM_COPYDATA` **之前**抓住窗口属主的真实
+// PID 与一个 `SYNCHRONIZE` 句柄：确认返回之后实例可能立刻销毁窗口，那时就再也没有 PID 可抓了。
+HWND control_find_window(std::wstring const& class_name);
+
+// 往一个已经找到的窗口发送。线上语义与 control_send 完全一致；window 为 nullptr 时按
+// “没有实例”失败返回。
+bool control_send_window(HWND window, ControlRequest const& request, unsigned timeout_ms,
+                         ControlReply& reply, std::string& error);
+
 // 只查在不在（不投递命令）。
 bool control_window_exists(std::wstring const& class_name);
 

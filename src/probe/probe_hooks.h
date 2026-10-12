@@ -27,6 +27,11 @@
 // 迟到的 ping，从而把正常顺序误判成失败。
 namespace deskfeed::probe {
 
+// 读一份 R3 阶段快照。它就是负载导出的 `DeskFeedProbeObserverStage`：第三方钩子在**自己的回调帧
+// 里、同一条线程上**调用它；返回 1 表示这次读到了正在被观测的一次安装。负载侧的实现是纯原子
+// 读取 + 固定大小拷贝（无锁、无分配、不碰 XAML），所以从钩子帧里调用是安全的。
+using StageReader = int(__stdcall*)(HookProbeStage* out, unsigned bytes);
+
 // ack 窗口（宿主自己的 STATIC 子窗口）收到的观测。
 struct AckObservation {
     unsigned hits = 0;                       // 收到的 WM_NULL 次数
@@ -43,12 +48,13 @@ struct ThirdPartyObservation {
 };
 
 // 在 `thread_id` 上装第三方钩子。必须**早于**负载的钩子安装（负载的 `CallNextHookEx` 才会到它）。
-// `phase` 可以为空（那就永不泵消息，只记进入次数）。`ack_window` 是宿主自己的 STATIC 子窗口，
-// 它在自己的线程上被子类化（底层仍是系统 STATIC 过程，绝不是负载模块的窗口过程）。
-bool third_party_install(DWORD thread_id, HookPhasePod* phase, HWND ack_window, std::wstring& error);
+// `reader` 为负载的阶段读取入口（R3），为 null 时永不泵消息、只记进入次数。
+// `ack_window` 是宿主自己的 STATIC 子窗口，它在自己的线程上被子类化（底层仍是系统 STATIC 过程，
+// 绝不是负载模块的窗口过程）。
+bool third_party_install(DWORD thread_id, StageReader reader, HWND ack_window, std::wstring& error);
 
-// 恢复导入表……不，恢复窗口过程并卸钩。卸载必须在**它自己的线程**上做，或者宿主已经确定
-// 目标线程不再取消息；探针在收尾时调用它，失败只记日志（不改变被测对象的状态）。
+// 恢复窗口过程并卸钩。卸载必须在**它自己的线程**上做，或者宿主已经确定目标线程不再取消息；
+// 探针在收尾时调用它，失败只记日志（不改变被测对象的状态）。
 bool third_party_uninstall(std::wstring& error);
 
 ThirdPartyObservation third_party_observation();

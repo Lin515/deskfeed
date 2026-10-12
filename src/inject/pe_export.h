@@ -40,9 +40,16 @@ enum class PeExportError {
 char const* pe_export_error_name(PeExportError kind);
 
 struct PeExportInfo {
-    unsigned long rva = 0;            // 模块内偏移，可直接加到远程基址上
+    unsigned long rva = 0;            // 模块内偏移（**磁盘侧候选值**）
     unsigned long long image_size = 0;  // PE 的 SizeOfImage（用来和目标模块的 modBaseSize 交叉核对）
     unsigned short machine = 0;       // COFF Machine（本工程只接受 0x8664）
+    // 以下字段用于"磁盘这份 build 与远程装载的那份是不是同一个"的一致性核验（见 remote.h 的
+    // `remote_image_identity` / `image_identity_matches`）：TimeDateStamp、PE32+ 标记与导出 RVA
+    // 所在**可执行节**的虚拟区间都交出去，调用方不再只看 SizeOfImage。
+    unsigned long time_date_stamp = 0;
+    bool is_pe32_plus = false;
+    unsigned long section_va = 0;        // 导出 RVA 所在节的虚拟起点
+    unsigned long long section_end = 0;  // 该节的虚拟终点（不含）
 };
 
 // 成功时把结果写进 `out` 并返回 true。失败时返回 false，`error` 是一行排障说明，
@@ -52,6 +59,11 @@ bool pe_export_rva(std::wstring const& file_path, char const* export_name, PeExp
 
 // 磁盘镜像与目标进程里那个模块是不是同一份：`remote_image_size` 是 `MODULEENTRY32W` 的
 // `modBaseSize`（等于 SizeOfImage）。对不上说明目标装载的是另一个版本，偏移不再有意义。
+//
+// 注意：**这只够当快速前置**。SizeOfImage 相同不等于同一个 build；真正允许调用远程导出之前，
+// 还必须走 `remote.h` 的 `remote_image_identity` + `image_identity_matches`（核验 Machine /
+// PE32+ / TimeDateStamp / 同名导出的**远程真实 RVA** / 该 RVA 落在可执行节内），并且调用时用
+// 远程确认过的 RVA，而不是这里的磁盘 RVA。
 bool pe_image_matches_module(PeExportInfo const& info, unsigned long long remote_image_size,
                              std::wstring& error);
 

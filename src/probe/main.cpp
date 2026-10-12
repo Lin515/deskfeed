@@ -9,6 +9,9 @@
 //   deskfeed-probe.exe --reading-rows <snapshot.json> [--refresh-ms <n>]
 //   deskfeed-probe.exe --frame-reading <frame.json>                       (仅诊断的显示帧量具)
 //
+// 退出码：0 = 跑了且符合预期；1 = 跑了但有断言失败；2 = BLOCKED（缺必需导出或参数无效，一条没跑）。
+// "没跑"绝不允许以 0 返回。
+//
 // 三种离线量具**先于**任何窗口/线程/XAML/DLL：它们只把一份正文换算成读数文本，输出要与
 // 桌面悬浮窗逐字节可比。`--mock` 与 `--feed` 互斥：前者在宿主线程上 inline 解析并应用（结构
 // 自测），后者把宿主的岛登记成负载的托盘目标、跑**生产入口**（负载经真实 hook 编组到 UI 线程）。
@@ -47,7 +50,10 @@ void print_usage() {
         L"                          completion-gate ordering\n"
         L"  --mutation-early-done   adversarial failpoint: expect the ordering check to bite\n"
         L"  --install-race          delay publishing the hook handle (install/publish race)\n"
-        L"  --reading/--reading-rows/--frame-reading   offline gauges (no window, no DLL)\n";
+        L"  --reading/--reading-rows/--frame-reading   offline gauges (no window, no DLL)\n"
+        L"\n"
+        L"exit codes: 0 = ran and matched, 1 = ran with a failed assertion,\n"
+        L"            2 = BLOCKED (a required payload export is missing; nothing was run)\n";
     ::fputws(text.c_str(), stderr);
 }
 
@@ -160,6 +166,17 @@ bool parse(int argc, wchar_t** argv, ParseResult& out) {
     if (!have_mock && !out.host.feed) {
         return false;
     }
+    // 两种宿主模式互斥：feed 走生产入口，inline 结构自测与对抗序列都不能同时开。
+    if (out.host.feed) {
+        bool const conflicting = out.host.hook || out.host.teardown || out.host.balance_check ||
+                                 out.host.third_party || out.host.mutation_early_done ||
+                                 out.host.dump_only || out.host.install_delay_ms != 0 ||
+                                 out.host.hang_ui_ms != 0;
+        if (conflicting) {
+            ::fwprintf(stderr, L"--feed cannot be combined with the inline self-test switches\n");
+            return false;
+        }
+    }
     out.ok = true;
     return true;
 }
@@ -202,7 +219,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     int const code = deskfeed::probe::run_host(options);
-    deskfeed::log_format(L"probe finished (%s)", code == 0 ? L"ok" : L"failed");
+    if (code == deskfeed::probe::kHostExitBlocked) {
+        deskfeed::log_line(L"probe finished (blocked: required probe interfaces are missing)");
+    } else {
+        deskfeed::log_format(L"probe finished (%s)", code == 0 ? L"ok" : L"failed");
+    }
     deskfeed::log_close();
     return code;
 }

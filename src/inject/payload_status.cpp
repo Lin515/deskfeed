@@ -37,15 +37,45 @@ bool copy_stable_header(void const* view, deskfeed::FrameSharedHeader& out, std:
     return false;
 }
 
-std::wstring scope_of_pod(PayloadStatusPod const& pod) {
-    return std::wstring(pod.scope, pod_scope_length(pod));
+// scope 的**白名单**：规范里 scope 最多 32 个字符（与 `resolve_scope` 一致）；容量 36 只是
+// "装得下"的余量，不是合法长度。
+inline constexpr std::size_t kPayloadScopeMaxChars = 32;
+
+// 只读地把 POD 里的 scope 取成字符串，并同时完成全部合法性检查。校验与取值共用这一份实现，
+// 免得"检查过的"和"用出去的"是两次不同的截断：负载若写了 33..35 个字符、或在容量内没有结尾，
+// 都是规范之外的东西 —— **拒绝**，绝不用 `pod_scope_length()` 的截断结果冒充合法 scope。
+bool pod_scope_text(PayloadStatusPod const& pod, std::wstring& out, std::wstring& why) {
+    std::size_t length = 0;
+    while (length < kPayloadScopeCapacity && pod.scope[length] != L'\0') {
+        wchar_t const character = pod.scope[length];
+        bool const allowed = (character >= L'A' && character <= L'Z') ||
+                             (character >= L'a' && character <= L'z') ||
+                             (character >= L'0' && character <= L'9') || character == L'_' ||
+                             character == L'-';
+        if (!allowed) {
+            why = L"the scope string contains a character outside the allowed set";
+            return false;
+        }
+        ++length;
+    }
+    if (length >= kPayloadScopeCapacity) {
+        why = L"the scope string is not NUL terminated inside the ABI capacity";
+        return false;
+    }
+    if (length > kPayloadScopeMaxChars) {
+        why = L"the scope string is longer than the 32-character whitelist";
+        return false;
+    }
+    out.assign(pod.scope, length);
+    return true;
 }
 
 // POD 里的布尔字段只能是 0 或 1：别的值说明这份 POD 不是我们认识的那一份（或已经被写坏）。
 bool is_flag(std::uint32_t value) { return value == 0 || value == 1; }
 
 // 校验负载写回来的 POD：`size`/`abi` 之外，还要看每一个字段的取值域与 scope 串本身。
-bool pod_is_well_formed(PayloadStatusPod const& pod, std::wstring& why) {
+// 通过时把 scope 文本一并交出来（校验与取值同一份实现）。
+bool pod_is_well_formed(PayloadStatusPod const& pod, std::wstring& scope_text, std::wstring& why) {
     if (pod.size != sizeof(PayloadStatusPod) || pod.abi != kPayloadStatusAbi) {
         why = L"size/abi mismatch";
         return false;
@@ -64,29 +94,12 @@ bool pod_is_well_formed(PayloadStatusPod const& pod, std::wstring& why) {
         why = L"producer_pid_high is not zero";
         return false;
     }
-    if (pod.scope_length >= kPayloadScopeCapacity) {
-        // 规范里 scope 最多 32 个字符；长度到容量上限（= 串在容量内没有结尾）说明这不是规范值，
-        // 不能把被截断的 35 字符串当成合法的 32 字符 scope。
-        why = L"scope_length is out of range";
+    if (pod.width != kPayloadStatusWidth) {
+        // `width` 是把 ABI 尺寸钉死用的显式字段：不是 64 说明这份 POD 不是我们认识的那一份。
+        why = L"width is not the 64 this ABI requires";
         return false;
     }
-    bool const terminated = pod.scope[pod.scope_length] == L'\0';
-    if (!terminated) {
-        why = L"the scope string is not NUL terminated at scope_length";
-        return false;
-    }
-    for (std::uint32_t index = 0; index < pod.scope_length; ++index) {
-        wchar_t const character = pod.scope[index];
-        bool const allowed = (character >= L'A' && character <= L'Z') ||
-                             (character >= L'a' && character <= L'z') ||
-                             (character >= L'0' && character <= L'9') || character == L'_' ||
-                             character == L'-';
-        if (!allowed) {
-            why = L"the scope string contains a character outside the allowed set";
-            return false;
-        }
-    }
-    return true;
+    return pod_scope_text(pod, scope_text, why);
 }
 
 }  // namespace
@@ -207,14 +220,25 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
         out.detail = L"the on-disk payload does not match the loaded module: " + export_error;
         return true;
     }
+    // 尺寸相同不等于同一个 build：受限读取远程镜像自己的 PE 元数据与导出表，只有同名导出的
+    // 远程真实 RVA 与磁盘一致、且落在可执行节内才允许调用；否则就是"读不出可信状态"（Unknown），
+    // 绝不因此报成 NotMapped / active。
+    unsigned long verified_rva = 0;
+    if (!verify_remote_export(process_id, module.base, module.size, "DeskFeedGetStatus", export_info,
+                              verified_rva, export_error)) {
+        out.state = PayloadState::MappedUnknownAbi;
+        out.detail = L"the loaded payload does not match the on-disk DLL: " + export_error;
+        return true;
+    }
 
     PayloadStatusPod pod;
     pod.size = sizeof(PayloadStatusPod);
     pod.abi = kPayloadStatusAbi;
+    pod.width = kPayloadStatusWidth;  // 显式宽度：让负载侧 ABI 校验也能看出我们在说哪一份布局
 
     RemoteCall call;
     std::wstring fetch_error;
-    if (!remote_fetch_pod(process_id, module.base, export_info.rva, &pod, sizeof(pod), 5000, call,
+    if (!remote_fetch_pod(process_id, module.base, verified_rva, &pod, sizeof(pod), 5000, call,
                           fetch_error)) {
         out.state = PayloadState::MappedUnknownAbi;
         out.detail = L"DeskFeedGetStatus did not answer: " + fetch_error;
@@ -226,8 +250,9 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
                      deskfeed::hex_text(pod.abi) + L", size=" + deskfeed::hex_text(pod.size) + L")";
         return true;
     }
+    std::wstring pod_scope;
     std::wstring pod_problem;
-    if (!pod_is_well_formed(pod, pod_problem)) {
+    if (!pod_is_well_formed(pod, pod_scope, pod_problem)) {
         out.state = PayloadState::MappedUnknownAbi;
         out.detail = L"the payload wrote a malformed status POD: " + pod_problem;
         return true;
@@ -235,7 +260,7 @@ bool query_payload_status(unsigned long process_id, std::wstring const& dll_path
 
     out.have_pod = true;
     out.pod = pod;
-    out.scope_matches = scope_of_pod(pod) == scope;
+    out.scope_matches = pod_scope == scope;
 
     // POD 报的生产者身份必须与帧头一致：否则它挂的是**另一个** scope / 另一份邮箱的主人。
     if (out.mailbox_present) {

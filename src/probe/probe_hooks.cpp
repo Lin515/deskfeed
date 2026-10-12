@@ -7,10 +7,26 @@ namespace {
 
 std::atomic<HHOOK> g_hook{nullptr};
 std::atomic<bool> g_in_callback{false};
-HookPhasePod* g_phase = nullptr;
+std::atomic<StageReader> g_reader{nullptr};
 HWND g_ack_window = nullptr;
 WNDPROC g_ack_original = nullptr;
 std::atomic<DWORD> g_hook_thread{0};
+
+// 负载此刻是否正跑在它自己的 `CallNextHookEx` 帧里。取一份 R3 快照来判断：这一层不缓存状态，
+// 也不读负载的内存——common ABI 刻意不提供共享 POD。
+bool inside_payload_callnext() {
+    StageReader const reader = g_reader.load(std::memory_order_acquire);
+    if (reader == nullptr) {
+        return false;
+    }
+    HookProbeStage stage{};
+    stage.size = static_cast<std::uint32_t>(kProbeStageSize);
+    stage.version = kProbeStageVersion;
+    if (reader(&stage, static_cast<unsigned>(kProbeStageSize)) != 1) {
+        return false;  // 当前没有正在被观测的安装
+    }
+    return stage_inside_callnext(stage);
+}
 
 std::atomic<unsigned> g_entries{0};
 std::atomic<unsigned> g_pumps{0};
@@ -28,7 +44,7 @@ LRESULT CALLBACK ack_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     if (message == WM_NULL) {
         g_ack_hits.fetch_add(1, std::memory_order_relaxed);
         g_ack_last_tick.store(::GetTickCount64(), std::memory_order_relaxed);
-        if (g_phase != nullptr && phase_inside_callnext(*g_phase)) {
+        if (inside_payload_callnext()) {
             // 这一条就是硬失败证据：收尾的 ping 在负载的 CallNext 帧里被处理了。
             g_ack_hits_in_frame.fetch_add(1, std::memory_order_relaxed);
         }
@@ -39,7 +55,7 @@ LRESULT CALLBACK ack_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
 }
 
 LRESULT CALLBACK third_party_proc(int code, WPARAM wparam, LPARAM lparam) {
-    if (code < 0 || g_phase == nullptr) {
+    if (code < 0 || g_reader.load(std::memory_order_acquire) == nullptr) {
         return ::CallNextHookEx(nullptr, code, wparam, lparam);
     }
     // 重入保护：泵消息本身会再次触发本条线程的钩子，绝不能在泵里再泵。
@@ -52,7 +68,7 @@ LRESULT CALLBACK third_party_proc(int code, WPARAM wparam, LPARAM lparam) {
 
     // 只有负载正处在自己的 CallNextHookEx 里时才泵——否则一条与本次编组无关的消息检索也会
     // 被当成对抗场景，得到假失败。
-    if (phase_inside_callnext(*g_phase)) {
+    if (inside_payload_callnext()) {
         g_pumps.fetch_add(1, std::memory_order_relaxed);
         MSG message{};
         for (int index = 0; index < 16 && ::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++index) {
@@ -73,18 +89,25 @@ LRESULT CALLBACK third_party_proc(int code, WPARAM wparam, LPARAM lparam) {
 
 }  // namespace
 
-bool third_party_install(DWORD thread_id, HookPhasePod* phase, HWND ack_window, std::wstring& error) {
+bool third_party_install(DWORD thread_id, StageReader reader, HWND ack_window, std::wstring& error) {
     third_party_reset();
     if (thread_id == 0) {
         error = L"the third-party probe hook needs a target thread";
         return false;
     }
-    g_phase = phase;
+    if (reader == nullptr) {
+        // 没有 R3 读取入口就没法判断"负载是否在自己的 CallNext 帧里"，那这个钩子只会产生假失败。
+        // 缺必需接口必须由 feature gate 拦成 BLOCKED，绝不在这里退化成一个不会咬的量具。
+        error = L"the third-party probe hook needs the payload's observer-stage reader (R3)";
+        return false;
+    }
+    g_reader.store(reader, std::memory_order_release);
     g_ack_window = ack_window;
 
     if (ack_window != nullptr) {
         if (::IsWindow(ack_window) == FALSE) {
             error = L"the ack window does not exist";
+            g_reader.store(nullptr, std::memory_order_release);
             return false;
         }
         // 子类化宿主自己的 STATIC 窗口：必须在窗口所属线程上做（调用方保证）。
@@ -92,6 +115,7 @@ bool third_party_install(DWORD thread_id, HookPhasePod* phase, HWND ack_window, 
             ack_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&ack_proc)));
         if (g_ack_original == nullptr) {
             error = L"cannot subclass the ack window: " + std::to_wstring(::GetLastError());
+            g_reader.store(nullptr, std::memory_order_release);
             return false;
         }
     }
@@ -103,6 +127,8 @@ bool third_party_install(DWORD thread_id, HookPhasePod* phase, HWND ack_window, 
             ::SetWindowLongPtrW(ack_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_ack_original));
             g_ack_original = nullptr;
         }
+        g_ack_window = nullptr;
+        g_reader.store(nullptr, std::memory_order_release);
         return false;
     }
     g_hook.store(hook);
@@ -125,7 +151,7 @@ bool third_party_uninstall(std::wstring& error) {
         g_ack_original = nullptr;
     }
     g_ack_window = nullptr;
-    g_phase = nullptr;
+    g_reader.store(nullptr, std::memory_order_release);
     return ok;
 }
 

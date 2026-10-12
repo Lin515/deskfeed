@@ -5,8 +5,10 @@
 
 #include <tlhelp32.h>
 
+#include <cstring>
 #include <cwctype>
 #include <iterator>
+#include <vector>
 
 namespace deskfeed::inject {
 namespace {
@@ -698,6 +700,361 @@ bool remote_fetch_pod(unsigned long process_id, unsigned long long module_base, 
 
     remote_free(process_id, buffer);
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// 远程镜像身份核验（T7）。全部只读、有界：见 remote.h 的说明。
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr unsigned long long kMaxDosHeaderBytes = 64;
+constexpr unsigned long long kMaxLfanew = 64 * 1024;
+constexpr unsigned long kMaxSectionCount = 96;
+constexpr unsigned long kMaxExportNames = 4096;
+constexpr unsigned long kMaxExportFunctions = 4096;
+constexpr unsigned long long kMaxNameBytes = 256;
+constexpr unsigned long long kIdentityReadBudget = 1024 * 1024;
+
+// [rva, rva+size) 是否整个落在镜像里。64 位相加，DWORD 回绕不能绕过边界。
+bool rva_range_inside(unsigned long rva, unsigned long long size, unsigned long long image_size) {
+    if (size == 0) {
+        return false;
+    }
+    unsigned long long const begin = rva;
+    if (begin >= image_size) {
+        return false;
+    }
+    return size <= image_size - begin;
+}
+
+// 一次核验内的读取计数：任何一段读取都先扣预算，超了就整条核验失败。
+struct IdentityReader {
+    unsigned long process_id = 0;
+    unsigned long long base = 0;
+    unsigned long long budget_left = kIdentityReadBudget;
+    std::wstring& error;
+
+    bool read(unsigned long long rva, void* out, std::size_t bytes, char const* what) {
+        if (bytes == 0 || static_cast<unsigned long long>(bytes) > budget_left) {
+            error = L"the identity probe read budget is exhausted while reading ";
+            error += widen_ascii(what);
+            return false;
+        }
+        budget_left -= bytes;
+        if (!remote_read(process_id, base + rva, out, bytes, error)) {
+            error = L"cannot read " + widen_ascii(what) + L": " + error;
+            return false;
+        }
+        return true;
+    }
+
+    static std::wstring widen_ascii(char const* text) {
+        std::wstring out;
+        for (; text != nullptr && *text != '\0'; ++text) {
+            out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*text)));
+        }
+        return out;
+    }
+};
+
+}  // namespace
+
+bool remote_image_identity(unsigned long process_id, unsigned long long module_base,
+                           unsigned long long module_size, char const* export_name,
+                           RemoteImageIdentity& out, std::wstring& error) {
+    out = RemoteImageIdentity{};
+    error.clear();
+    if (export_name == nullptr || *export_name == '\0') {
+        error = L"the identity probe needs an export name";
+        return false;
+    }
+    if (module_size == 0) {
+        error = L"the module table reports a zero image size";
+        return false;
+    }
+    IdentityReader reader{process_id, module_base, kIdentityReadBudget, error};
+
+    // 1) DOS 头：e_lfanew 必须落在有界范围内。
+    unsigned char dos[kMaxDosHeaderBytes]{};
+    if (!reader.read(0, dos, sizeof(dos), "the DOS header")) {
+        return false;
+    }
+    unsigned short const dos_magic = static_cast<unsigned short>(dos[0] | (dos[1] << 8));
+    if (dos_magic != 0x5A4D) {
+        error = L"the loaded module does not start with MZ";
+        return false;
+    }
+    LONG lfanew = 0;
+    std::memcpy(&lfanew, dos + 0x3C, sizeof(lfanew));
+    if (lfanew <= 0 || static_cast<unsigned long long>(lfanew) >= kMaxLfanew) {
+        error = L"the loaded module has an out-of-range e_lfanew";
+        return false;
+    }
+    unsigned long long const nt = static_cast<unsigned long long>(lfanew);
+
+    // 2) NT 头：签名、Machine、节数、TimeDateStamp、PE32+、SizeOfImage、导出目录项。
+    //    一次读 4 + 20 + 240 字节（PE32+ 可选头头部含 16 个数据目录）。多读的尾部不会被解释。
+    unsigned char nt_headers[4 + 20 + 240]{};
+    if (!reader.read(nt, nt_headers, sizeof(nt_headers), "the NT headers")) {
+        return false;
+    }
+    if (std::memcmp(nt_headers, "PE\0\0", 4) != 0) {
+        error = L"the loaded module has no PE signature";
+        return false;
+    }
+    unsigned char const* const file_header = nt_headers + 4;
+    unsigned char const* const optional = file_header + 20;
+    unsigned short machine = 0;
+    unsigned short section_count = 0;
+    unsigned long time_date_stamp = 0;
+    unsigned short optional_size = 0;
+    std::memcpy(&machine, file_header + 0, sizeof(machine));
+    std::memcpy(&section_count, file_header + 2, sizeof(section_count));
+    std::memcpy(&time_date_stamp, file_header + 4, sizeof(time_date_stamp));
+    std::memcpy(&optional_size, file_header + 16, sizeof(optional_size));
+    if (machine != IMAGE_FILE_MACHINE_AMD64) {
+        error = L"the loaded module is not AMD64";
+        return false;
+    }
+    if (section_count == 0 || section_count > kMaxSectionCount) {
+        error = L"the loaded module declares an out-of-range section count";
+        return false;
+    }
+    if (optional_size < 112 + 8) {
+        error = L"the loaded module has no room for the export data directory";
+        return false;
+    }
+    unsigned short magic = 0;
+    unsigned long size_of_image = 0;
+    unsigned long number_of_directories = 0;
+    unsigned long export_rva = 0;
+    unsigned long export_size = 0;
+    std::memcpy(&magic, optional + 0, sizeof(magic));
+    std::memcpy(&size_of_image, optional + 56, sizeof(size_of_image));
+    std::memcpy(&number_of_directories, optional + 108, sizeof(number_of_directories));
+    std::memcpy(&export_rva, optional + 112, sizeof(export_rva));
+    std::memcpy(&export_size, optional + 116, sizeof(export_size));
+    if (magic != 0x20B) {
+        error = L"the loaded module is not PE32+";
+        return false;
+    }
+    if (size_of_image == 0 || static_cast<unsigned long long>(size_of_image) != module_size) {
+        error = L"the loaded module reports a different SizeOfImage than the module table";
+        return false;
+    }
+    if (number_of_directories < 1) {
+        error = L"the loaded module declares no data directories";
+        return false;
+    }
+    if (export_rva == 0 || export_size < 40) {
+        error = L"the loaded module has no usable export directory";
+        return false;
+    }
+    unsigned long long const image_size = size_of_image;
+    if (!rva_range_inside(export_rva, export_size, image_size)) {
+        error = L"the loaded module's export directory is out of range";
+        return false;
+    }
+
+    // 3) 导出目录本体。
+    unsigned char directory[40]{};
+    if (!reader.read(export_rva, directory, sizeof(directory), "the export directory")) {
+        return false;
+    }
+    unsigned long function_count = 0;
+    unsigned long name_count = 0;
+    unsigned long functions_rva = 0;
+    unsigned long names_rva = 0;
+    unsigned long ordinals_rva = 0;
+    std::memcpy(&function_count, directory + 20, sizeof(function_count));
+    std::memcpy(&name_count, directory + 24, sizeof(name_count));
+    std::memcpy(&functions_rva, directory + 28, sizeof(functions_rva));
+    std::memcpy(&names_rva, directory + 32, sizeof(names_rva));
+    std::memcpy(&ordinals_rva, directory + 36, sizeof(ordinals_rva));
+    if (name_count == 0 || name_count > kMaxExportNames || function_count == 0 ||
+        function_count > kMaxExportFunctions) {
+        error = L"the loaded module declares an out-of-range export table";
+        return false;
+    }
+    if (functions_rva == 0 || names_rva == 0 || ordinals_rva == 0 ||
+        !rva_range_inside(functions_rva, function_count * 4ull, image_size) ||
+        !rva_range_inside(names_rva, name_count * 4ull, image_size) ||
+        !rva_range_inside(ordinals_rva, name_count * 2ull, image_size)) {
+        error = L"the loaded module's export arrays are out of range";
+        return false;
+    }
+
+    // 4) 在名字表里找目标导出。先读 4 字节做前缀筛选，只有前缀相符才把整串读回来（有界 NUL）。
+    std::size_t const wanted_length = std::strlen(export_name);
+    unsigned long found_ordinal = 0;
+    bool found = false;
+    for (unsigned long index = 0; index < name_count && !found; ++index) {
+        unsigned long name_rva = 0;
+        if (!reader.read(names_rva + index * 4ull, &name_rva, sizeof(name_rva), "an export name RVA")) {
+            return false;
+        }
+        if (name_rva == 0 || static_cast<unsigned long long>(name_rva) >= image_size) {
+            error = L"the loaded module has an out-of-range export name RVA";
+            return false;
+        }
+        unsigned char prefix[4]{};
+        if (!reader.read(name_rva, prefix, sizeof(prefix), "an export name prefix")) {
+            return false;
+        }
+        std::size_t const prefix_length = wanted_length < sizeof(prefix) ? wanted_length : sizeof(prefix);
+        if (std::memcmp(prefix, export_name, prefix_length) != 0) {
+            continue;
+        }
+        // 名字必须在一个有界的窗口内以 NUL 结尾；找不到结尾就说明这不是一个可信的名字表。
+        unsigned long long const available = image_size - name_rva;
+        unsigned long long const window = available < kMaxNameBytes ? available : kMaxNameBytes;
+        std::vector<unsigned char> window_bytes(static_cast<std::size_t>(window));
+        if (!reader.read(name_rva, window_bytes.data(), window_bytes.size(), "an export name")) {
+            return false;
+        }
+        std::size_t name_length = 0;
+        while (name_length < window_bytes.size() && window_bytes[name_length] != 0) {
+            ++name_length;
+        }
+        if (name_length >= window_bytes.size()) {
+            error = L"the loaded module has an export name without a bounded NUL";
+            return false;
+        }
+        if (name_length != wanted_length ||
+            std::memcmp(window_bytes.data(), export_name, wanted_length) != 0) {
+            continue;
+        }
+        unsigned short ordinal = 0;
+        if (!reader.read(ordinals_rva + index * 2ull, &ordinal, sizeof(ordinal), "an export ordinal")) {
+            return false;
+        }
+        if (ordinal >= function_count) {
+            error = L"the loaded module's export ordinal is out of range";
+            return false;
+        }
+        found_ordinal = ordinal;
+        found = true;
+    }
+    if (!found) {
+        error = L"the loaded module does not export ";
+        error += IdentityReader::widen_ascii(export_name);
+        return false;
+    }
+
+    // 5) 函数 RVA：转发导出（落在导出目录自身里）一律拒绝；RVA 0 / 越界也拒绝。
+    unsigned long function_rva = 0;
+    if (!reader.read(functions_rva + static_cast<unsigned long long>(found_ordinal) * 4, &function_rva,
+                     sizeof(function_rva), "an export function RVA")) {
+        return false;
+    }
+    unsigned long long const directory_begin = export_rva;
+    unsigned long long const directory_end = static_cast<unsigned long long>(export_rva) + export_size;
+    if (static_cast<unsigned long long>(function_rva) >= directory_begin &&
+        static_cast<unsigned long long>(function_rva) < directory_end) {
+        error = L"the loaded module's export is a forwarder";
+        return false;
+    }
+    if (function_rva == 0 || static_cast<unsigned long long>(function_rva) >= image_size) {
+        error = L"the loaded module's export RVA is zero or out of range";
+        return false;
+    }
+
+    // 6) 节表：证明这个 RVA 落在**可执行**节内。
+    unsigned long long const sections_at = nt + 4 + 20 + optional_size;
+    std::vector<unsigned char> sections(static_cast<std::size_t>(section_count) * 40);
+    if (!reader.read(sections_at, sections.data(), sections.size(), "the section table")) {
+        return false;
+    }
+    bool in_exec_section = false;
+    for (unsigned long index = 0; index < section_count && !in_exec_section; ++index) {
+        unsigned char const* const entry = sections.data() + index * 40;
+        unsigned long virtual_size = 0;
+        unsigned long virtual_address = 0;
+        unsigned long characteristics = 0;
+        std::memcpy(&virtual_size, entry + 8, sizeof(virtual_size));
+        std::memcpy(&virtual_address, entry + 12, sizeof(virtual_address));
+        std::memcpy(&characteristics, entry + 36, sizeof(characteristics));
+        if (virtual_size == 0) {
+            continue;
+        }
+        unsigned long long const begin = virtual_address;
+        unsigned long long const end = begin + virtual_size;
+        if (function_rva < begin || function_rva >= end) {
+            continue;
+        }
+        if (end > image_size) {
+            error = L"the loaded module's executable section extends past SizeOfImage";
+            return false;
+        }
+        if ((characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+            error = L"the loaded module's export RVA lives in a non-executable section";
+            return false;
+        }
+        in_exec_section = true;
+    }
+    if (!in_exec_section) {
+        error = L"the loaded module's export RVA is not inside any executable section";
+        return false;
+    }
+
+    out.machine = machine;
+    out.pe32_plus = true;
+    out.image_size = image_size;
+    out.time_date_stamp = time_date_stamp;
+    out.export_rva = function_rva;
+    out.export_in_exec_section = true;
+    return true;
+}
+
+bool image_identity_matches(PeExportInfo const& disk, RemoteImageIdentity const& remote,
+                            std::wstring& error) {
+    error.clear();
+    if (disk.machine != IMAGE_FILE_MACHINE_AMD64 || remote.machine != IMAGE_FILE_MACHINE_AMD64) {
+        error = L"the disk image and the loaded module are not both AMD64";
+        return false;
+    }
+    if (!disk.is_pe32_plus || !remote.pe32_plus) {
+        error = L"the disk image and the loaded module are not both PE32+";
+        return false;
+    }
+    if (disk.image_size != remote.image_size) {
+        error = L"the loaded module has a different SizeOfImage than the on-disk DLL";
+        return false;
+    }
+    if (disk.time_date_stamp != remote.time_date_stamp) {
+        error = L"the loaded module has a different TimeDateStamp than the on-disk DLL (a different "
+                L"build is mapped)";
+        return false;
+    }
+    if (disk.rva != remote.export_rva) {
+        error = L"the same export name maps to a different RVA in the loaded module";
+        return false;
+    }
+    if (disk.rva < disk.section_va || disk.rva >= disk.section_end) {
+        error = L"the on-disk export RVA is not inside the executable section it was parsed from";
+        return false;
+    }
+    if (!remote.export_in_exec_section) {
+        error = L"the loaded module's export RVA was not proven to be executable";
+        return false;
+    }
+    return true;
+}
+
+bool verify_remote_export(unsigned long process_id, unsigned long long module_base,
+                          unsigned long long module_size, char const* export_name,
+                          PeExportInfo const& disk, unsigned long& verified_rva, std::wstring& error) {
+    verified_rva = 0;
+    RemoteImageIdentity remote;
+    if (!remote_image_identity(process_id, module_base, module_size, export_name, remote, error)) {
+        return false;
+    }
+    if (!image_identity_matches(disk, remote, error)) {
+        return false;
+    }
+    // 调用时用**远程确认过的** RVA：磁盘那个只是候选值。
+    verified_rva = remote.export_rva;
+    return true;
 }
 
 }  // namespace deskfeed::inject

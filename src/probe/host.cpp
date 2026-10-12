@@ -1,7 +1,9 @@
 #include "probe/host.h"
 
+#include "inject/status_pod.h"
 #include "platform/log.h"
 #include "platform/win32_util.h"
+#include "probe/host_gate.h"
 #include "probe/observer_pod.h"
 #include "probe/probe_hooks.h"
 
@@ -39,7 +41,8 @@ constexpr UINT kRunMessage = WM_APP + 1;
 // 形状（钩子记录留在链上，收尾拿不到完成证明）。判断必须在 PeekMessage **之前**生效。
 constexpr UINT kHangMessage = WM_APP + 2;
 
-// 负载给自测宿主用的一组导出（冻结 ABI，见 src/payload/dllmain.cpp）。
+// 负载给自测宿主用的一组导出（签名与负载侧 common ABI 头逐字一致，见
+// src/payload/probe_api.h 与 dllmain.cpp；这里只按名字解析，不链接负载）。
 struct ProbeExports {
     int(__stdcall* start)() = nullptr;
     int(__stdcall* sites)() = nullptr;
@@ -54,17 +57,22 @@ struct ProbeExports {
     int(__stdcall* teardown)(unsigned) = nullptr;
     void(__stdcall* stop)() = nullptr;
     int(__stdcall* dangling)() = nullptr;
-    // 生产入口与（待负载作者冻结的）probe 专用入口。
+    // 探针 ABI（R1–R5，common 头 src/payload/probe_api.h）。
+    void(__stdcall* set_install_delay)(unsigned) = nullptr;              // R1
+    int(__stdcall* hook_status)(HookProbeStatus*, unsigned) = nullptr;   // R2
+    int(__stdcall* set_observer)(int) = nullptr;                         // R3（开关）
+    int(__stdcall* observer_stage)(HookProbeStage*, unsigned) = nullptr; // R3（拉一份快照）
+    int(__stdcall* set_completion_mutation)(unsigned) = nullptr;         // R4
+    int(__stdcall* set_tray_window)(HWND) = nullptr;                     // R5
+    // 生产入口与状态 ABI。
     DWORD(WINAPI* feed_start)(void*) = nullptr;
     DWORD(WINAPI* feed_stop)(void*) = nullptr;
-    void(__stdcall* set_tray_window)(HWND) = nullptr;
-    void(__stdcall* set_install_delay)(unsigned) = nullptr;
-    void(__stdcall* set_observer)(HookPhasePod*) = nullptr;
-    void(__stdcall* set_completion_mutation)(unsigned) = nullptr;
+    DWORD(WINAPI* get_status)(void*) = nullptr;
 };
 
 HostOptions g_options;
 ProbeExports g_probe;
+ExportPresence g_presence;
 HMODULE g_module = nullptr;
 HWND g_window = nullptr;
 HWND g_ack = nullptr;
@@ -72,8 +80,8 @@ DWORD g_ui_thread = 0;
 HANDLE g_ui_done = nullptr;
 bool g_feed_retired = false;
 bool g_failed = false;
+bool g_blocked = false;
 bool g_dump_only = false;
-HookPhasePod g_phase{};
 
 struct ExtraCore {
     HANDLE thread = nullptr;
@@ -197,6 +205,8 @@ bool create_extra_cores(unsigned target) {
 
 // ---- 对抗与验收 ---------------------------------------------------------
 
+// 按名字把负载的探针导出解析出来。**只填**，不做"缺了就跳过"的判断：需要什么由 feature gate
+// （host_gate.h）决定，缺必需接口一律 BLOCKED。返回 false 只表示"这个模块连基线都不像负载"。
 bool resolve_exports(HMODULE module) {
     g_probe.start = reinterpret_cast<int(__stdcall*)()>(::GetProcAddress(module, "DeskFeedProbeStart"));
     g_probe.sites = reinterpret_cast<int(__stdcall*)()>(::GetProcAddress(module, "DeskFeedProbeSites"));
@@ -218,48 +228,145 @@ bool resolve_exports(HMODULE module) {
     g_probe.stop = reinterpret_cast<void(__stdcall*)()>(::GetProcAddress(module, "DeskFeedProbeStop"));
     g_probe.dangling = reinterpret_cast<int(__stdcall*)()>(
         ::GetProcAddress(module, "DeskFeedProbeDangling"));
+    g_probe.set_install_delay = reinterpret_cast<void(__stdcall*)(unsigned)>(
+        ::GetProcAddress(module, "DeskFeedProbeSetInstallDelay"));
+    g_probe.hook_status = reinterpret_cast<int(__stdcall*)(HookProbeStatus*, unsigned)>(
+        ::GetProcAddress(module, "DeskFeedProbeHookStatus"));
+    g_probe.set_observer = reinterpret_cast<int(__stdcall*)(int)>(
+        ::GetProcAddress(module, "DeskFeedProbeSetObserver"));
+    g_probe.observer_stage = reinterpret_cast<int(__stdcall*)(HookProbeStage*, unsigned)>(
+        ::GetProcAddress(module, "DeskFeedProbeObserverStage"));
+    g_probe.set_completion_mutation = reinterpret_cast<int(__stdcall*)(unsigned)>(
+        ::GetProcAddress(module, "DeskFeedProbeSetCompletionMutation"));
+    g_probe.set_tray_window = reinterpret_cast<int(__stdcall*)(HWND)>(
+        ::GetProcAddress(module, "DeskFeedProbeSetTrayWindow"));
     g_probe.feed_start = reinterpret_cast<DWORD(WINAPI*)(void*)>(
         ::GetProcAddress(module, "DeskFeedStart"));
     g_probe.feed_stop = reinterpret_cast<DWORD(WINAPI*)(void*)>(
         ::GetProcAddress(module, "DeskFeedStop"));
-    g_probe.set_tray_window = reinterpret_cast<void(__stdcall*)(HWND)>(
-        ::GetProcAddress(module, "DeskFeedProbeSetTrayWindow"));
-    g_probe.set_install_delay = reinterpret_cast<void(__stdcall*)(unsigned)>(
-        ::GetProcAddress(module, "DeskFeedProbeSetInstallDelay"));
-    g_probe.set_observer = reinterpret_cast<void(__stdcall*)(HookPhasePod*)>(
-        ::GetProcAddress(module, "DeskFeedProbeSetObserver"));
-    g_probe.set_completion_mutation = reinterpret_cast<void(__stdcall*)(unsigned)>(
-        ::GetProcAddress(module, "DeskFeedProbeSetCompletionMutation"));
-    return g_probe.start != nullptr && g_probe.sites != nullptr && g_probe.watch != nullptr &&
-           g_probe.run != nullptr && g_probe.set_host != nullptr && g_probe.stop != nullptr;
+    g_probe.get_status = reinterpret_cast<DWORD(WINAPI*)(void*)>(
+        ::GetProcAddress(module, "DeskFeedGetStatus"));
+
+    g_presence.start = g_probe.start != nullptr;
+    g_presence.sites = g_probe.sites != nullptr;
+    g_presence.watch = g_probe.watch != nullptr;
+    g_presence.run = g_probe.run != nullptr;
+    g_presence.set_host = g_probe.set_host != nullptr;
+    g_presence.stop = g_probe.stop != nullptr;
+    g_presence.set_slow_apply = g_probe.set_slow_apply != nullptr;
+    g_presence.post_apply = g_probe.post_apply != nullptr;
+    g_presence.retire = g_probe.retire != nullptr;
+    g_presence.hook = g_probe.hook != nullptr;
+    g_presence.teardown = g_probe.teardown != nullptr;
+    g_presence.dangling = g_probe.dangling != nullptr;
+    g_presence.hook_status = g_probe.hook_status != nullptr;
+    g_presence.set_observer = g_probe.set_observer != nullptr;
+    g_presence.observer_stage = g_probe.observer_stage != nullptr;
+    g_presence.set_install_delay = g_probe.set_install_delay != nullptr;
+    g_presence.set_completion_mutation = g_probe.set_completion_mutation != nullptr;
+    g_presence.set_tray_window = g_probe.set_tray_window != nullptr;
+    g_presence.feed_start = g_probe.feed_start != nullptr;
+    g_presence.feed_stop = g_probe.feed_stop != nullptr;
+    g_presence.get_status = g_probe.get_status != nullptr;
+
+    return g_probe.start != nullptr || g_probe.feed_start != nullptr;
+}
+
+// 在**本进程内**读一次 144 字节状态 POD，并逐项校验。返回 1 表示这份 POD 可信；返回 0 时
+// `why` 说明原因。校验与取值共用同一份实现：绝不用"截断过的" scope 冒充合法 scope，也不把
+// 尺寸/abi/width 对不上的一份 POD 当结论（fail closed）。
+// `require_scope`：运行期必须报告本次运行的 scope；收尾之后负载可以合法地把 scope 清掉，
+// 那时只校验 ABI 与字段域。
+int read_status_pod(deskfeed::inject::PayloadStatusPod& pod, bool require_scope,
+                    std::wstring& why) {
+    using deskfeed::inject::kPayloadScopeCapacity;
+    using deskfeed::inject::kPayloadStatusAbi;
+    using deskfeed::inject::kPayloadStatusPodBytes;
+    using deskfeed::inject::kPayloadStatusWidth;
+    using deskfeed::inject::PayloadStatusPod;
+
+    pod = PayloadStatusPod{};
+    pod.size = static_cast<std::uint32_t>(sizeof(pod));
+    pod.abi = kPayloadStatusAbi;
+    pod.width = kPayloadStatusWidth;
+    if (g_probe.get_status == nullptr) {
+        why = L"the payload exports no DeskFeedGetStatus";
+        return 0;
+    }
+    if (g_probe.get_status(&pod) != 1) {
+        why = L"DeskFeedGetStatus returned 0";
+        return 0;
+    }
+    if (pod.abi != kPayloadStatusAbi || pod.size != kPayloadStatusPodBytes) {
+        why = L"the status POD reports a different size/abi";
+        return 0;
+    }
+    if (pod.width != kPayloadStatusWidth) {
+        why = L"the status POD reports a different ABI width";
+        return 0;
+    }
+    // 规范白名单：scope 最多 32 个字符，且必须在 ABI 容量内以 NUL 结尾。
+    std::size_t length = 0;
+    while (length < kPayloadScopeCapacity && pod.scope[length] != L'\0') {
+        ++length;
+    }
+    if (length >= kPayloadScopeCapacity) {
+        why = L"the reported scope is not NUL terminated inside the ABI capacity";
+        return 0;
+    }
+    if (length > 32) {
+        why = L"the reported scope is longer than the 32-character whitelist";
+        return 0;
+    }
+    if (require_scope && std::wstring(pod.scope, length) != g_options.scope) {
+        why = L"the reported scope is not the scope of this run";
+        return 0;
+    }
+    return 1;
 }
 
 // 第三方钩子 + install-race + 提前 done 的对抗序列。返回 true 表示观测符合预期。
+//
+// 这一条**不再**"缺接口就 return true"：缺任何一项必需导出时 feature gate 已经把它拦成 BLOCKED，
+// 而这里再硬断言一次（防御性）：运行时少一个入口就是失败，绝不静默跳过。
 bool run_ordering_case() {
-    if (!g_options.third_party || g_probe.post_apply == nullptr || g_probe.retire == nullptr) {
+    if (!g_options.third_party && g_options.install_delay_ms == 0) {
         return true;
     }
-    HookPhasePod* const phase = g_probe.set_observer != nullptr ? &g_phase : nullptr;
-    if (phase != nullptr) {
-        g_phase = HookPhasePod{};
-        g_phase.size = sizeof(HookPhasePod);
-        g_phase.abi = kHookPhaseAbi;
-        g_probe.set_observer(phase);
+    if (g_probe.post_apply == nullptr || g_probe.retire == nullptr ||
+        g_probe.set_observer == nullptr || g_probe.observer_stage == nullptr ||
+        g_probe.hook_status == nullptr || g_probe.dangling == nullptr) {
+        deskfeed::log_line(L"ordering: a required probe export disappeared after the gate; "
+                           L"refusing to run the case");
+        return false;
+    }
+
+    // R3 打开阶段记录：第三方钩子随后每次取样都是从负载拉一份最新快照。
+    if (g_probe.set_observer(1) != 1) {
+        deskfeed::log_line(L"ordering: the payload refused to observe hook stages (R3)");
+        return false;
     }
     if (g_probe.set_install_delay != nullptr && g_options.install_delay_ms != 0) {
         g_probe.set_install_delay(g_options.install_delay_ms);
     }
-    if (g_probe.set_completion_mutation != nullptr) {
-        g_probe.set_completion_mutation(g_options.mutation_early_done ? 1u : 0u);
+    if (g_options.mutation_early_done) {
+        if (g_probe.set_completion_mutation == nullptr ||
+            g_probe.set_completion_mutation(
+                static_cast<unsigned>(CompletionMutation::EarlyBeforeCallNext)) != 1) {
+            deskfeed::log_line(L"ordering: the early-done failpoint (R4) could not be armed");
+            g_probe.set_observer(0);
+            return false;
+        }
     }
 
     // **第三方钩子先装**，负载的钩子后装 → 负载的 CallNextHookEx 会到达第三方。
     std::wstring error;
-    if (!third_party_install(g_ui_thread, phase, g_ack, error)) {
+    if (!third_party_install(g_ui_thread, g_probe.observer_stage, g_ack, error)) {
         deskfeed::log_format(L"ordering: cannot install the third-party hook: %s", error.c_str());
         if (g_probe.set_completion_mutation != nullptr) {
-            g_probe.set_completion_mutation(0);
+            g_probe.set_completion_mutation(static_cast<unsigned>(CompletionMutation::Normal));
         }
+        g_probe.set_observer(0);
         return false;
     }
 
@@ -270,13 +377,34 @@ bool run_ordering_case() {
     std::wstring const stop_error;
     third_party_uninstall(error);
     if (g_probe.set_completion_mutation != nullptr) {
-        g_probe.set_completion_mutation(0);  // 收尾前强制复位：failpoint 绝不留到下一轮
+        // 收尾前强制复位：failpoint 绝不留到下一轮（生产启动也会复位，这里是双保险）。
+        g_probe.set_completion_mutation(static_cast<unsigned>(CompletionMutation::Normal));
     }
+    g_probe.set_observer(0);
 
     deskfeed::log_format(L"ordering: post=%d retire=%d entries=%u pumps=%u sentinels=%u "
                         L"ping_in_frame=%u ack_hits=%u ack_in_frame=%u",
                         posted, retired, third.entries, third.pumps, third.sentinels,
                         third.ping_in_frame, ack.hits, ack.hits_while_third_party_active);
+
+    // R2：把钩子门的数字状态如实打出来（只判"读得到"与"没有悬挂"，其余供人核查）。
+    HookProbeStatus status{};
+    status.size = static_cast<std::uint32_t>(kProbeStatusSize);
+    status.version = kProbeStatusVersion;
+    int const status_ok = g_probe.hook_status(&status, static_cast<unsigned>(kProbeStatusSize));
+    if (status_ok != 1) {
+        deskfeed::log_line(L"ordering: the hook-gate status POD (R2) could not be read");
+        return false;
+    }
+    deskfeed::log_format(L"ordering: status installed=%u retired=%u still_installed=%u in_flight=%u "
+                        L"pending=%u completion_expected=%u dangling=%u done=%u",
+                        status.hook_installed, status.retired, status.still_installed, status.in_flight,
+                        status.pending, status.completion_expected, status.dangling,
+                        status.done_signaled);
+    if (status.dangling != 0) {
+        deskfeed::log_line(L"ordering: the hook gate still reports a dangling record");
+        return false;
+    }
 
     if (g_options.mutation_early_done) {
         // 对抗：done 被提前，收尾会在负载的 CallNext 帧里被处理 —— 必须**观察到**这个症状，
@@ -306,7 +434,22 @@ bool run_ordering_case() {
 
 // UI 线程上：解析 + 应用（结构模式），或只跑对抗序列（feed 模式由负载自己应用）。
 bool run_on_ui() {
-    if (g_probe.set_slow_apply != nullptr && g_options.slow_apply_ms != 0) {
+    if (g_blocked) {
+        // BLOCKED：缺必需导出，一条也不跑。这里只负责把工作线程放行（它随后收窗口）。
+        if (g_ui_done != nullptr) {
+            ::SetEvent(g_ui_done);
+        }
+        return true;
+    }
+    if (g_options.slow_apply_ms != 0) {
+        // gate 已保证这个导出存在；再断言一次，绝不静默忽略这个请求。
+        if (g_probe.set_slow_apply == nullptr) {
+            deskfeed::log_line(L"slow-apply: the payload export disappeared after the gate");
+            if (g_ui_done != nullptr) {
+                ::SetEvent(g_ui_done);
+            }
+            return false;
+        }
         g_probe.set_slow_apply(g_options.slow_apply_ms);
     }
     if (!g_options.feed) {
@@ -331,11 +474,16 @@ bool run_on_ui() {
         }
     }
 
-    if (g_options.teardown && !g_options.feed && g_probe.teardown != nullptr) {
-        int const ok = g_probe.teardown(5000);
-        deskfeed::log_format(L"teardown: %s", ok == 1 ? L"retired" : L"NOT retired");
-        if (ok != 1) {
+    if (g_options.teardown && !g_options.feed) {
+        if (g_probe.teardown == nullptr) {
+            deskfeed::log_line(L"teardown: the payload export disappeared after the gate");
             g_failed = true;
+        } else {
+            int const ok = g_probe.teardown(5000);
+            deskfeed::log_format(L"teardown: %s", ok == 1 ? L"retired" : L"NOT retired");
+            if (ok != 1) {
+                g_failed = true;
+            }
         }
     }
     if (g_ui_done != nullptr) {
@@ -378,8 +526,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 
 // "任务栏线程被挂住"的对抗：短超时的 post/retire 必须**未退休**（0），恢复之后重试必须成功。
 bool run_hang_case() {
-    if (g_options.hang_ui_ms == 0 || g_probe.post_apply == nullptr || g_probe.retire == nullptr) {
+    if (g_options.hang_ui_ms == 0) {
         return true;
+    }
+    if (g_probe.post_apply == nullptr || g_probe.retire == nullptr) {
+        deskfeed::log_line(L"hang: a required probe export disappeared after the gate; "
+                           L"refusing to run the case");
+        return false;
     }
     ::PostMessageW(g_window, kHangMessage, 0, 0);
     ::Sleep(80);  // 让 UI 线程进到"不取消息"的窗口里
@@ -405,37 +558,87 @@ DWORD WINAPI worker_entry(LPVOID) {
     if (module == nullptr) {
         deskfeed::log_format(L"cannot load the payload: %s", deskfeed::last_error_text().c_str());
         g_failed = true;
+        g_blocked = true;  // 一条也跑不了：UI 线程必须什么都不碰（导出全是空指针）
         ::PostMessageW(g_window, kRunMessage, 0, 0);
+        ::WaitForSingleObject(g_ui_done, 30000);
+        ::PostMessageW(g_window, WM_CLOSE, 0, 0);
         return 0;
     }
     g_module = module;
 
     if (!resolve_exports(module)) {
-        deskfeed::log_line(L"the payload does not export the probe entry points");
+        deskfeed::log_line(L"the module does not export any known payload entry point");
         g_failed = true;
+        g_blocked = true;
         ::PostMessageW(g_window, kRunMessage, 0, 0);
+        ::WaitForSingleObject(g_ui_done, 30000);
+        ::PostMessageW(g_window, WM_CLOSE, 0, 0);
         return 0;
     }
 
-    if (g_options.hook && g_probe.hook != nullptr) {
-        deskfeed::log_format(L"reg hook: %s", g_probe.hook(1) == 1 ? L"installed" : L"refused");
+    // Feature gate：命令行开了什么，就必须有什么。缺一条就 BLOCKED（exit 2），一条也不跑——
+    // 决不允许"日志里说一句就跳过"再以 0 退出，让验收脚本把没跑读成通过。
+    GateDecision const gate = gate_decision(g_options, g_presence);
+    if (gate.blocked) {
+        for (GateMiss const& miss : gate.missing) {
+            deskfeed::log_format(L"BLOCKED: %s needs export %s", miss.feature.c_str(), miss.symbol);
+        }
+        deskfeed::log_format(L"BLOCKED: %zu required probe interface(s) are missing; no case was run",
+                             gate.missing.size());
+        g_blocked = true;
+        g_failed = true;
+        ::PostMessageW(g_window, kRunMessage, 0, 0);
+        ::WaitForSingleObject(g_ui_done, 30000);
+        ::PostMessageW(g_window, WM_CLOSE, 0, 0);
+        return 0;
     }
-    if (g_probe.set_slow_apply != nullptr && g_options.slow_apply_ms != 0) {
-        // 慢执行体是给"挂着的时候 stop 必须未退休"用的，越早设越好。
-        g_probe.set_slow_apply(g_options.slow_apply_ms);
+
+    if (g_options.hook) {
+        // gate 已保证 hook 存在；缺了就不是 PASS 而是失败。
+        if (g_probe.hook == nullptr) {
+            deskfeed::log_line(L"reg hook: the payload export disappeared after the gate");
+            g_failed = true;
+        } else {
+            int const installed = g_probe.hook(1);
+            deskfeed::log_format(L"reg hook: %s", installed == 1 ? L"installed" : L"refused");
+            if (installed != 1) {
+                g_failed = true;
+            }
+            // 自检完立刻还原：模块随后要被 FreeLibrary，钩子还留着就是在卸载自己的代码。
+            int const restored = g_probe.hook(0);
+            deskfeed::log_format(L"reg hook: restore -> %s", restored == 1 ? L"ok" : L"FAILED");
+            if (restored != 1) {
+                g_failed = true;
+            }
+        }
+    }
+    if (g_options.slow_apply_ms != 0) {
+        // 慢执行体是给"挂着的时候 stop 必须未退休"用的，越早设越好（UI 线程里还会再设一次）。
+        if (g_probe.set_slow_apply == nullptr) {
+            deskfeed::log_line(L"slow-apply: the payload export disappeared after the gate");
+            g_failed = true;
+        } else {
+            g_probe.set_slow_apply(g_options.slow_apply_ms);
+        }
     }
 
     if (g_options.feed) {
         // 生产路径：负载自己 attach mock 邮箱、自己把帧渲染进宿主的岛。**不做** inline 应用：
         // XAML 元素有线程亲和性，内容必须由负载经真实 hook 编组到 UI 线程。
-        if (g_probe.set_tray_window == nullptr || g_probe.feed_start == nullptr) {
-            deskfeed::log_line(L"the payload does not export the probe tray-window entry point; "
-                               L"feed mode needs it");
+        // R5：把宿主的岛登记成托盘目标。返回 0 = 负载拒绝了这个窗口，那是失败而不是跳过。
+        int const tray_ok = g_probe.set_tray_window(g_window);
+        DWORD owner_pid = 0;
+        DWORD const owner_thread = ::GetWindowThreadProcessId(g_window, &owner_pid);
+        if (tray_ok != 1) {
+            deskfeed::log_line(L"the payload refused the probe tray window (R5)");
             g_failed = true;
-            ::PostMessageW(g_window, kRunMessage, 0, 0);
-            return 0;
         }
-        g_probe.set_tray_window(g_window);
+        if (owner_pid != ::GetCurrentProcessId() || owner_thread != g_ui_thread) {
+            deskfeed::log_format(L"the tray window is not ours: pid=%lu thread=%lu (expected pid=%lu "
+                                 L"thread=%lu)",
+                                 owner_pid, owner_thread, ::GetCurrentProcessId(), g_ui_thread);
+            g_failed = true;
+        }
         std::wstring scope = g_options.scope;
         DWORD const started = g_probe.feed_start(&scope);
         deskfeed::log_format(L"DeskFeedStart -> %lu (%s)", started,
@@ -443,13 +646,30 @@ DWORD WINAPI worker_entry(LPVOID) {
         if (started != 1 && started != 3) {
             g_failed = true;
         }
+        // 144 字节状态 POD：started 必须为真、线程必须活着（gate 已保证导出存在）。
+        deskfeed::inject::PayloadStatusPod pod{};
+        std::wstring status_why;
+        if (read_status_pod(pod, /*require_scope=*/true, status_why) != 1) {
+            deskfeed::log_format(L"the status POD (144B) is not trustworthy after DeskFeedStart: %s",
+                                 status_why.c_str());
+            g_failed = true;
+        } else {
+            deskfeed::log_format(L"status: started=%u thread_alive=%u unload_safe=%u dangling=%u "
+                                L"mailbox=%u producer_alive=%u block=%u scope=<%s>",
+                                pod.started, pod.thread_alive, pod.unload_safe, pod.dangling,
+                                pod.mailbox_attached, pod.producer_alive, pod.xaml_block_present,
+                                pod.scope);
+            if (pod.started == 0) {
+                deskfeed::log_line(L"the status POD does not report a started payload");
+                g_failed = true;
+            }
+        }
         ::PostMessageW(g_window, kRunMessage, 0, 0);
         ::WaitForSingleObject(g_ui_done, 30000);
 
         // 收尾的对抗：挂住 UI / 让 apply 变慢时，**短超时**的 stop 必须报"未退休"（0），
         // 恢复之后重试必须报"可以卸载"（1）。绝不在这两种情况下强卸模块。
-        if (g_probe.feed_stop != nullptr &&
-            (g_options.slow_apply_ms != 0 || g_options.hang_ui_ms != 0)) {
+        if (g_options.slow_apply_ms != 0 || g_options.hang_ui_ms != 0) {
             if (g_options.hang_ui_ms != 0) {
                 ::PostMessageW(g_window, kHangMessage, 0, 0);
             }
@@ -480,8 +700,10 @@ DWORD WINAPI worker_entry(LPVOID) {
     }
     deskfeed::log_format(L"diagnostics sites after waiting: %d (wanted %u)", sites, g_options.cores);
     if (sites < static_cast<int>(g_options.cores)) {
+        // 少一条 site 就意味着这次运行证明不了 >1 核心时的引用归还：那是失败，不是"少跑了一条"。
         deskfeed::log_format(L"only %d of %u core(s) owned by this process attached a site", sites,
                              g_options.cores);
+        g_failed = true;
     }
 
     // 一次注入只走查一次，**不重试**：重试就是又一次走查，会把风险最高的操作重复一遍。
@@ -614,37 +836,77 @@ int run_host(HostOptions const& options) {
         ::DispatchMessageW(&message);
     }
 
-    if (options.feed && !g_feed_retired && g_probe.feed_stop != nullptr) {
-        // 生产收尾：只有返回 1 才表示门禁全过。
-        DWORD const stopped = g_probe.feed_stop(
-            reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
-        deskfeed::log_format(L"DeskFeedStop -> %lu (%s)", stopped,
-                             stopped == 1 ? L"retired" : L"NOT retired");
-        if (stopped != 1) {
+    if (g_blocked) {
+        // BLOCKED：什么都没跑（除了装载/解析导出与一次 LoadLibrary 引用）。
+        // 这里**不**调用任何会改变负载状态的入口，只把自己那份引用还清再退出。
+        report_module_references(g_module);
+    } else {
+        if (options.feed && !g_feed_retired) {
+            // 生产收尾：只有返回 1 才表示门禁全过。
+            DWORD const stopped = g_probe.feed_stop(
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
+            deskfeed::log_format(L"DeskFeedStop -> %lu (%s)", stopped,
+                                 stopped == 1 ? L"retired" : L"NOT retired");
+            if (stopped != 1) {
+                g_failed = true;
+            }
+        }
+        if (options.feed) {
+            // 状态 POD 复核：线程必须已经不在跑、unload_safe 必须为真、不得有悬挂。
+            deskfeed::inject::PayloadStatusPod pod{};
+            std::wstring status_why;
+            if (read_status_pod(pod, /*require_scope=*/false, status_why) != 1) {
+                deskfeed::log_format(L"the status POD (144B) is not trustworthy after DeskFeedStop: %s",
+                                     status_why.c_str());
+                g_failed = true;
+            } else {
+                deskfeed::log_format(L"status after stop: started=%u thread_alive=%u unload_safe=%u "
+                                    L"dangling=%u block=%u",
+                                    pod.started, pod.thread_alive, pod.unload_safe, pod.dangling,
+                                    pod.xaml_block_present);
+                if (pod.thread_alive != 0 || pod.unload_safe != 1 || pod.dangling != 0) {
+                    deskfeed::log_line(L"the payload is not safely retired according to its own "
+                                       L"status POD");
+                    g_failed = true;
+                }
+            }
+        }
+        if (g_probe.dangling != nullptr) {
+            if (g_probe.dangling() != 0) {
+                deskfeed::log_line(L"a hook is still dangling");
+                g_failed = true;
+            }
+        } else if (options.teardown || options.third_party || options.hook ||
+                   options.hang_ui_ms != 0 || options.feed) {
+            // gate 保证这些模式下 dangling 存在；真走到这里说明导出在运行期丢了。
+            deskfeed::log_line(L"the dangling judge export disappeared after the gate");
             g_failed = true;
         }
-    }
-    if (g_probe.dangling != nullptr && g_probe.dangling() != 0) {
-        deskfeed::log_line(L"a hook is still dangling");
-        g_failed = true;
-    }
-    if (options.balance_check && g_probe.stop != nullptr) {
-        // 第二次 stop 既不该多还也不该少还（引用数必须仍是 1）。
-        deskfeed::log_line(L"balance check: calling the payload stop entry point again");
-        g_probe.stop();
-    }
-    if (g_probe.stop != nullptr) {
-        g_probe.stop();
-    }
+        if (options.balance_check) {
+            // 第二次 stop 既不该多还也不该少还（引用数必须仍是 1）。
+            deskfeed::log_line(L"balance check: calling the payload stop entry point again");
+            g_probe.stop();
+        }
+        if (g_probe.stop != nullptr) {
+            g_probe.stop();
+        } else if (!options.feed) {
+            // 结构自测的 gate 要求 DeskFeedProbeStop 存在；真走到这里说明它在运行期丢了。
+            deskfeed::log_line(L"the payload stop entry point disappeared after the gate");
+            g_failed = true;
+        }
 
-    report_module_references(g_module);
+        report_module_references(g_module);
+    }
 
     for (ExtraCore* core : g_extra_cores) {
         if (core->thread != nullptr) {
             ::PostThreadMessageW(::GetThreadId(core->thread), WM_QUIT, 0, 0);
         }
     }
-    return g_failed ? 1 : 0;
+    if (g_blocked) {
+        return kHostExitBlocked;
+    }
+    return g_failed ? kHostExitFailed : kHostExitOk;
 }
 
 }  // namespace deskfeed::probe

@@ -106,15 +106,21 @@ bool stop_one(unsigned long process_id, std::wstring const& dll_path, bool no_un
         return false;
     }
     // 磁盘上那份镜像必须与目标进程里装载的那份是同一个版本：否则 RVA 加到一个不同 build 的
-    // 基址上就是跳到别的代码。
+    // 基址上就是跳到别的代码。SizeOfImage 只是快速前置，之后还要读远程镜像自己的 PE 元数据。
     if (!pe_image_matches_module(info, module.size, error)) {
+        return false;
+    }
+    unsigned long verified_rva = 0;
+    if (!verify_remote_export(process_id, module.base, module.size, kStopExportName, info,
+                              verified_rva, error)) {
+        error = L"the loaded payload does not match the on-disk DLL: " + error;
         return false;
     }
 
     // 超时值按 uintptr_t 编码在参数指针本身里（不解引用），这是冻结的负载 ABI。
     void* const encoded_timeout = reinterpret_cast<void*>(static_cast<std::uintptr_t>(kStopTimeoutMs));
     RemoteCall const call =
-        call_remote_export(process_id, module.base, info.rva, encoded_timeout,
+        call_remote_export(process_id, module.base, verified_rva, encoded_timeout,
                            kStopTimeoutMs + kCallGraceMs);
 
     UnloadDecision const decision = unload_decision(call.exit_code, call.signaled, no_unload);
@@ -247,15 +253,34 @@ int do_load(Options const& options) {
         if (status.state == PayloadState::MappedRetained) {
             report(L"refusing to reload: the mapped payload cannot prove it is retired (" +
                    status.detail + L"); fix or stop it first");
+            // 目标这一份不能动（它连"已退休"都证明不了），但别的 explorer.exe 里的残留仍要按同一套
+            // 安全门撤下：每次 load 都要做，哪怕这一轮对本目标什么都不做。
+            if (options.dry_run) {
+                report(L"dry run: would still retire stale payloads in other explorer.exe processes");
+            } else if (!clean_other_explorers(target.process_id, dll_path, /*dry_run=*/false)) {
+                report(L"stale-other-retained: a stale payload in another explorer.exe could not be safely removed (deployment requires no stale payload elsewhere)");
+            }
             return 1;
         }
         if (status.state == PayloadState::MappedActive) {
+            // 本目标这一轮是 no-op，但"清别的 explorer 里的残留"不是 no-op：旧 explorer 没退、
+            // 或以前装错过进程时，那一份会一直占着 DLL 且永远插不出读数块。stop_one 只在负载报
+            // "已退休"且远程线程退出后才 FreeLibrary，超时保留映射、绝不按镜像名杀进程。
             report(L"the payload is already running on this scope and bound to the live producer; "
-                   L"nothing to do");
+                   L"nothing to do for this target");
+            if (options.dry_run) {
+                report(L"dry run: would still retire stale payloads in other explorer.exe processes");
+                return 0;
+            }
+            if (!clean_other_explorers(target.process_id, dll_path, /*dry_run=*/false)) {
+                report(L"stale-other-retained: a stale payload in another explorer.exe could not be safely removed (deployment requires no stale payload elsewhere)");
+            }
+            report(L"nothing was injected for this target");
             return 0;
         }
         if (options.dry_run) {
             report(L"would stop the mapped payload (it is not provably active) and load it again");
+            report(L"dry run: would also retire stale payloads in other explorer.exe processes");
             return 0;
         }
         report(L"the mapped payload is not provably active; removing it before loading again");
@@ -276,8 +301,10 @@ int do_load(Options const& options) {
     }
 
     if (!clean_other_explorers(target.process_id, dll_path, /*dry_run=*/false)) {
-        report(L"warning: a stale payload in another explorer.exe could not be removed; continuing "
-               L"with the target");
+        // 不把它当成"清干净了"：如实记下 stale-other-retained。本目标的装载继续（失败的是别的
+        // explorer 里那份，不影响这里），但部署门禁要求最终别处没有旧负载。
+        report(L"stale-other-retained: a stale payload in another explorer.exe could not be safely "
+               L"removed; continuing with this target (deployment requires no stale payload elsewhere)");
     }
 
     // 破坏性动作之前再核对一次身份：这中间如果任务栏属主重启了（explorer 崩溃是常态），PID 可能
@@ -298,7 +325,7 @@ int do_load(Options const& options) {
     }
     if (already_loaded) {
         report(L"the payload is already mapped in the target (another injector won the race); "
-        L"run '--status' to see whether it is active");
+               L"run '--status' to see whether it is active");
         return 1;
     }
     report(L"payload loaded: base=" + deskfeed::hex_text(loaded.base) + L" size=" +
@@ -315,7 +342,14 @@ int do_load(Options const& options) {
         report(L"cannot use the on-disk export offsets: " + export_error);
         return 1;
     }
-    unsigned long const start_rva = start_info.rva;
+    // 尺寸相同不等于同一个 build：读一次远程镜像自己的 PE 元数据/导出表，用远程确认过的 RVA。
+    unsigned long start_rva = 0;
+    if (!verify_remote_export(target.process_id, loaded.base, loaded.size, kStartExportName, start_info,
+                              start_rva, export_error)) {
+        report(L"the loaded payload does not match the on-disk DLL; refusing to call into it: " +
+               export_error);
+        return 1;
+    }
 
     RemoteCall start_call;
     std::wstring start_error;

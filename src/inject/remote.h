@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "inject/pe_export.h"
+
 // 对**别的进程**动手的原语：枚举进程与模块、把 DLL 映射进去、调用它的导出、读写一块定长缓冲。
 //
 // 这一层只属于注入器与探针工具，**不进负载模块**：负载跑在 explorer 里，不参与自己的装载过程。
@@ -134,5 +136,46 @@ bool remote_read(unsigned long process_id, unsigned long long address, void* out
 bool remote_fetch_pod(unsigned long process_id, unsigned long long module_base, unsigned long export_rva,
                       void* pod, std::size_t pod_bytes, DWORD wait_ms, RemoteCall& call,
                       std::wstring& error);
+
+// ---------------------------------------------------------------------------
+// 远程镜像身份核验（T7）
+//
+// 为什么需要：`MODULEENTRY32W.modBaseSize` 只是 SizeOfImage；**尺寸相同不等于同一个 build**。
+// 目标进程里可能映射着一份旧 DLL（上一轮注入后文件被新构建覆盖），此时拿磁盘那份的导出 RVA 加到
+// 远程基址上执行，就是跳到另一份 build 的代码。所以调用任何远程导出之前，必须**受限读取**远程
+// 那份镜像自己的 PE 元数据与导出表，并证明"同名导出的远程真实 RVA"与磁盘一致。
+//
+// 这一层只读、不执行：所有读取都经过 `remote_read`，并且
+//   * `e_lfanew < 64 KiB`，节数 ≤ 96，导出名/函数数 ≤ 4096；
+//   * 每一段 [RVA, RVA+size) 都必须落在 SizeOfImage 之内（u64 比较，防 DWORD 回绕）；
+//   * 总读取预算 1 MiB（不逐字节无限扫描）；
+//   * 名字串必须在 256 字节内有 NUL（bounded NUL），转发导出一律拒绝；
+//   * RVA 0、越界、或不在可执行节里 -> 拒绝。
+// 任一步读失败/字段越界都返回 false：**未知即拒绝**，绝不退化成"只看尺寸"。
+// ---------------------------------------------------------------------------
+struct RemoteImageIdentity {
+    unsigned short machine = 0;
+    bool pe32_plus = false;
+    unsigned long long image_size = 0;   // 远程 SizeOfImage（必须等于模块表报的尺寸）
+    unsigned long time_date_stamp = 0;   // 换 build 的强区分位
+    unsigned long export_rva = 0;        // 同名导出在**远程**那份镜像里的真实 RVA
+    bool export_in_exec_section = false; // 该 RVA 已证明落在可执行节内
+};
+
+// 受限读取 `module_base` 那个模块的 PE 头/导出表，找 `export_name` 并核验上列各项。
+// `module_size` 来自模块枚举（MODULEENTRY32W.modBaseSize），必须与远程 SizeOfImage 相等。
+bool remote_image_identity(unsigned long process_id, unsigned long long module_base,
+                           unsigned long long module_size, char const* export_name,
+                           RemoteImageIdentity& out, std::wstring& error);
+
+// 纯判定：磁盘那份与远程那份必须是同一个 build，且同名导出映射到同一个 RVA、且落在可执行节内。
+// 不碰任何句柄，可离线测。
+bool image_identity_matches(PeExportInfo const& disk, RemoteImageIdentity const& remote,
+                            std::wstring& error);
+
+// 调用点用的单一入口：读远程身份 + 判定，成功时把**远程确认过的 RVA** 交给调用方（不要用磁盘的）。
+bool verify_remote_export(unsigned long process_id, unsigned long long module_base,
+                          unsigned long long module_size, char const* export_name,
+                          PeExportInfo const& disk, unsigned long& verified_rva, std::wstring& error);
 
 }  // namespace deskfeed::inject

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include <utility>
@@ -29,6 +30,8 @@ struct PeFile {
     unsigned long long size = 0;
     unsigned short machine = 0;
     unsigned long long image_size = 0;
+    unsigned long time_date_stamp = 0;  // COFF TimeDateStamp：换 build 的强区分位
+    bool pe32_plus = false;
     std::vector<Section> sections;
 
     // 把一段 RVA 区间映射成文件偏移；不在任何节的文件数据里时返回 false。
@@ -188,7 +191,7 @@ bool parse_headers(PeFile& pe, unsigned long& export_rva, unsigned long& export_
     unsigned short section_count = 0;
     unsigned short optional_size = 0;
     if (!pe.read(nt + 4, pe.machine) || !pe.read(nt + 4 + 2, section_count) ||
-        !pe.read(nt + 4 + 16, optional_size)) {
+        !pe.read(nt + 4 + 4, pe.time_date_stamp) || !pe.read(nt + 4 + 16, optional_size)) {
         return fail(PeExportError::BadHeader, L"cannot read the COFF header", error, kind);
     }
     // 本工程只有 x64：负载要和 64 位 explorer.exe 同位数，注入器也只解析自己那一份 DLL。
@@ -215,6 +218,7 @@ bool parse_headers(PeFile& pe, unsigned long& export_rva, unsigned long& export_
         return fail(PeExportError::UnsupportedMachine, L"the optional header is not PE32+", error,
                     kind);
     }
+    pe.pe32_plus = true;
     unsigned long long const data_directory = 112;
 
     unsigned long size_of_image = 0;
@@ -430,6 +434,12 @@ bool pe_export_rva(std::wstring const& file_path, char const* export_name, PeExp
         out.rva = function_rva;
         out.image_size = pe.image_size;
         out.machine = pe.machine;
+        // 换 build 的区分位与"这个 RVA 落在哪个可执行节"一起交出去：远程侧要用它们做一致性核验。
+        out.time_date_stamp = pe.time_date_stamp;
+        out.is_pe32_plus = pe.pe32_plus;
+        out.section_va = section->virtual_address;
+        out.section_end = static_cast<unsigned long long>(section->virtual_address) +
+                          section->virtual_size;
         return true;
     }
 
@@ -438,6 +448,15 @@ bool pe_export_rva(std::wstring const& file_path, char const* export_name, PeExp
                 L"export not found: " + std::wstring(wanted.begin(), wanted.end()), error, kind);
 }
 
+namespace {
+// 十六进制文本（诊断用）。这一层不拉 platform 的头，所以就地写一个几行的实现。
+std::wstring hex_of(unsigned long long value) {
+    wchar_t buffer[32]{};
+    ::swprintf_s(buffer, L"0x%llX", value);
+    return std::wstring(buffer);
+}
+}  // namespace
+
 bool pe_image_matches_module(PeExportInfo const& info, unsigned long long remote_image_size,
                              std::wstring& error) {
     if (remote_image_size == 0) {
@@ -445,8 +464,8 @@ bool pe_image_matches_module(PeExportInfo const& info, unsigned long long remote
         return false;
     }
     if (info.image_size != remote_image_size) {
-        error = L"the on-disk image (SizeOfImage 0x" + std::to_wstring(info.image_size) +
-                L") does not match the loaded module (0x" + std::to_wstring(remote_image_size) +
+        error = L"the on-disk image (SizeOfImage " + hex_of(info.image_size) +
+                L") does not match the loaded module (" + hex_of(remote_image_size) +
                 L"); refusing to use an offset from a different build";
         return false;
     }

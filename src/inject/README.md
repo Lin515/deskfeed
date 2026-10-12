@@ -57,17 +57,35 @@ deskfeed-inject.exe --watch  [--scope <NAME>] [--interval <秒>] [--once] [--dry
    确认那个进程**就是**当初那个（PID 会被复用）。
 3. **两者一致**：负载报的生产者身份必须等于帧头里的身份。
 
-`DeskFeedGetStatus` 是**新增的内部 ABI**（不在公开协议里，也不改变任务的显示语义），目前由
-MAIN 转给负载作者实现；在它落地之前，`--status` 会如实报 `mapped-unknown-abi` → 1。
+`DeskFeedGetStatus` 是**新增的内部 ABI**（不在公开协议里，也不改变任务的显示语义）：144 字节的
+定长 POD，唯一出处是负载侧 `src/payload/status_pod.h`，注入器只转发包含 + 别名。读取端仍有已知
+缺陷（由 Native 作者修：空 scope、借用生命周期、收尾覆盖 `unload_safe`），所以在它真正可信之前，
+`--status` 对读不成/校验不过的 POD 一律 fail closed，报 `mapped-unknown-abi` → 1，绝不拿半份 POD
+当结论。
 
 ## 装载与卸载的门禁
 
 - `--load` 先查状态：已经 `mapped-active` 就什么都不做（幂等）；`mapped-inactive` /
   `mapped-unknown-abi` 先走一次 `--stop` 把它换成新的；`mapped-retained` 直接拒绝。
 - **残留清理**：目标进程之外的 explorer.exe 里如果还挂着一份负载，装载与卸载都会把它收掉。
+  这一条与"本轮对目标动不动它"无关：目标是 `mapped-active`（本轮 no-op）、甚至 `mapped-retained`
+  （拒绝重装）时，别的 explorer 里的残留照样要按同一套安全门撤下；`--dry-run` 只说明会做什么。
+  撤下走的是同一个 `DeskFeedStop` 门禁：只有它报"已退休"且远程线程退出才 `FreeLibrary`，
+  超时保留映射、绝不按镜像名杀进程。
 - 卸载只有一条路：远程 `DeskFeedStop` 返回 1（"既定回收门禁全部通过"）**并且**调用它的远程线程
   已经退出。返回 0（超时、有悬挂、导入表没恢复）时**保留映射**，稍后重试；`--no-unload` 时
   只让它退出、不卸 DLL。
+- **调用任何远程导出之前必须核验"装载的那份就是磁盘那份"**：`MODULEENTRY32W` 的 `modBaseSize`
+  只是 SizeOfImage，**尺寸相同不等于同一个 build**（旧模块还在映射、磁盘已被新构建覆盖）。所以在
+  `Start` / `Stop` / `GetStatus`（含清理别的 explorer）调用前，都要受限读取远程镜像自己的
+  `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS`/导出表，核对 Machine、PE32+、SizeOfImage、TimeDateStamp
+  与**同名导出的远程真实 RVA**，并证明该 RVA 落在 `IMAGE_SCN_MEM_EXECUTE` 的节内；全部相等才调用，
+  而且调用时用**远程确认过的 RVA**（磁盘那个只是候选值）。读不到/字段越界一律拒绝（fail closed），
+  绝不退化成"只看尺寸"。
+  读取全部有界：`e_lfanew < 64 KiB`、节数 ≤ 96、导出名/函数数 ≤ 4096、名字必须在 256 字节内有
+  NUL、转发导出拒绝、每段 `[RVA, RVA+size)` 必须落在 SizeOfImage 内、单次核验总读取 ≤ 1 MiB。
+  诚实的限度：TimeDateStamp + SizeOfImage + 同名导出 RVA 映射一致**不是**代码内容哈希，只用于防
+  "常见版本漂移"（旧 build 仍映射着）；它不构成对"同一用户自行替换 payload 代码"的认证。
 - 装载确认用 `MODULEENTRY32W` 枚举**完整路径**：远程线程退出码是 `DWORD`，x64 的 `HMODULE`
   会被截断，绝不能当基址用。
 - **不按镜像名杀进程、不强行卸载、不替换任何窗口过程**：本工具只做"装载/卸载一个 DLL、调它

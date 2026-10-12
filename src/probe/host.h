@@ -6,6 +6,15 @@
 
 namespace deskfeed::probe {
 
+// 退出码语义（README 与命令行用法同步）：
+//   0 = 跑了，且所有观测量都符合预期（对抗用例里"观察到对抗症状"也算符合预期）；
+//   1 = 跑了，但至少一条断言不成立（包括"接口不齐时拒绝执行"这种运行期自检）；
+//   2 = **BLOCKED**：命令行要跑的东西缺少必需的负载导出，或参数组合无效——一条也没跑。
+// "没跑"绝不允许以 0 返回：验收脚本只能把 0 当"真的跑过并通过"。
+inline constexpr int kHostExitOk = 0;
+inline constexpr int kHostExitFailed = 1;
+inline constexpr int kHostExitBlocked = 2;
+
 // 自测宿主（`deskfeed-probe.exe`）的输入。两种模式**互斥**，不许同时开：
 //   * 结构自测（默认）：XAML 诊断 → 一次走查 → 在宿主线程上解析并应用 → 拆除 → 归还引用。
 //   * `--feed`：把宿主自己的岛登记成负载的"托盘目标"，然后跑**生产入口** `DeskFeedStart`，

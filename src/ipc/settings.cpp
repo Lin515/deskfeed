@@ -251,11 +251,20 @@ bool SettingsFile::set(std::wstring_view section, std::wstring_view key,
 }
 
 bool SettingsFile::save(std::wstring& error) {
-    if (!ensure_parent_directory(path_, error)) {
+    if (!save_as(path_, error)) {
+        return false;
+    }
+    // 让内存里的行与磁盘一致（值已经在里面，这一步只是重排 raw）。
+    load(error);
+    return true;
+}
+
+bool SettingsFile::save_as(std::wstring const& path, std::wstring& error) {
+    if (!ensure_parent_directory(path, error)) {
         return false;
     }
     std::string const bytes = utf8_from_wide(render());
-    std::wstring const temporary = path_ + L".tmp-" + std::to_wstring(::GetCurrentProcessId());
+    std::wstring const temporary = path + L".tmp-" + std::to_wstring(::GetCurrentProcessId());
 
     HANDLE const file = ::CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                       FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -284,14 +293,20 @@ bool SettingsFile::save(std::wstring& error) {
         ::DeleteFileW(temporary.c_str());
         return false;
     }
-    if (::MoveFileExW(temporary.c_str(), path_.c_str(),
+    if (::MoveFileExW(temporary.c_str(), path.c_str(),
                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
         error = L"替换设置文件失败：" + last_error_text();
         ::DeleteFileW(temporary.c_str());
         return false;
     }
-    load(error);  // 让内存里的行与磁盘一致（值已经在里面，这一步只是重排 raw）
     return true;
+}
+
+void SettingsFile::adopt(SettingsFile const& committed) {
+    path_ = committed.path_;
+    text_ = committed.text_;
+    lines_ = committed.lines_;
+    loaded_ = committed.loaded_;
 }
 
 SourceSettings SettingsFile::read_source() const {

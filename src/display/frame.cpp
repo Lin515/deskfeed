@@ -134,6 +134,25 @@ struct Cursor {
 
 }  // namespace
 
+Frame frame_from_view(View const& view) {
+    Frame frame;
+    frame.kind = view.kind;
+    frame.alarm = view.alarm;
+    frame.failure = view.failure;
+    frame.reason = view.reason;
+    frame.items.reserve(view.items.size());
+    for (ViewItem const& item : view.items) {
+        FrameItem out;
+        out.id = item.id;
+        out.label = item.label;
+        out.value = item.value;
+        out.state = item.state;
+        out.detail = item.detail;
+        frame.items.push_back(std::move(out));
+    }
+    return frame;
+}
+
 bool frame_encode(Frame const& frame, std::vector<unsigned char>& out) {
     if (frame.items.size() > kMaxItems || frame.reason.size() > kFrameMaxReasonBytes) {
         return false;

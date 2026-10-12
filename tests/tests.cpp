@@ -2127,6 +2127,37 @@ private:
     std::wstring path_;
 };
 
+// 临时给**本进程**设一个环境变量，析构时恢复原值（原来没有就删掉）。
+//
+// 子进程用 CreateProcessW 的默认行为继承本进程的环境块，所以隔离实例的失败注入点可以这样
+// 精确地只作用在这一次 start() 上，不必给命令行加一个生产上也会存在的开关。用例是串行跑的，
+// 恢复发生在子进程已经起来之后，不会串到别的用例。
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(std::wstring name, std::wstring const& value) : name_(std::move(name)) {
+        wchar_t buffer[64]{};
+        DWORD const chars =
+            ::GetEnvironmentVariableW(name_.c_str(), buffer, static_cast<DWORD>(std::size(buffer)));
+        if (chars > 0 && chars < std::size(buffer)) {
+            had_old_ = true;
+            old_ = std::wstring(buffer, chars);
+        }
+        ::SetEnvironmentVariableW(name_.c_str(), value.c_str());
+    }
+
+    ~ScopedEnvironmentVariable() {
+        ::SetEnvironmentVariableW(name_.c_str(), had_old_ ? old_.c_str() : nullptr);
+    }
+
+    ScopedEnvironmentVariable(ScopedEnvironmentVariable const&) = delete;
+    ScopedEnvironmentVariable& operator=(ScopedEnvironmentVariable const&) = delete;
+
+private:
+    std::wstring name_;
+    std::wstring old_;
+    bool had_old_ = false;
+};
+
 // 起一个子进程并持有它的句柄（用来跑真实的 deskfeed.exe）。
 class ChildProcess {
 public:
@@ -2158,6 +2189,16 @@ public:
     bool wait(unsigned timeout_ms) {
         return process_ != nullptr &&
                ::WaitForSingleObject(process_, timeout_ms) == WAIT_OBJECT_0;
+    }
+
+    // 已经退出时给出退出码（诊断用）；还在跑时返回 -1。
+    long long exit_code() const {
+        if (process_ == nullptr || ::WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) {
+            return -1;
+        }
+        DWORD code = 0;
+        ::GetExitCodeProcess(process_, &code);
+        return static_cast<long long>(code);
     }
 
     void stop() {
@@ -2452,8 +2493,12 @@ TEST(master_publishes_expiry_into_the_mailbox_before_the_next_poll) {
 }
 
 TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
-    // 整次取数的墙钟截止由主进程守。到点宣布失败的那一刻，显示面也必须立刻失效——旧实现把它
-    // 压到循环末尾，与下一次重试（默认 5 s）之间隔着一整个阻塞等待。
+    // 整次取数的墙钟截止由主进程守。这里验的是截止失败之后**有界**地到达显示面，以及
+    // “从没取到过数 ⇒ 红色 ERROR + timeout”这一条语义。
+    //
+    // 说清楚它的边界：这条用例**不**区分“阻塞等待之前发布”与“循环末尾发布”。挂在目标进程里的
+    // 取数线程结束时会让主循环的 MsgWaitForMultipleObjects 立刻返回，两次发布因此落在同一轮里。
+    // 真正能抓住发布时机的是那条到期用例（到期之后没有别的句柄会叫醒主循环）。
     LoopbackServer server;
     std::string error;
     CHECK(server.start(error));
@@ -2483,10 +2528,15 @@ TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
     CHECK(attached);
 
     // 启动时那帧是 waiting（没有配置好之前不露空窗）；挂着的请求到点之后必须变成整体失效。
-    long long const started = tick_ms();
+    // 计时全部落在帧自己的墙钟域（produced_at_ms），不拿单调时钟去减：两者不能换算。
+    long long const started_wall = unix_ms();
     long long const alarm_produced = wait_for_alarm(consumer, 6000);
     CHECK(alarm_produced > 0);
-    CHECK(alarm_produced - started <= 3000);  // 约等于 1500 ms 预算 + 调度与用例轮询的余量
+    // 15 ms 之内起的子进程、1500 ms 预算、再加上进程启动与用例轮询的余量。
+    if (alarm_produced - started_wall > 5000) {
+        testing::report_failure("timeout alarm took " + std::to_string(alarm_produced - started_wall) +
+                                " ms to reach the mailbox (budget was 1500 ms)");
+    }
 
     Frame alarm;
     CHECK(consumer.read(alarm));
@@ -2502,6 +2552,164 @@ TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
     cleanup_isolated_instance(scope, state_dir.path());
 }
 
+TEST(master_keeps_publishing_during_a_nested_modal_dispatch) {
+    // 右键菜单的 TrackPopupMenu 会在主进程线程上开一个**嵌套模态循环**：主循环那一次
+    // PeekMessage 在这期间根本跑不到。这条用例就把那个情形复现出来——自己起一个模态派发循环，
+    // 持续把消息派发给主进程的控制窗口。
+    //
+    // 要证两件事，都是 W4 里真实存在的缺陷：
+    //   1) 取数结果不能丢。旧实现是 PostMessage 一个 new 出来的指针，模态循环里落到
+    //      DefWindowProc 上就被静默吞掉（结果丢失 + 内存泄漏）。现在结果在有界队列里，
+    //      窗口过程/心跳把它取走，所以“有值的内容帧”必须仍然出现。
+    //   2) 到期不能被推迟。模态期间主循环不转，只有心跳那条 WM_TIMER 还能推进状态机；
+    //      所以整体失效必须在有界时间内被发布出来。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"mbmodal-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/expires-soon"), L"--poll-ms",
+                        L"30000", L"--timeout-ms", L"10000"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    // 模态派发循环：2 秒，每次取一条消息就派发给主进程的控制窗口（TrackPopupMenu 内部
+    // 就是这种节奏）。取数结果与心跳都在这个窗口里被处理。
+    long long const started_wall = unix_ms();
+    long long const modal_deadline = tick_ms() + 2000;
+    long long content_produced = 0;
+    long long alarm_produced = 0;
+    while (tick_ms() < modal_deadline) {
+        MSG message{};
+        while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+        }
+        Frame frame;
+        if (consumer.read(frame)) {
+            if (content_produced == 0 && frame.kind == ViewKind::Content && !frame.items.empty() &&
+                !frame.alarm) {
+                content_produced = produced_at_ms(frame);
+            }
+            if (alarm_produced == 0 && frame_shows_alarm(frame)) {
+                alarm_produced = produced_at_ms(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 结果没丢：模态期间仍然拿到了内容帧。
+    CHECK(content_produced > 0);
+    // 到期没被推迟：整体失效在有界时间内发布出来了（模态循环只有 2 秒，之后主循环恢复，
+    // 所以这条断言真正证明的是“模态期间也在推进”，而不是“模态结束后补上”）。
+    CHECK(alarm_produced > 0);
+    CHECK(alarm_produced - content_produced <= 2500);
+    CHECK(alarm_produced - started_wall <= 4000);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+TEST(master_publishes_a_start_job_failure_into_the_mailbox_before_the_wait) {
+    // start_job() 自己也会当场改显示模型：CreateThread 失败时它立刻 apply_failure(Internal)。
+    // 这次改动同样必须在阻塞等待**之前**发布出去，否则显示面会继续显示 waiting，直到下一个
+    // 轮询点或别的消息把主循环叫醒。
+    //
+    // 失败是注入的：真实 CreateThread 几乎不会失败，所以这里用只在隔离实例里生效的开关
+    // （scope 非空 + DESKFEED_TEST_FAIL_FETCH_THREAD=1）让 start_job() 走**同一条**收尾路径。
+    // 生产实例的 scope 恒为空，这个开关在生产上打不开。
+    //
+    // 重试给 10 s：一旦这次失败没有被及时发布，下一件能叫醒主循环的事就是 10 s 之后的重试，
+    // 用例的 3 s 上限会立刻失败。所以这条用例真的咬住“发布在阻塞等待之前”。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"mbfailthread-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    {
+        ScopedEnvironmentVariable const failpoint(L"DESKFEED_TEST_FAIL_FETCH_THREAD", L"1");
+        CHECK(master.start(exe,
+                           {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                            L"--frame-mailbox", L"--url", server.url(L"/ok"), L"--poll-ms", L"1000",
+                            L"--retry-ms", L"10000", L"--timeout-ms", L"3000"},
+                           error));
+    }
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!attached) {
+        bool const exited = master.wait(0);
+        testing::report_failure("attach failed: " + error + "; master exited=" +
+                                (exited ? "yes" : "no") + "; map=" +
+                                utf8_from_wide(display_frame_map_name(scope)));
+    }
+    CHECK(attached);
+
+    long long const started_wall = unix_ms();
+    long long const alarm_produced = wait_for_alarm(consumer, 6000);
+    if (alarm_produced <= 0) {
+        bool const exited = master.wait(0);
+        testing::report_failure("no alarm frame in 6 s; master exited=" +
+                                std::string(exited ? "yes" : "no") + "; producer_running=" +
+                                std::string(consumer.producer_running() ? "yes" : "no"));
+    }
+    if (alarm_produced - started_wall > 3000) {
+        testing::report_failure("start_job failure took " +
+                                std::to_string(alarm_produced - started_wall) +
+                                " ms to reach the mailbox (retry was 10000 ms)");
+    }
+
+    Frame alarm;
+    CHECK(consumer.read(alarm));
+    CHECK(alarm.kind == ViewKind::Error);
+    CHECK(alarm.failure == FailureKind::Internal);
+    CHECK(alarm.reason.find("无法启动取数线程") != std::string::npos);
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
+}
+
+// ---- 主入口 ----------------------------------------------------------------
 
 int wmain(int argc, wchar_t** argv) {
     // 子模式：本程序被自己再起一份，充当“另一个生产者进程”（见显示邮箱的身份用例）。

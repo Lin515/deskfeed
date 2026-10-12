@@ -55,6 +55,13 @@ struct Frame {
     std::vector<FrameItem> items;
 };
 
+// 把显示模型（View）映射成显示帧（Frame）：只搬字段，不做任何解释。
+//
+// 这是**唯一**一份 View → Frame 映射：主进程发布显示邮箱用它，离线量具（tools）算同一份
+// 读数也用它是为了让“量具看到的帧”与“主进程真的发出去的帧”逐字段一致，不必各自抄一份。
+// 它只依赖 core/health.h 里的 View 类型，不拉进 HealthState 的实现，也不碰 HTTP / JSON。
+Frame frame_from_view(View const& view);
+
 // 把一帧编码成载荷。超过 kFramePayloadCapacity 时返回 false（调用方应当先做容量检查；
 // 正常情况下协议边界保证了不会超）。
 bool frame_encode(Frame const& frame, std::vector<unsigned char>& out);

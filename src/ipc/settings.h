@@ -42,6 +42,16 @@ public:
     // 原子替换落盘。没有改动过也可以调用。
     bool save(std::wstring& error);
 
+    // 把**内存里这份内容**原子写到另一个路径（同目录临时文件 + 替换），不回读。
+    //
+    // 配置事务用它：先复制一份“候选”，在候选上改，把候选落盘；成功了才把候选接进正在用的
+    // 这一份。于是“保存失败”永远不会把这一份改成半吊子状态——不需要靠“再读一次盘”去回滚，
+    // 也就不存在“保存失败 + 回读也失败”时留下被拒候选的那种局面。
+    bool save_as(std::wstring const& path, std::wstring& error);
+
+    // 把另一份（已经成功落盘的）内容与路径接过来。用于事务提交；不读盘。
+    void adopt(SettingsFile const& committed);
+
     // [source] 一节的原始值（不做默认值与上下限处理，交给调用方）。
     SourceSettings read_source() const;
 

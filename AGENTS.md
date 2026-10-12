@@ -14,8 +14,9 @@
   `deskfeed_widget`。测试与夹具目标：`deskfeed-tests`、`deskfeed-native-tests`、
   `deskfeed-tools-tests`、`deskfeed-supervisor-tests`、`deskfeed-widget-tests`、
   `deskfeed-widget-window-tests`、`deskfeed-reg-hook-caller`、`deskfeed-test-remote-writer`、
-  `deskfeed-fake-injector`。Windows / MSVC / x64、C++20、静态 CRT；CTest 注册 8 条用例
-  （含生产/测试两条成品 DLL 审计）。
+  `deskfeed-test-fixture-payload`、`deskfeed-tools-fixture-host`、`deskfeed-fake-injector`
+  （后三者与 remote-writer 一样只服务工具用例：不部署、不安装、不进交付物）。Windows / MSVC /
+  x64、C++20、静态 CRT；CTest 注册 8 条用例（含生产/测试两条成品 DLL 审计）。
 - `README.md` — 面向用户的说明：当前阶段、快速开始、安全边界、许可。
 - `AGENTS.md` — 本文件。
 - `LICENSE` — MIT，版权署名 Lin515。

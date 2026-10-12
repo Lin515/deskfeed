@@ -3,7 +3,17 @@
 | 文件 | 作用 |
 | --- | --- |
 | `test_support.h` | 极简测试框架：`TEST` / `CHECK` / `CHECK_EQ`，失败抛异常、由入口按用例捕获；不引第三方依赖。 |
-| `tests.cpp` | 全部离线用例与入口（`--filter <子串>` 只跑匹配的用例，末尾打印通过/失败数，失败时返回 1）。 |
+| `tests.cpp` | 主进程侧全部离线用例与入口（`--filter <子串>` 只跑匹配的用例，末尾打印通过/失败数，失败时返回 1）。 |
+| `native_tests.cpp` | 任务栏负载侧的离线用例与**成品 DLL 审计**入口：显示帧消费策略、钩子门收尾协议、C++/SEH 边界、IAT 改写的恢复路径、回收门位、真 DLL 的 `status` / `glue` / `failclosed`、进程守卫（纯函数 + 自起子进程场景，含 `reload` 的句柄零增长与 `hookevents` 的无名钩子事件归还）。 |
+| `tools_tests.cpp` | 注入器与探针工具的离线用例：目标解析、严格 PE 解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（后两者用下面三个夹具）。 |
+| `master_supervisor_tests.cpp` | 主进程侧任务栏编排的用例（配 `fake_injector.cpp`，只做假注入）。 |
+| `widget_tests.cpp` | 桌面悬浮窗的纯逻辑与偏好用例。 |
+| `widget_window_tests.cpp` | 悬浮窗隐藏窗口的门禁用例：真的建窗口，但强制隐藏。 |
+| `fake_injector.cpp` | **测试专用**假注入器：主进程任务栏编排用例的目标，不注入任何进程。 |
+| `reg_hook_caller.cpp` | **测试专用**夹具 DLL：只按名字导入 `Reg*` 三个入口，让 `reg_hook` 真的去补它的导入槽。 |
+| `remote_delay_writer.cpp` | **测试专用**夹具模块：一个"先睡、后写"的导出，用来确定性制造"调用已超时、写入还没发生"的窗口。 |
+| `fixture_payload.cpp` | **测试专用**夹具负载 DLL：扮演被注入的负载（真实的生产 ABI，行为开关全走环境变量），只被工具用例装进它自己 spawn 的隐藏夹具主机。 |
+| `tools_fixture_host.cpp` | **测试专用**夹具主机 EXE：只装载夹具负载然后等在那里，给动作路径一个真实的远程目标；绝不碰真实 `explorer.exe`。 |
 
 覆盖范围：严格 JSON 与深度上限、`expiresAtMs` 的数值整数语义、容量边界、单行/空白判据
 （含 VT/FF 等 Unicode 硬换行）、完整替换与失效恢复、独立到期与不续期、首份即过期、调度夹取、

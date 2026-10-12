@@ -410,12 +410,37 @@ set_target_properties(deskfeed-test-remote-writer PROPERTIES
     PREFIX ""
 )
 
+# 工具用例的另外两个**测试专用**夹具（与上面 remote-writer 同一套纪律：不部署、不安装、不进任何
+# 交付二进制）：
+#   * `deskfeed-test-fixture-payload`（MODULE）扮演被注入的负载：只导出真实的生产 ABI
+#     （`DeskFeedStart` / `DeskFeedStop` / `DeskFeedGetStatus`），行为开关全部走环境变量，所以同一份
+#     DLL 能演"立刻返回"、"卡在闸门上等放行"、"报未退休"等全部形状；
+#   * `deskfeed-tools-fixture-host` 是隐藏的夹具主机：只把那个 DLL 装进自己然后等在那里，给动作路径
+#     一个**真实**的远程目标（真实模块表 + 真实 `CreateRemoteThread` + 真实可被结束）。它绝不碰真实
+#     explorer.exe：目标恒为用例自己 spawn 的进程。
+# 两者都由 `deskfeed-tools-tests.exe` 按"与本可执行文件同目录"拉起（默认输出目录就是 `bin/`），
+# 所以必须与本用例一起构建出来。
+add_library(deskfeed-test-fixture-payload MODULE
+    tests/fixture_payload.cpp
+)
+target_link_libraries(deskfeed-test-fixture-payload PRIVATE deskfeed_base)
+set_target_properties(deskfeed-test-fixture-payload PROPERTIES
+    OUTPUT_NAME "deskfeed-test-fixture-payload"
+    PREFIX ""
+)
+
+add_executable(deskfeed-tools-fixture-host
+    tests/tools_fixture_host.cpp
+)
+target_link_libraries(deskfeed-tools-fixture-host PRIVATE deskfeed_base)
+
 add_executable(deskfeed-tools-tests
     tests/tools_tests.cpp
 )
 target_link_libraries(deskfeed-tools-tests PRIVATE deskfeed_inject_support)
-# 工具用例按"与本可执行文件同目录"找这个夹具（默认输出目录就是 `bin/`），所以必须一起构建出来。
-add_dependencies(deskfeed-tools-tests deskfeed-test-remote-writer)
+# 工具用例按"与本可执行文件同目录"找这三个夹具（默认输出目录就是 `bin/`），所以必须一起构建出来。
+add_dependencies(deskfeed-tools-tests deskfeed-test-remote-writer
+    deskfeed-test-fixture-payload deskfeed-tools-fixture-host)
 add_test(NAME deskfeed-tools-tests COMMAND deskfeed-tools-tests)
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ CTest 注册 8 条：
 | `deskfeed-tests` | 协议/状态机/帧/邮箱/检查器/主进程事务与条件退出 |
 | `deskfeed-native-tests` | 负载侧：显示帧消费策略、钩子门收尾协议、C++/SEH 边界、导入表改写、回收门位、真 DLL 的 `status` / `glue` / `failclosed` / 进程守卫 |
 | `deskfeed-supervisor-tests` | 主进程侧任务栏编排，配 `deskfeed-fake-injector`（**不注入任何进程**的假注入器） |
-| `deskfeed-tools-tests` | 注入器工具：目标解析、远程调用超时与迟到写者、per-target 租约 |
+| `deskfeed-tools-tests` | 注入器工具：目标解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（配 `deskfeed-test-remote-writer`、`deskfeed-test-fixture-payload` 与 `deskfeed-tools-fixture-host` 三个**测试专用**夹具） |
 | `deskfeed-payload-audit` | 成品**生产** DLL 的导入表 / 导出名 / map 审计 |
 | `deskfeed-payload-test-audit` | 成品**自测** DLL 的同款审计（探针入口必须仍在） |
 | `deskfeed-widget-tests` | 悬浮窗纯逻辑与偏好 |
@@ -35,12 +35,14 @@ CTest 注册 8 条：
 一律带 `--no-tests=error`，避免“没有注册用例”被当成绿。
 
 `deskfeed-native-tests` 的过滤器：`--filter feed` / `seh` / `retire` / `status` / `glue` / `failclosed` /
-`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十条进程守卫场景各自在**新子进程**里跑
+`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十一条进程守卫场景各自在**新子进程**里跑
 （父进程用 `CreateProcessW` 起自己，`--guard-child <场景>`，断言退出码）：守卫对象名按目标
 pid + 创建时间命名、`DllMain` 每个进程只 attach 一次，所以“Native 自己 init / actor 先 init /
 粘性事件已置位 / 坏 header / 错类型对象 / 只读零 header / abandoned 恢复 / 引用跨 FreeLibrary /
-每轮 reload 不泄漏”必须分别是新进程。这些用例只碰**用例自己的进程**：`LoadLibrary` 成品 DLL、
-建自己的命名对象与线程，不注入 explorer、不起可见 GUI、不碰任务栏与光标。
+每轮 reload 不泄漏（含逐轮句柄数回到基线、命名清理事件在 `FreeLibrary` 后必须消失）/
+无名钩子事件在 DETACH 归还”必须分别是新进程。这些用例只碰**用例自己的进程**：`LoadLibrary` 成品 DLL、
+建自己的命名对象、线程与一条**隐藏**的合成 UI 线程（`hookevents` 用它把真实的 `WH_GETMESSAGE` 线程
+钩子装到自己的线程上；窗口是不可见的 STATIC，不注入 explorer、不起可见 GUI、不碰真实任务栏与光标）。
 
 ## 离线检查器
 

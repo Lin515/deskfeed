@@ -5,9 +5,12 @@
 
 ## 根目录
 
-- `CMakeLists.txt` — 全部构建目标：`deskfeed_platform`、`deskfeed_symbols`、`deskfeed_core`、
-  `deskfeed_net`、`deskfeed_ipc`、`deskfeed_display`、`deskfeed`（主进程）、`deskfeed-check`、
-  `deskfeed-tests`。Windows / MSVC / x64、C++20、静态 CRT；CTest 注册 `deskfeed-tests`。
+- `CMakeLists.txt` — 全部构建目标：`deskfeed_base`、`deskfeed_core`（含只做 UTF-8 转换的
+  `deskfeed_core_text`）、`deskfeed_platform`、`deskfeed_symbols`、`deskfeed_net`、`deskfeed_ipc`
+  （含控制通道线格式的 `deskfeed_control_wire` / `deskfeed_control_wire_send`）、`deskfeed_display`、
+  `deskfeed_payload`（`deskfeed-payload.dll`，注入 `explorer.exe`）、`deskfeed`（主进程）、
+  `deskfeed-check`、`deskfeed-tests`。Windows / MSVC / x64、C++20、静态 CRT；CTest 注册
+  `deskfeed-tests`。
 - `README.md` — 面向用户的说明：当前阶段、快速开始、安全边界、许可。
 - `AGENTS.md` — 本文件。
 - `LICENSE` — MIT，版权署名 Lin515。
@@ -31,7 +34,19 @@
 5. **验收与测试必须用隔离实例**：`--scope <名字>`（或 `--test-instance`，或环境变量
    `DESKFEED_SCOPE`）会隔开互斥体、控制窗口类名、设置文件与日志；再加 `--headless`
    保证不碰界面与任务栏。生产实例与测试实例互不干扰。
-6. **不要在没有明确授权时注入 `explorer.exe`**。Phase 2 之前该能力根本不存在。
+6. **不要在没有明确授权时注入 `explorer.exe`**。授权之后也必须按下面的纪律做：
+   - 先用自测宿主（不起窗口、不注入 explorer 的离线用例与 `deskfeed-probe.exe` 的
+     `--cores 1/2/3` 矩阵）验，再按“注入 → 观察 → 立刻 stop”逐轮做真机实验；每轮开始前确认上一轮的
+     守护进程与后台进程都已结束，日志先复制走（负载日志每注入一次截断一次）。
+   - 卸载只有一条合法路径：负载导出的 `DeskFeedStop` 返回“可以卸载”，**并且**调用它的远程线程已经
+     退出。返回“未退休”（超时、有悬挂、导入表没恢复）时**绝不** `FreeLibrary`，也不按镜像名杀进程；
+     稍后重试即可。门禁与原因见 `docs/native-safety.md`。
+   - 不替换任何窗口过程（尤其不碰 `Shell_TrayWnd`），不在拆除时调用
+     `DispatcherQueueController::ShutdownQueueAsync()`，不把“清理事件已触发”“`running = false`”
+     当成线程已退出。
+   - 历史上一例 explorer 在 `Windows.UI.Xaml.dll` 里崩溃时负载并不在那个进程：**既不能归因，也不能
+     排除**。不要宣称注入绝对安全；导入表改写那一层还有一个明确接受的残余窗口（见
+     `docs/native-safety.md`）。
 7. 健康/到期用**墙钟 Unix 毫秒**（快照里的绝对时间），调度与超时用**单调时钟**，两者不得混用。
 
 ## 目录
@@ -39,5 +54,6 @@
 - `docs/` — 见 `docs/README.md`。
 - `examples/` — 见 `examples/README.md`。
 - `schema/` — `snapshot-v1.schema.json`，协议约束的机器可读版本。
-- `src/` — 见 `src/README.md`（在 `src/` 下按 `core` / `platform` / `net` / `ipc` / `display` / `master` / `tools` 分层）。
+- `src/` — 见 `src/README.md`（在 `src/` 下按 `core` / `platform` / `net` / `ipc` / `display` /
+  `payload` / `master` / `tools` 分层）。
 - `tests/` — 见 `tests/README.md`。

@@ -1,6 +1,6 @@
 #include "ipc/control_channel.h"
 
-#include "core/utf8.h"
+#include "core/utf8.h"  // utf8_from_wide：只用于错误文本；校验器那一份不在这里用
 #include "platform/win32_util.h"
 
 #include <windows.h>
@@ -8,112 +8,12 @@
 #include <cstring>
 
 namespace deskfeed {
-namespace {
 
-void put_u32(std::string& out, std::uint32_t value) {
-    out.push_back(static_cast<char>(value & 0xFF));
-    out.push_back(static_cast<char>((value >> 8) & 0xFF));
-    out.push_back(static_cast<char>((value >> 16) & 0xFF));
-    out.push_back(static_cast<char>((value >> 24) & 0xFF));
-}
+// 线格式的编解码在 `ipc/control_wire_encode.cpp` / `control_wire_decode.cpp`：发送端与接收端
+// 共用同一份实现，任务栏负载 DLL 只链发送那一半。本文件只负责窗口、互斥体与收发。
 
-bool take_u32(std::string_view bytes, std::size_t& offset, std::uint32_t& value) {
-    if (offset + 4 > bytes.size()) {
-        return false;
-    }
-    value = static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset])) |
-            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 1])) << 8) |
-            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 2])) << 16) |
-            (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 3])) << 24);
-    offset += 4;
-    return true;
-}
-
-}  // namespace
-
-std::intptr_t control_reply_value(ControlReply reply) { return static_cast<std::intptr_t>(reply); }
-
-std::string control_encode(ControlRequest const& request) {
-    std::string out;
-    put_u32(out, kControlMagic);
-    put_u32(out, kControlVersion);
-    put_u32(out, static_cast<std::uint32_t>(request.op));
-    put_u32(out, request.sender_pid);
-    put_u32(out, static_cast<std::uint32_t>(request.args.size()));
-    put_u32(out, 0);  // 预留
-    for (std::wstring const& arg : request.args) {
-        std::string const bytes = utf8_from_wide(arg);
-        put_u32(out, static_cast<std::uint32_t>(bytes.size()));
-        out.append(bytes);
-    }
-    return out;
-}
-
-bool control_decode(std::string_view bytes, ControlRequest& out, std::string& error) {
-    if (bytes.size() > kControlMaxPayloadBytes) {
-        error = "control payload too large";
-        return false;
-    }
-    std::size_t offset = 0;
-    std::uint32_t magic = 0;
-    std::uint32_t version = 0;
-    std::uint32_t op = 0;
-    std::uint32_t sender = 0;
-    std::uint32_t count = 0;
-    std::uint32_t reserved = 0;
-    if (!take_u32(bytes, offset, magic) || !take_u32(bytes, offset, version) ||
-        !take_u32(bytes, offset, op) || !take_u32(bytes, offset, sender) ||
-        !take_u32(bytes, offset, count) || !take_u32(bytes, offset, reserved)) {
-        error = "control payload truncated";
-        return false;
-    }
-    if (magic != kControlMagic) {
-        error = "control magic mismatch";
-        return false;
-    }
-    if (version != kControlVersion) {
-        error = "control version mismatch";
-        return false;
-    }
-    if (op != static_cast<std::uint32_t>(ControlOp::Command) &&
-        op != static_cast<std::uint32_t>(ControlOp::Inspect)) {
-        error = "control op unknown";
-        return false;
-    }
-    if (count > kControlMaxArgs) {
-        error = "control argument count out of range";
-        return false;
-    }
-
-    ControlRequest request;
-    request.op = static_cast<ControlOp>(op);
-    request.sender_pid = sender;
-    request.args.reserve(count);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        std::uint32_t length = 0;
-        if (!take_u32(bytes, offset, length)) {
-            error = "control argument truncated";
-            return false;
-        }
-        if (length > kControlMaxArgBytes || offset + length > bytes.size()) {
-            error = "control argument length out of range";
-            return false;
-        }
-        std::string_view const text = bytes.substr(offset, length);
-        offset += length;
-        if (!utf8_validate(text)) {
-            error = "control argument is not valid UTF-8";
-            return false;
-        }
-        request.args.push_back(wide_from_utf8(text));
-    }
-    if (offset != bytes.size()) {
-        error = "control payload has trailing bytes";
-        return false;
-    }
-    out = std::move(request);
-    return true;
-}
+// 心跳定时器的 id。窗口只有一个，用一个固定 id 就够了。
+constexpr UINT_PTR kHeartbeatTimerId = 1;
 
 InstanceMutex::~InstanceMutex() {
     if (handle_ != nullptr) {
@@ -168,12 +68,41 @@ LRESULT CALLBACK ControlServer::window_proc(HWND window, UINT message, WPARAM wp
     if (message == WM_CLOSE) {
         return 0;
     }
+    // 主进程自己的窗口消息（WM_APP 及以上）与心跳：交给它自己那条泵。
+    //
+    // 这一段是必需的，不是可选的：右键菜单的 TrackPopupMenu 会在主进程线程上开一个嵌套模态
+    // 循环，主循环那一次 PeekMessage 在这期间根本跑不到；带指针的 WM_APP 若在这里落到
+    // DefWindowProc，指针就被静默丢掉（结果丢失 + 内存泄漏）。所以主进程的 WM_APP / WM_TIMER
+    // 必须在这个窗口过程里有去处，无论消息是被哪个循环派发过来的。
+    if (self != nullptr && self->pump_ != nullptr && message >= WM_APP) {
+        if (self->pump_(message, wparam, lparam)) {
+            return 0;
+        }
+    }
     if (message == WM_NCCREATE) {
         auto const* create = reinterpret_cast<CREATESTRUCTW const*>(lparam);
         ::SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
         return TRUE;
     }
     return ::DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool ControlServer::start_heartbeat(UINT interval_ms) {
+    if (window_ == nullptr || interval_ms == 0) {
+        return false;
+    }
+    if (::SetTimer(window_, kHeartbeatTimerId, interval_ms, nullptr) == 0) {
+        return false;
+    }
+    heartbeat_ = true;
+    return true;
+}
+
+void ControlServer::stop_heartbeat() {
+    if (window_ != nullptr && heartbeat_) {
+        ::KillTimer(window_, kHeartbeatTimerId);
+    }
+    heartbeat_ = false;
 }
 
 bool ControlServer::create(std::wstring const& class_name, UserSecurity const* security,
@@ -206,11 +135,13 @@ void ControlServer::destroy() {
         ::DestroyWindow(window_);
         window_ = nullptr;
     }
+    heartbeat_ = false;
     if (!class_name_.empty()) {
         ::UnregisterClassW(class_name_.c_str(), ::GetModuleHandleW(nullptr));
         class_name_.clear();
     }
     handler_ = nullptr;
+    pump_ = nullptr;
 }
 
 bool control_window_exists(std::wstring const& class_name) {

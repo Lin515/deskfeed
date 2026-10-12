@@ -16,12 +16,14 @@ DeskFeed 不解释业务数值。温度、百分比、币种、剩余量都只�
 | 取数：HTTP GET、200 才接纳、重定向与超时规则 | 已实现 |
 | 离线检查器 `deskfeed-check.exe` 与离线用例 `deskfeed-tests.exe` | 已实现 |
 | 显示帧与显示邮箱（`src/display/`：主进程 → 显示面的 seam） | 已实现（含 `--frame-mailbox` 隔离验收通道） |
-| 任务栏真嵌入负载 `deskfeed-payload.dll` | **尚未实现**（Phase 2） |
-| `deskfeed-inject.exe`、`deskfeed-probe.exe` | **尚未实现**（Phase 2） |
+| 任务栏真嵌入负载 `deskfeed-payload.dll`（只读显示帧、渲染进任务栏 XAML、可证明的拆除门禁） | 已实现（Phase 2） |
+| `deskfeed-inject.exe`（注入/卸载工具）、`deskfeed-probe.exe`（自测宿主） | **尚未实现**（Phase 2） |
 | 桌面悬浮窗 | **尚未实现**（Phase 3） |
 
 主进程目前是无界面后台进程：它取数、校验、维护状态机，并提供命令行控制与状态查询。
-任务栏与悬浮窗的路线与安全约束见 [任务栏注入计划](<docs/taskbar-injection.md>)。
+负载 DLL 已经有独立构建目标与安全收尾协议，但**还没有注入工具**：当前版本不会向任何进程注入，
+也没有面向用户的开关能触发注入。任务栏与悬浮窗的路线与安全约束见
+[任务栏注入计划](<docs/taskbar-injection.md>) 与 [原生侧安全约束](<docs/native-safety.md>)。
 
 ## 快速开始
 
@@ -62,7 +64,8 @@ node examples\producer\minimal-producer.mjs --port 8099
 | [docs/testing.md](<docs/testing.md>) | 构建与测试、离线检查器用法、**安全验收流程**（隔离实例、不碰 explorer） |
 | [docs/building.md](<docs/building.md>) | 工具链要求与构建命令 |
 | [docs/architecture.md](<docs/architecture.md>) | 四条 seam、模块划分、阶段路线 |
-| [docs/taskbar-injection.md](<docs/taskbar-injection.md>) | Phase 2 任务栏真嵌入计划与硬性安全约束（尚未实现） |
+| [docs/taskbar-injection.md](<docs/taskbar-injection.md>) | Phase 2 任务栏真嵌入：当前实现状态、硬性安全约束与已知风险 |
+| [docs/native-safety.md](<docs/native-safety.md>) | 原生侧安全：任务栏线程编组的收尾门禁、`DeskFeedStop` 返回值、已接受的残余窗口 |
 | [schema/snapshot-v1.schema.json](<schema/snapshot-v1.schema.json>) | 机器可读的协议约束 |
 | [examples/producer/](<examples/producer/README.md>) | 不依赖任何私有生产端的最小生产端示例 |
 

@@ -28,6 +28,7 @@ DeskFeed 只有一个取数与状态决策的地方：主进程 `deskfeed.exe`�
 | `src/display/` | `deskfeed_display` | 显示帧的有界线格式（`frame.*`）与显示邮箱（`mailbox.*`）：主进程是唯一生产者，任务栏负载 DLL 只读最新一帧。这一层是主进程与负载共用的 seam。 |
 | `src/ipc/` | `deskfeed_ipc` | 命令行、控制通道（互斥体 + 隐藏窗口 + `WM_COPYDATA`）、设置落盘、进程绑定与代次。 |
 | `src/master/` | `deskfeed` | 单实例生命周期、命令事务、取数调度、到期定时器、消息循环、把显示模型发布进显示邮箱。 |
+| `src/payload/` | `deskfeed_payload` | 注入 `explorer.exe` 的任务栏负载：只读最新显示帧、渲染进任务栏 XAML 树、带可证明的拆除门禁（见 docs/native-safety.md）。 |
 | `src/tools/check/` | `deskfeed-check` | 离线协议检查器与 HTTP 量具。 |
 | `tests/` | `deskfeed-tests` | 全部离线用例。 |
 

@@ -11,7 +11,8 @@
 | [testing.md](testing.md) | 构建与测试、离线检查器、mock 生产端、**安全验收流程**与禁止事项 |
 | [building.md](building.md) | 工具链要求、配置/构建/测试命令、产物位置 |
 | [architecture.md](architecture.md) | 四条 seam、模块划分、Phase 1/2/3 路线 |
-| [taskbar-injection.md](taskbar-injection.md) | Phase 2 任务栏真嵌入与显示邮箱的计划、硬性安全约束、已知风险（尚未实现） |
+| [taskbar-injection.md](taskbar-injection.md) | Phase 2 任务栏真嵌入与显示邮箱：当前实现状态、硬性安全约束、已知风险 |
+| [native-safety.md](native-safety.md) | 原生侧安全约束：任务栏线程编组与收尾门禁、`DeskFeedStop` 返回值、导入表改写的已接受残余 |
 
 约定：
 

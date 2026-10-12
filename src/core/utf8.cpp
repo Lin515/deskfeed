@@ -1,40 +1,11 @@
 #include "core/utf8.h"
 
-#include <windows.h>
-
+// 这个翻译单元只放**校验与判据**（`utf8_decode` / `utf8_validate` /
+// `is_unicode_whitespace` / `is_blank` / `has_line_break`）。UTF-8 与 UTF-16 的互转在
+// `core/utf8_convert.cpp`：任务栏负载 DLL 只需要那一份转换，不应该把校验器一起带进
+// explorer.exe，所以两者分成两个翻译单元、两个目标（`deskfeed_core_text` 只含转换）。
 namespace deskfeed {
 namespace {
-
-// 只做 UTF-8 与 UTF-16 的互转，不引入任何界面依赖。
-std::string to_utf8(std::wstring_view text) {
-    if (text.empty()) {
-        return std::string();
-    }
-    int const bytes = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                                            nullptr, 0, nullptr, nullptr);
-    if (bytes <= 0) {
-        return std::string();
-    }
-    std::string result(static_cast<std::size_t>(bytes), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(),
-                          bytes, nullptr, nullptr);
-    return result;
-}
-
-std::wstring to_wide(std::string_view text) {
-    if (text.empty()) {
-        return std::wstring();
-    }
-    int const chars = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                                            static_cast<int>(text.size()), nullptr, 0);
-    if (chars <= 0) {
-        return std::wstring();
-    }
-    std::wstring result(static_cast<std::size_t>(chars), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                          static_cast<int>(text.size()), result.data(), chars);
-    return result;
-}
 
 bool is_continuation(unsigned char byte) { return (byte & 0xC0) == 0x80; }
 
@@ -101,10 +72,6 @@ bool utf8_validate(std::string_view text) {
     }
     return true;
 }
-
-std::wstring wide_from_utf8(std::string_view text) { return to_wide(text); }
-
-std::string utf8_from_wide(std::wstring_view text) { return to_utf8(text); }
 
 bool is_unicode_whitespace(CodePoint code_point) {
     switch (code_point) {

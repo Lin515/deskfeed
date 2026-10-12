@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="DeskFeed.payload" version="1.0.0.0"/>
+
+  <!-- 读数块上的悬停提示是一个 TOOLTIPS_CLASS 的 Win32 窗口，它住在任务栏那个进程里。任务栏自己
+       用的是 comctl32 6.0，这里声明同一个依赖，进程才会加载 6.0 那一份；否则提示的外观与尺寸会
+       跟任务栏自己的提示不一致。清单作为**源文件**交给 CMake，是让它与 CMake 自己生成的那份合并的
+       唯一办法（单独用 /MANIFESTINPUT 会被拒绝，再加 /MANIFEST:EMBED 会撞成重复的 MANIFEST 资源）。 -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+                        processorArchitecture="amd64" publicKeyToken="6595b64144ccf1df"
+                        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <maxversiontested Id="10.0.22621.0"/>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

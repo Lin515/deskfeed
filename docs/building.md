@@ -28,6 +28,7 @@ cmd /c 'chcp 65001 >nul && call vcvarsall.bat x64 && cmake --build .agent/build/
 .agent/build/debug/bin/deskfeed.exe        主进程
 .agent/build/debug/bin/deskfeed-check.exe  离线检查器 / HTTP 量具
 .agent/build/debug/bin/deskfeed-tests.exe  离线用例
+.agent/build/debug/bin/deskfeed-payload.dll 任务栏负载（注入 explorer.exe；同目录另有 .map 文件）
 .agent/build/debug/lib/                    静态库
 ```
 

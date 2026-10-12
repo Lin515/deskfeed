@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "ipc/control_wire.h"
 #include "platform/user_scope.h"
 
 // 启动/控制通道：命名互斥体仲裁单实例，稳定隐藏窗口接受 WM_COPYDATA，
@@ -15,38 +16,11 @@
 //
 // 载荷规则：接收端在窗口消息处理器里把参数**复制**出来，绝不保存 lpData 指针；
 // 载荷里没有发送进程的私有地址，只有协议版本、操作码、发送方 PID 与参数文本。
+//
+// 线格式（协议常量、`ControlOp` / `ControlReply`、`ControlRequest` 与编解码）在
+// `ipc/control_wire.h`：那一份是发送端与接收端的唯一出处，也被任务栏负载 DLL 的
+// 单向发送端复用（负载只链编码那一半，不带解码器与校验器）。本文件只管窗口、互斥体与收发。
 namespace deskfeed {
-
-inline constexpr wchar_t kControlWindowClassBase[] = L"DeskFeedControl";
-inline constexpr std::uint32_t kControlMagic = 0x31464644;  // 'D','F','F','1'
-inline constexpr std::uint32_t kControlVersion = 1;
-inline constexpr std::size_t kControlMaxPayloadBytes = 64 * 1024;
-inline constexpr std::size_t kControlMaxArgs = 64;
-inline constexpr std::size_t kControlMaxArgBytes = 4096;
-
-enum class ControlOp : std::uint32_t {
-    Command = 1,  // args 是原始命令行参数，由接收端照常解析
-    Inspect = 2,  // 查询运行状态
-};
-
-enum class ControlReply : std::intptr_t {
-    Accepted = 0,   // 命令已被接受
-    Rejected = 1,   // 命令被拒绝（地址非法、保存失败等）
-    BadRequest = 2, // 载荷/参数不合法
-    NotBound = 3,   // --quit-if-bound 的 PID 不匹配（对发送端算成功）
-};
-
-std::intptr_t control_reply_value(ControlReply reply);
-
-struct ControlRequest {
-    ControlOp op = ControlOp::Command;
-    std::uint32_t sender_pid = 0;
-    std::vector<std::wstring> args;
-};
-
-// 序列化/反序列化（同一份代码给发送端与接收端用，两端不可能对线格式有第二种解释）。
-std::string control_encode(ControlRequest const& request);
-bool control_decode(std::string_view bytes, ControlRequest& out, std::string& error);
 
 // 单实例仲裁：CreateMutexW 的返回值 + ERROR_ALREADY_EXISTS 决定谁是主实例。
 class InstanceMutex {
@@ -66,9 +40,20 @@ private:
 };
 
 // 接收端：隐藏窗口 + WM_COPYDATA。必须建在主实例的消息线程上。
+//
+// 这个窗口同时是主进程**唯一那条消息泵**的落脚点：主循环的 MsgWaitForMultipleObjects 与
+// 别人（例如右键菜单的 TrackPopupMenu）开的嵌套模态循环，最终都会把窗口消息派发到这里的
+// window_proc。所以主进程自己的 WM_APP / WM_TIMER 必须在这里也有去处——只靠主循环里那次
+// PeekMessage，会在模态循环期间把取数结果、绑定退出、到期 tick 全部吞掉（见 message_pump）。
 class ControlServer {
 public:
     using Handler = std::function<ControlReply(ControlRequest const&)>;
+    // 主进程自己的窗口消息处理（WM_APP 及以上）与周期心跳。返回 true 表示这条消息已经被
+    // 处理掉了，窗口过程不再往下走默认处理（默认处理会把带指针的消息静默丢掉）。
+    //
+    // 它会在**任何**派发这条消息的循环里被调到：主循环的 PeekMessage，或者模态循环内部的
+    // 派发。所以实现必须是可重入安全的（主进程那侧用一把“正在泵”的闸门保证不重入）。
+    using Pump = std::function<bool(UINT message, WPARAM wparam, LPARAM lparam)>;
 
     ~ControlServer();
     ControlServer() = default;
@@ -79,6 +64,12 @@ public:
     void destroy();
     HWND window() const { return window_; }
     void set_handler(Handler handler) { handler_ = std::move(handler); }
+    void set_pump(Pump pump) { pump_ = std::move(pump); }
+
+    // 心跳定时器：毫秒。主循环在模态循环期间不会跑，靠这个定时器把状态机继续推下去
+    // （到期 tick、取数结果、绑定退出、发布显示帧）。0 表示不要定时器。
+    bool start_heartbeat(UINT interval_ms);
+    void stop_heartbeat();
 
     static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
@@ -86,6 +77,8 @@ private:
     HWND window_ = nullptr;
     std::wstring class_name_;
     Handler handler_;
+    Pump pump_;
+    bool heartbeat_ = false;
 };
 
 // 发送端：找到隐藏窗口并投递。超时或没有实例时返回 false，error 说明原因。

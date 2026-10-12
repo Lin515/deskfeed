@@ -1,8 +1,9 @@
 # 任务栏真嵌入与显示邮箱（Phase 2）
 
 > **部分实现。** 显示邮箱（主进程发布“最新完整帧”）已经落地，并有一条按 scope 隔离的离线验收
-> 通道 `--frame-mailbox`；**任务栏真嵌入负载 `deskfeed-payload.dll`、`deskfeed-inject.exe`、
-> `deskfeed-probe.exe` 尚未实现**。当前版本不做任何注入，任务栏上不显示任何东西。本文记录
+> 通道 `--frame-mailbox`；负载 `deskfeed-payload.dll` 已经实现（只读最新显示帧、渲染进任务栏
+> XAML 树、收尾门禁见 [native-safety.md](native-safety.md)），`deskfeed-inject.exe`、
+> `deskfeed-probe.exe` 尚未实现**。当前版本没有任何注入工具，任务栏上不显示任何东西。本文记录
 > 计划与硬性约束，供接手实现的人使用。
 
 ## 目标

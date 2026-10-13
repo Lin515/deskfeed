@@ -182,6 +182,9 @@ struct WidgetState {
     unsigned long long last_tap_ms = 0;
     POINT last_tap_point{0, 0};
     unsigned long long last_menu_ms = 0;
+    // 本窗口自己的右键菜单正开着（TrackPopupMenu 的模态循环还没返回）。置顶守护在菜单期间必须
+    // 停手：见 verify_topmost_of 与 show_context_menu_of 里的理由。
+    bool menu_open = false;
     // “被别的窗口压住、补完置顶还压着”那行日志上一次记的时刻（毫秒）。0 = 上一 tick 没被压住，
     // 于是下一次被压住立刻记一行；连续被压住则 10 秒最多一行。
     unsigned long long topmost_cover_log_ms = 0;
@@ -993,6 +996,17 @@ void verify_topmost_of(WidgetState& self) {
     if (!self.preferences.topmost) {
         return;
     }
+    // 自己的右键菜单正开着：这一 tick **不判也不补**。
+    //   * 判据会被我们自己那个菜单搅浑：菜单是本进程的窗口，命中测试（covered_by_foreign_window_of）
+    //     会跳过它，z 序扫描（overlapped_from_above_of）却会把菜单上面的窗口算成“盖住了我们”，
+    //     于是守卫在菜单期间凭空认为被压住（真实日志里每次菜单弹出后的下一个 tick 都出现那一行）；
+    //   * 而且那一下 `SetWindowPos(hwnd, HWND_TOPMOST, ...)` 会把本窗口抬到**自己的菜单**之上，
+    //     菜单被自家窗口盖住却仍握着鼠标捕获，随后的点击就落进这个看不见的菜单里选中光标下那一项
+    //     ——可产生与现场相同的隐藏/退出后果（现场那一次的退出**来源**旧日志分不出来）。
+    // 推迟到菜单返回之后：下一 tick 仍用原来那两条判据、原来那一个动作照原样补。
+    if (self.menu_open) {
+        return;
+    }
     // 两个判据任一成立就补置顶：命中测试（确定性，主判据）与 z 序扫描（兜底，对“置顶位被外部
     // 摘掉”这类邻近情形也敏感）。都不成立就一次都不碰，否则就是“无条件每秒重抬”。
     //
@@ -1215,6 +1229,13 @@ void show_context_menu_of(WidgetState& self) {
     if (self.menu == nullptr) {
         return;
     }
+    // 已经有一个菜单开着就不再开第二个。TrackPopupMenu 是模态的：递归进入会让内层先返回，
+    // 内层把 menu_open 清成 false，于是外层菜单还开着的时候守卫就恢复补置顶了。真实手势里
+    // 菜单握着鼠标捕获、窗口根本收不到第二次右键，这里挡的是被外部投递进来的重复
+    // WM_RBUTTONUP / WM_CONTEXTMENU（离线夹具就是这么发的）。
+    if (self.menu_open) {
+        return;
+    }
     // 菜单是模态的：弹出前先把悬停提示收掉，免得它盖在菜单上。
     hide_hover_tip_of(self);
     // 菜单打开时按当前状态回填。
@@ -1243,11 +1264,24 @@ void show_context_menu_of(WidgetState& self) {
     ::GetCursorPos(&cursor);
     // 不先把自己设成前台窗口的话，菜单点到别处不会收起来。
     ::SetForegroundWindow(self.hwnd);
+    // 模态循环期间置顶守护必须停手：`SetWindowPos(hwnd, HWND_TOPMOST, ...)` 会把本窗口抬到
+    // **它自己这个菜单**之上（菜单是本窗口拥有的顶层弹出窗口；实测补一次置顶后，菜单矩形内
+    // `WindowFromPoint` 命中的就从菜单变成宿主窗口）。菜单被自家窗口盖住、却仍然握着鼠标捕获，
+    // 于是随后的点击会落进这个看不见的菜单、选中光标下那一项——这**可以**产生与现场相同的
+    // 隐藏/退出后果，时序（菜单弹出后约一个 tick 就补置顶、再约半秒后 hide/quit）也吻合；
+    // 现场那一次到底是菜单命令还是外部 WM_CLOSE，要等运行期日志（下面那两行）才分得清。
+    // 停的只是这段模态期间；菜单一返回，判据与动作一字不改。
+    self.menu_open = true;
     UINT const command = ::TrackPopupMenu(self.menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                                           cursor.x, cursor.y, 0, self.hwnd, nullptr);
+    self.menu_open = false;
     // 官方 sample 要求的收尾：菜单之后补一条 WM_NULL。少了它，下一次弹出可能立刻消失
     // （模态循环退出时残留的鼠标状态会被当成一次点击）。这条消息对 DefWindowProc 是无操作。
     ::PostMessageW(self.hwnd, WM_NULL, 0, 0);
+    // 菜单是模态的、外面看不见它：这一行（选中了哪一项；0 = 点外面/ESC 取消）是运行期唯一
+    // 能分清「菜单退出」与「--quit / 绑定退出 / 外部 WM_CLOSE」的第一手材料。
+    log_format(L"widget: context menu closed: command=%u%s", command,
+               command == 0 ? L" (dismissed without a command)" : L"");
     if (command == 0) {
         return;
     }
@@ -1308,6 +1342,9 @@ void run_command_of(WidgetState& self, UINT command) {
             }
             break;
         case kCmdExit:
+            // 退出的**来源**已经由调用方各记一行（菜单返回的命令号 / 外面递进来的 WM_COMMAND /
+            // WM_CLOSE）：这里只留“退出这条命令真的被执行了”这一行，固定文案、不带任何明细。
+            log_line(L"widget: the exit command was run (the master will post the quit request)");
             if (self.callbacks.quit != nullptr) {
                 self.callbacks.quit(self.callbacks.context);
             } else {
@@ -1623,10 +1660,16 @@ LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPA
             // 菜单本身用 TrackPopupMenu(TPM_RETURNCMD)，选中一项不会发 WM_COMMAND——那条路由
             // show_context_menu 直接调 run_command。这里接的是“从外面按命令号递进来”的同一条
             // 命令，离线夹具靠它无人值守地逐条验证菜单项。
+            // 记一行来源与当时有没有活动菜单：产品里这个窗口没有子控件，命令号只可能来自外部
+            // 投递；菜单开着时收到它，就是“绕过了菜单直接递命令”的直接证据。
+            log_format(L"widget: WM_COMMAND %u arrived from outside (menu_open=%d)",
+                       static_cast<unsigned>(wparam & 0xFFFFu), self.menu_open ? 1 : 0);
             run_command_of(self, static_cast<UINT>(wparam & 0xFFFFu));
             return 0;
         case WM_CLOSE:
             // Alt+F4 与菜单「退出」走同一条收尾路径：外面按“先摘任务栏负载、再关窗”的顺序来。
+            // 与 kCmdExit 分开记一行：退出到底走的哪条路，运行期日志里必须能分清。
+            log_format(L"widget: WM_CLOSE received (menu_open=%d)", self.menu_open ? 1 : 0);
             if (self.callbacks.quit != nullptr) {
                 self.callbacks.quit(self.callbacks.context);
             } else {

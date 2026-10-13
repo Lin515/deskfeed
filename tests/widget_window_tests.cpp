@@ -23,6 +23,7 @@
 #include "core/utf8.h"
 #include "display/frame.h"
 #include "display/reading.h"
+#include "platform/log.h"
 #include "platform/win32_util.h"
 #include "widget/fullscreen.h"
 #include "widget/text_metrics.h"
@@ -56,6 +57,8 @@ struct Recorder {
     int quit = 0;
     int taskbar_calls = 0;
     int saves = 0;
+    // 落盘里出现过 hidden=true：这一条就是“隐藏悬浮窗那条路被走过”的证据。
+    int hidden_saves = 0;
     bool save_ok = true;
     bool taskbar_result = true;
     deskfeed::widget::WindowPreferences last_saved{};
@@ -74,6 +77,9 @@ bool on_save(void* context, deskfeed::widget::WindowPreferences const& preferenc
     Recorder* recorder = static_cast<Recorder*>(context);
     recorder->saves += 1;
     recorder->last_saved = preferences;
+    if (preferences.hidden) {
+        recorder->hidden_saves += 1;
+    }
     if (!recorder->save_ok) {
         if (error != nullptr) {
             *error = L"injected save failure";
@@ -1004,9 +1010,313 @@ void test_drag_save_failure_rolls_the_anchor_back() {
     window.destroy();
 }
 
+// ---- 菜单保活：置顶守护不得把宿主窗口抬到它自己那个菜单之上 ------------------------------------
+//
+// 这一条走**真的** `TrackPopupMenu` 模态循环（不是按命令号发 `WM_COMMAND`）：坏掉的是“菜单还开着
+// 的时候窗口被重新置顶”这一件事，它只在真菜单的模态循环里成立——菜单是本窗口**拥有**的顶层弹出
+// 窗口，`SetWindowPos(hwnd, HWND_TOPMOST, ...)` 会把宿主抬到自己菜单之上（实测：补一次置顶后，
+// 菜单矩形内 `WindowFromPoint` 命中的就从菜单变成宿主窗口）。菜单被自家窗口盖住、却仍然握着鼠标
+// 捕获，于是随后的点击会落进这个**看不见的**菜单、选中光标下那一项——这**可以**产生与现场相同的
+// 隐藏/退出后果，时序（菜单弹出后约一个 tick 就补置顶、再约半秒后 hide/quit）也吻合；现场那一次
+// 的退出**来源尚未捕获**（菜单命令与外部 `WM_CLOSE` 在旧日志里分不出来，运行期日志现在才补上）。
+// 这不是内存/异常崩溃，是“菜单被遮盖但仍捕获输入 → 后续误触发 Hide/Exit 路径”。
+//
+// 不碰用户桌面：整轮跑在**私有桌面**上（`CreateDesktop`，不是输入桌面），用户屏幕、光标与焦点都
+// 不受影响，也不注入任何真实输入——只给自己的窗口发合成消息；菜单与窗口都是本进程自己的窗口。
+//
+// 触发用守卫两条具名判据里的 `is_topmost_of()==false`（“置顶位丢了”），测试期间把宿主窗口的
+// topmost 位剥掉来定死它。生产日志里那次命中的是另一条分支（z 序扫描认为有异进程窗口压着我们；
+// `covered_by_foreign_window_of` 会跳过本进程的菜单，而离线环境造不出异进程窗口）。两条判据落到
+// 的是**同一行动作** `apply_topmost_of`，也就是这条门禁钉住的东西；差别只在这里写明。
+constexpr wchar_t kMenuGateClass[] = L"DeskFeedWidgetMenuGateWindow";
+constexpr UINT_PTR kMenuGateTimer = 11;
+constexpr unsigned kMenuGateTickMs = 100;
+
+struct MenuGateState {
+    HWND widget = nullptr;
+    HWND helper = nullptr;
+    HWND menu = nullptr;
+    unsigned long long start = 0;
+    int phase = 0;
+    bool harness_ok = false;           // 菜单真的开出来了，而且它与窗口有交叠区域
+    bool visible_before = false;       // 守卫动手之前：交叠点上最上层是菜单（用户看得见）
+    bool visible_after_guard = false;  // 守卫动手之后：仍然是菜单 ← 这一条就是红/绿判据
+    bool topmost_restored = false;     // 菜单结束后：守卫按原判据把置顶补了回来
+    bool end_menu_called = false;
+    bool widget_created = false;
+    bool repeated_request_sent = false;  // 菜单开着的时候又递了一条右键请求
+    int quit_calls = 0;
+    int hidden_saves = 0;
+};
+
+MenuGateState* g_menu_gate = nullptr;
+
+bool create_for_menu_gate(deskfeed::widget::WidgetWindow& window, Recorder& recorder,
+                          deskfeed::widget::WindowPreferences preferences, std::wstring& error) {
+    deskfeed::widget::WidgetOptions options;
+    options.instance = ::GetModuleHandleW(nullptr);
+    options.class_name = kMenuGateClass;  // 独立类名：与其它用例的隐藏窗口互不干扰
+    options.taskbar_available = true;
+    options.force_hidden = false;  // 这一轮要真的显示（显示在私有桌面上）
+    options.preferences = preferences;
+    return window.create(options, callbacks_for(recorder), &error);
+}
+
+// 弹出菜单的窗口类固定是 `#32768`；它属于开菜单的那个线程。
+HWND find_popup_menu_of_this_thread() {
+    struct Search {
+        HWND found;
+    } search{nullptr};
+    ::EnumThreadWindows(
+        ::GetCurrentThreadId(),
+        [](HWND window, LPARAM param) -> BOOL {
+            auto* state = reinterpret_cast<Search*>(param);
+            wchar_t name[64] = L"";
+            ::GetClassNameW(window, name, static_cast<int>(std::size(name)));
+            if (::wcscmp(name, L"#32768") == 0) {
+                state->found = window;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+// 菜单与宿主窗口的交叠点：只有两边都盖住它，“谁在最上层”才有意义。
+bool menu_overlap_point(HWND widget, HWND menu, POINT* out) {
+    RECT mine{}, menu_rect{}, overlap{};
+    if (widget == nullptr || menu == nullptr || out == nullptr || !::GetWindowRect(widget, &mine) ||
+        !::GetWindowRect(menu, &menu_rect) || !::IntersectRect(&overlap, &mine, &menu_rect)) {
+        return false;
+    }
+    *out = POINT{(overlap.left + overlap.right) / 2, (overlap.top + overlap.bottom) / 2};
+    return true;
+}
+
+LRESULT CALLBACK menu_gate_helper_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    MenuGateState* const state = g_menu_gate;
+    if (message != WM_TIMER || wparam != kMenuGateTimer || state == nullptr) {
+        return ::DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    unsigned long long const elapsed = ::GetTickCount64() - state->start;
+    if (state->phase == 0 && elapsed >= 250) {
+        state->menu = find_popup_menu_of_this_thread();
+        POINT at{0, 0};
+        state->harness_ok = state->menu != nullptr && menu_overlap_point(state->widget, state->menu,
+                                                                        &at);
+        state->visible_before = state->harness_ok && ::WindowFromPoint(at) == state->menu;
+        // “置顶位丢了”——守卫存在的理由，也是这次定死的触发（见上面那段说明）。
+        ::SetWindowPos(state->widget, HWND_NOTOPMOST, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        state->phase = 1;
+        return 0;
+    }
+    if (state->phase == 1 && elapsed >= 2600) {
+        // 守卫定时器是 1000 ms 一次：等满两个多周期，它必然在菜单开着的时候跑过。
+        POINT at{0, 0};
+        state->visible_after_guard = menu_overlap_point(state->widget, state->menu, &at) &&
+                                     ::WindowFromPoint(at) == state->menu;
+        ::EndMenu();  // 自己线程上那个活动菜单：取消，不该选中任何一项
+        state->end_menu_called = true;
+        state->phase = 2;
+        return 0;
+    }
+    if (state->phase == 1 && elapsed >= 700 && !state->repeated_request_sent) {
+        // 菜单开着的时候再递一条右键请求：真实手势里菜单握着捕获、窗口收不到它，但外部投递
+        // 得到（离线夹具就是这么发的）。它必须被挡在门外——既不弹第二个菜单，也不能把
+        // menu_open 清掉让守卫提前恢复。
+        state->repeated_request_sent = true;
+        ::PostMessageW(state->widget, WM_RBUTTONUP, 0, MAKELPARAM(5, 5));
+        ::PostMessageW(state->widget, WM_CONTEXTMENU, 0, MAKELPARAM(5, 5));
+        return 0;
+    }
+    if (state->phase == 2 && elapsed >= 4200) {
+        state->topmost_restored = is_topmost(state->widget);
+        ::KillTimer(hwnd, kMenuGateTimer);
+        state->phase = 3;
+        return 0;
+    }
+    return 0;
+}
+
+DWORD WINAPI menu_gate_thread(void* param) {
+    auto* const state = static_cast<MenuGateState*>(param);
+    HDESK const original = ::GetThreadDesktop(::GetCurrentThreadId());
+    HDESK const desktop = ::CreateDesktopW(L"DeskFeedWidgetMenuGateDesk", nullptr, nullptr, 0,
+                                           GENERIC_ALL, nullptr);
+    if (desktop == nullptr || !::SetThreadDesktop(desktop)) {
+        if (desktop != nullptr) {
+            ::CloseDesktop(desktop);
+        }
+        return 1;
+    }
+
+    WNDCLASSEXW helper_class{};
+    helper_class.cbSize = sizeof(helper_class);
+    helper_class.lpfnWndProc = &menu_gate_helper_proc;
+    helper_class.hInstance = ::GetModuleHandleW(nullptr);
+    helper_class.lpszClassName = L"DeskFeedWidgetMenuGateHelper";
+    ::RegisterClassExW(&helper_class);
+
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    POINT cursor{};
+    ::GetCursorPos(&cursor);  // 私有桌面上的光标位置：菜单就弹在这里
+    deskfeed::widget::WindowPreferences preferences;
+    preferences.anchor_known = true;
+    preferences.anchor = POINT{cursor.x + 200, cursor.y + 100};
+    preferences.topmost = true;
+    preferences.hidden = false;
+    std::wstring error;
+    state->widget_created = create_for_menu_gate(window, recorder, preferences, error);
+    if (state->widget_created) {
+        window.apply(content_frame(2));
+        state->widget = window.handle();
+        // 用户是**在悬浮窗上**右键的，菜单因此压在窗口上：把窗口摆到菜单要出现的位置。
+        RECT rect{};
+        if (state->widget != nullptr && ::GetWindowRect(state->widget, &rect)) {
+            ::SetWindowPos(state->widget, nullptr, cursor.x, cursor.y, rect.right - rect.left,
+                           rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        state->helper = ::CreateWindowExW(0, L"DeskFeedWidgetMenuGateHelper", L"h", WS_POPUP, 0, 0,
+                                          0, 0, nullptr, nullptr, helper_class.hInstance, nullptr);
+        if (state->widget != nullptr && state->helper != nullptr) {
+            state->start = ::GetTickCount64();
+            ::SetTimer(state->helper, kMenuGateTimer, kMenuGateTickMs, nullptr);
+            ::PostMessageW(state->widget, WM_RBUTTONUP, 0, MAKELPARAM(5, 5));
+            unsigned long long const deadline = state->start + 9000;
+            MSG message{};
+            while (::GetTickCount64() < deadline && state->phase < 3) {
+                while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                    ::TranslateMessage(&message);
+                    ::DispatchMessageW(&message);
+                }
+                ::Sleep(5);
+            }
+        }
+    }
+    window.destroy();  // 偏好最后一次落盘也走这里；回调上下文必须活到它返回之后
+    state->quit_calls = recorder.quit;
+    state->hidden_saves = recorder.hidden_saves;
+    if (state->helper != nullptr) {
+        ::DestroyWindow(state->helper);
+        state->helper = nullptr;
+    }
+    state->widget = nullptr;
+    ::SetThreadDesktop(original);
+    ::CloseDesktop(desktop);
+    return 0;
+}
+
+std::wstring menu_gate_log_path() {
+    wchar_t base[MAX_PATH] = L"";
+    DWORD const length = ::GetTempPathW(MAX_PATH, base);
+    std::wstring directory(base, length);
+    directory += L"deskfeed-widget-menu-gate-" + std::to_wstring(::GetCurrentProcessId());
+    ::CreateDirectoryW(directory.c_str(), nullptr);
+    return directory + L"\\widget-menu-gate.log";
+}
+
+std::string read_file_bytes(std::wstring const& path) {
+    HANDLE const file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::string();
+    }
+    LARGE_INTEGER size{};
+    std::string bytes;
+    if (::GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (1 << 20)) {
+        bytes.resize(static_cast<std::size_t>(size.QuadPart));
+        DWORD read = 0;
+        if (!::ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr)) {
+            bytes.clear();
+        } else {
+            bytes.resize(read);
+        }
+    }
+    ::CloseHandle(file);
+    return bytes;
+}
+
+void test_context_menu_stays_above_the_widget_through_the_topmost_guard() {
+    std::wstring const log_path = menu_gate_log_path();
+    // 这一条同时用**生产日志**取证：z 序只能说明“菜单被盖住”，说明不了“守卫在菜单期间动过手”。
+    bool const logged = deskfeed::log_open(log_path, false);
+    check(logged, "the menu gate captures the widget's own production log");
+
+    MenuGateState state;
+    g_menu_gate = &state;
+    HANDLE const thread = ::CreateThread(nullptr, 0, &menu_gate_thread, &state, 0, nullptr);
+    bool joined = false;
+    if (thread != nullptr) {
+        // 只有真的等到线程退出，才关句柄、才读 state：超时说明夹具自己挂住了（那时 state 还在被
+        // 那个线程写），继续读就是读一块已经回收的栈。这里不强杀任何进程，只结束自己的测试进程。
+        joined = ::WaitForSingleObject(thread, 30000) == WAIT_OBJECT_0;
+        if (joined) {
+            ::CloseHandle(thread);
+        }
+    }
+    g_menu_gate = nullptr;
+    check(thread != nullptr, "the menu gate desktop thread started");
+    check(joined, "the menu gate thread exited in time (menu cancelled and joined)");
+    if (!joined) {
+        // fail-fast：不读 state、不假装线程已经退出，直接让测试进程以失败码结束（线程随进程结束）。
+        std::printf("FAIL the menu gate thread did not exit; aborting before reading its stack\n");
+        std::fflush(stdout);
+        ::ExitProcess(1);
+    }
+
+    check(state.widget_created, "the menu gate created the production widget window");
+    check(state.harness_ok, "the real context menu opened on the private desktop, over the widget");
+    check(state.visible_before, "before the guard acts the menu is the top window over its own area");
+    check(state.end_menu_called, "the gate cancelled the menu instead of leaving it up");
+    check(state.visible_after_guard,
+          "the topmost guard does not raise the widget over its own open menu");
+    check(state.topmost_restored,
+          "after the menu closes the guard restores topmost exactly as before");
+    check(state.repeated_request_sent, "the gate really sent a repeated right-click request");
+    check(state.quit_calls == 0, "cancelling the menu (and the repeated request) never asks to quit");
+    check(state.hidden_saves == 0, "cancelling the menu (and the repeated request) never hides");
+
+    deskfeed::log_close();
+    // 全部判据都是 ASCII 子串（日志行首只有时间戳与线程号），不需要解码 UTF-8。
+    std::string const text = read_file_bytes(log_path);
+    std::size_t const opened = text.rfind("widget: context menu texts:");
+    std::size_t const closed =
+        opened == std::string::npos
+            ? std::string::npos
+            : text.find("widget: context menu closed:", opened);
+    check(opened != std::string::npos && closed != std::string::npos,
+          "the production log recorded both the menu opening and its return command");
+    if (opened != std::string::npos && closed != std::string::npos) {
+        check(text.substr(opened, closed - opened).find("the topmost bit was lost") ==
+                  std::string::npos,
+              "the topmost guard never re-applied while our own menu was open");
+        check(text.find("the topmost bit was lost", closed) != std::string::npos,
+              "the guard re-applied right after the menu closed (deferred, not disabled)");
+        // 菜单开着时那条重复右键请求必须被挡在门外：整轮只能有一次“弹出菜单”。
+        std::size_t hits = 0;
+        for (std::size_t at = text.find("widget: context menu texts:"); at != std::string::npos;
+             at = text.find("widget: context menu texts:", at + 1)) {
+            ++hits;
+        }
+        check(hits == 1, "a repeated right-click request while the menu is open opens no second menu");
+        check(text.find("widget: context menu closed: command=0") != std::string::npos,
+              "the production log records the menu returning the cancel command");
+    }
+    ::DeleteFileW(log_path.c_str());
+    std::wstring directory = log_path;
+    std::wstring::size_type const slash = directory.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        ::RemoveDirectoryW(directory.substr(0, slash).c_str());
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_context_menu_stays_above_the_widget_through_the_topmost_guard();
     test_create_is_hidden_and_tooltips_are_configured();
     test_menu_toggles_callbacks_rollback_and_refresh();
     test_show_request_leaves_disk_alone_while_force_hidden();

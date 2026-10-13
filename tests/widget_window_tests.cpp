@@ -1,9 +1,11 @@
 // 悬浮窗的**隐藏窗口门禁**：在测试进程自己的线程上建一个真窗口，但用 `force_hidden = true`
 // 让它永远不显示，所以真实悬浮窗绝不会出现在桌面上。
 //
-// 这里只发**合成窗口消息**与直接调用公开方法：不移动光标、不弹可见菜单、不做真实悬停、
-// 不注入 explorer、不碰用户正在跑的实例。需要真实指针或真实桌面的行为（悬停提示真的弹出、
-// 命中测试、拖动落盘后的真机位置、全屏让位）不在这里覆盖，也不宣称验证过。
+// 这里只发**合成窗口消息**与直接调用公开方法：不移动光标、不弹可见菜单、不注入 explorer、
+// 不碰用户正在跑的实例。悬停提示本身就是由窗口消息驱动的（命中判定在窗口里，显示走
+// `TTM_TRACKPOSITION` + `TTM_TRACKACTIVATE`），所以合成 `WM_MOUSEMOVE` 走的就是生产路径，
+// 提示的可见性、文本与摆放位置都能在这里断言。不在这里覆盖的是需要真实桌面的行为
+// （拖动落盘后的真机位置、真实指针是否命中、全屏让位）。
 //
 // `WM_COMMAND` 的命令号是窗口对外的稳定接口（菜单项与离线夹具共用），这里按号发送。
 
@@ -16,8 +18,11 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
+#include "core/utf8.h"
 #include "display/frame.h"
+#include "display/reading.h"
 #include "platform/win32_util.h"
 #include "widget/fullscreen.h"
 #include "widget/text_metrics.h"
@@ -101,6 +106,15 @@ deskfeed::Frame content_frame(std::size_t items) {
     return frame;
 }
 
+// 与生产同形：每条目带非空 detail（生产快照里 4 个条目的 detail 长度在 21..115 之间）。
+deskfeed::Frame detailed_content_frame(std::size_t items) {
+    deskfeed::Frame frame = content_frame(items);
+    for (std::size_t index = 0; index < frame.items.size(); ++index) {
+        frame.items[index].detail = "detail of item " + std::to_string(index);
+    }
+    return frame;
+}
+
 bool is_topmost(HWND window) {
     return (::GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
 }
@@ -149,6 +163,495 @@ bool create_hidden(deskfeed::widget::WidgetWindow& window, Recorder& recorder,
     return window.create(options, callbacks_for(recorder), &error);
 }
 
+// ---- 悬停与双击的公共夹具 --------------------------------------------------------------------
+
+void pump_for(unsigned ms) {
+    unsigned long long const deadline = ::GetTickCount64() + ms;
+    MSG message{};
+    while (::GetTickCount64() < deadline) {
+        while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+        }
+        ::Sleep(5);
+    }
+}
+
+WNDPROC window_proc_of(HWND window) {
+    return reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(window, GWLP_WNDPROC));
+}
+
+// comctl32 现在为悬停持有**一个**工具（uId 固定为 0），文本按命中的条目换。
+constexpr UINT kHoverToolId = 0;
+
+std::wstring tool_text_of(HWND tip, HWND owner, UINT id) {
+    wchar_t buffer[2048] = {};
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(TOOLINFOW);
+    tool.hwnd = owner;
+    tool.uId = id;
+    tool.lpszText = buffer;
+    ::SendMessageW(tip, TTM_GETTEXTW, static_cast<WPARAM>(std::size(buffer)),
+                   reinterpret_cast<LPARAM>(&tool));
+    return buffer;
+}
+
+// 提示当下显示的那一行文本；提示没显示时就是空。
+std::wstring shown_hover_text(HWND tip, HWND owner) {
+    if (tip == nullptr || !::IsWindowVisible(tip)) {
+        return std::wstring();
+    }
+    return tool_text_of(tip, owner, kHoverToolId);
+}
+
+// 帧里每个条目自己的提示文本，按排版顺序（与任务栏那侧悬停格同一个字段 `ReadingRow::tip`）。
+std::vector<std::wstring> expected_node_tips(deskfeed::Frame const& frame) {
+    deskfeed::ReadingContent const content = deskfeed::reading_from_frame(frame);
+    std::vector<std::wstring> tips;
+    for (deskfeed::ReadingRow const& row : content.rows) {
+        tips.push_back(deskfeed::wide_from_utf8(row.tip));
+    }
+    return tips;
+}
+
+// 在整个客户区上合成鼠标移动，返回“提示文本的变化序列”（空 = 提示没显示）。
+std::vector<std::wstring> sweep_hover_texts(HWND hwnd, HWND tip, int step = 2) {
+    RECT client{};
+    if (!::GetClientRect(hwnd, &client)) {
+        return {};
+    }
+    std::vector<std::wstring> seen;
+    std::wstring last = L"<start>";
+    for (int y = 1; y < client.bottom; y += step) {
+        for (int x = 1; x < client.right; x += step) {
+            ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+            std::wstring const text = shown_hover_text(tip, hwnd);
+            if (text != last) {
+                seen.push_back(text);
+                last = text;
+            }
+        }
+    }
+    return seen;
+}
+
+std::vector<std::wstring> non_empty(std::vector<std::wstring> const& values) {
+    std::vector<std::wstring> kept;
+    for (std::wstring const& value : values) {
+        if (!value.empty()) {
+            kept.push_back(value);
+        }
+    }
+    return kept;
+}
+
+// 同一行里从左到右扫，每一行都会重看一遍同样的节点；这里只留**第一次出现**的顺序。
+std::vector<std::wstring> unique_in_order(std::vector<std::wstring> const& values) {
+    std::vector<std::wstring> kept;
+    for (std::wstring const& value : values) {
+        bool known = false;
+        for (std::wstring const& seen : kept) {
+            if (seen == value) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            kept.push_back(value);
+        }
+    }
+    return kept;
+}
+
+int gdi_objects() { return static_cast<int>(::GetGuiResources(::GetCurrentProcess(), GR_GDIOBJECTS)); }
+int user_objects() {
+    return static_cast<int>(::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS));
+}
+
+// 找到一个能悬停出 `text` 的客户区点；指针不动也能从合成消息里挑出来。
+bool find_hover_point(HWND hwnd, HWND tip, std::wstring const& text, POINT* out) {
+    RECT client{};
+    if (!::GetClientRect(hwnd, &client)) {
+        return false;
+    }
+    for (int y = 1; y < client.bottom; y += 2) {
+        for (int x = 1; x < client.right; x += 2) {
+            ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+            if (shown_hover_text(tip, hwnd) == text) {
+                *out = POINT{x, y};
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 逐条指定 value/detail 的帧：用来只改排版宽度（value）或只改提示文本（detail）。
+deskfeed::Frame hover_frame(std::vector<std::string> const& values,
+                            std::vector<std::string> const& details) {
+    deskfeed::Frame frame;
+    frame.kind = deskfeed::ViewKind::Content;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        deskfeed::FrameItem item;
+        item.id = "i" + std::to_string(index);
+        item.label = "cpu";
+        item.value = values[index];
+        item.detail = index < details.size() ? details[index] : std::string();
+        frame.items.push_back(std::move(item));
+    }
+    return frame;
+}
+
+bool same_rect(RECT const& left, RECT const& right) {
+    return left.left == right.left && left.top == right.top && left.right == right.right &&
+           left.bottom == right.bottom;
+}
+
+// ---- 悬停：每个条目自己的提示，稳定、可断言 --------------------------------------------------
+
+// 悬停必须按**条目**给出提示（与任务栏那侧同一个字段），不是把整行拼成一条；
+// 同一个条目里指针怎么动都不重发；离开条目/窗口/整窗隐藏时提示必须收掉。
+void test_hover_shows_each_nodes_own_tip() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the hover gate");
+    HWND const hwnd = window.handle();
+    deskfeed::Frame const frame = detailed_content_frame(4);
+
+    // 我们去掉了 TTF_SUBCLASS：comctl32 不该再替换本窗口的窗口过程。
+    WNDPROC const proc_before = window_proc_of(hwnd);
+    window.apply(frame);
+    check(window_proc_of(hwnd) == proc_before,
+          "comctl32 never replaces the widget window procedure (no TTF_SUBCLASS)");
+
+    HWND const tip = find_tooltip(hwnd);
+    check(tip != nullptr, "the hover tooltip control exists");
+    if (tip == nullptr) {
+        window.destroy();
+        return;
+    }
+    check(::SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0) == 1, "exactly one hover tool is registered");
+
+    std::vector<std::wstring> const expected = expected_node_tips(frame);
+    check(expected.size() == 4, "the frame has four hoverable nodes");
+
+    std::vector<std::wstring> const tips = unique_in_order(non_empty(sweep_hover_texts(hwnd, tip)));
+    check(tips == expected,
+          "sweeping the window shows every node's own tip, in packing order (not the whole row)");
+
+    // 同一个条目里再动几下：文本与提示位置都不该变（提示钉在节点上，不跟鼠标走）。
+    if (!expected.empty()) {
+        RECT client{};
+        ::GetClientRect(hwnd, &client);
+        POINT inside{0, 0};
+        for (int y = 1; y < client.bottom && inside.x == 0; y += 2) {
+            for (int x = 1; x < client.right; x += 2) {
+                ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+                if (shown_hover_text(tip, hwnd) == expected[0]) {
+                    inside = POINT{x, y};
+                    break;
+                }
+            }
+        }
+        check(inside.x != 0, "the first node is reachable by a synthetic move");
+        RECT tip_before{};
+        ::GetWindowRect(tip, &tip_before);
+        ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(inside.x + 1, inside.y));
+        ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(inside.x + 2, inside.y));
+        RECT tip_after{};
+        ::GetWindowRect(tip, &tip_after);
+        check(shown_hover_text(tip, hwnd) == expected[0], "moving inside one node keeps its tip");
+        check(tip_before.left == tip_after.left && tip_before.top == tip_after.top,
+              "the tip does not follow the pointer inside one node");
+
+        // 内容不变的一次刷新不该把正在看的提示弄没。
+        window.apply(frame);
+        check(shown_hover_text(tip, hwnd) == expected[0],
+              "a refresh with unchanged content keeps the tip on the same node");
+
+        // 提示必须落在节点所在显示器的工作区里（否则就是“弹到屏幕外，看不见”）。
+        RECT tip_rect{};
+        ::GetWindowRect(tip, &tip_rect);
+        HMONITOR const monitor = ::MonitorFromRect(&tip_rect, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        bool inside_work = false;
+        if (monitor != nullptr && ::GetMonitorInfoW(monitor, &info)) {
+            inside_work = tip_rect.left >= info.rcWork.left && tip_rect.top >= info.rcWork.top &&
+                          tip_rect.right <= info.rcWork.right &&
+                          tip_rect.bottom <= info.rcWork.bottom;
+        }
+        check(inside_work, "the tip is placed inside the monitor work area");
+    }
+
+    // 行外的空白处（左上角内边距）不该冒提示。
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(2, 2));
+    check(!::IsWindowVisible(tip), "the padding around the rows shows no tip");
+
+    // 合成一条 WM_MOUSELEAVE：提示必须收掉。
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(10, 10));
+    ::SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
+    check(!::IsWindowVisible(tip), "leaving the window hides the tip");
+
+    // 内容清空：窗口隐藏，提示也必须跟着收掉。
+    deskfeed::Frame empty;
+    empty.kind = deskfeed::ViewKind::Content;
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(10, 10));
+    window.apply(empty);
+    check(!::IsWindowVisible(hwnd), "an empty frame hides the window");
+    check(!::IsWindowVisible(tip), "an empty frame hides the hover tip too");
+
+    window.destroy();
+}
+
+// 详细模式下提示同样只认条目：折行之外多出来的详情块不该变成新的悬停节点。
+void test_hover_in_detailed_mode_covers_only_nodes() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the detailed hover gate");
+    HWND const hwnd = window.handle();
+    deskfeed::Frame const frame = detailed_content_frame(4);
+    window.apply(frame);
+    HWND const tip = find_tooltip(hwnd);
+    if (tip == nullptr) {
+        check(false, "the tooltip exists in detailed mode");
+        window.destroy();
+        return;
+    }
+    ::SendMessageW(hwnd, WM_COMMAND, kCmdExpanded, 0);
+    check(recorder.last_saved.expanded, "the detailed mode switch persisted");
+    std::vector<std::wstring> const tips = unique_in_order(non_empty(sweep_hover_texts(hwnd, tip)));
+    std::vector<std::wstring> const expected = expected_node_tips(frame);
+    check(tips == expected, "detailed mode still hovers per node, and only the nodes");
+    window.destroy();
+}
+
+// 已经显示出来的提示要经得起“指针没动、内容刷新了”：
+//   * 同一条目、同一份提示文本，但这一帧把排版宽度改了、条目矩形挪了 → 提示必须**还在**，
+//     而且位置一个像素都不动（旧写法的“矩形变了就收掉、等鼠标再显示”会在这里闪一下）；
+//   * 同一条目换了提示文本 → 只换文本：位置不动，也不必等下一次鼠标移动；
+//   * 悬停的那个条目在下一帧里没有了 / 内容清空 → 必须收掉。
+void test_hover_same_node_survives_refresh() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the hover refresh gate");
+    HWND const hwnd = window.handle();
+    std::vector<std::string> values{"1C", "2C", "3C", "4C"};
+    std::vector<std::string> details{"detail 0", "detail 1", "detail 2", "detail 3"};
+    window.apply(hover_frame(values, details));
+    HWND const tip = find_tooltip(hwnd);
+    if (tip == nullptr) {
+        check(false, "the refresh gate has a tooltip control");
+        window.destroy();
+        return;
+    }
+    std::vector<std::wstring> const expected = expected_node_tips(hover_frame(values, details));
+
+    // 指针停在第一个条目上。
+    POINT at{0, 0};
+    check(find_hover_point(hwnd, tip, expected[0], &at), "the first node was reachable");
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(at.x, at.y));
+    RECT before{};
+    ::GetWindowRect(tip, &before);
+    check(::IsWindowVisible(tip), "the tip is visible before the refresh");
+
+    // (1) 同文本、矩形变：把数值拉宽，排版跟着变。指针一个消息都不发。
+    values[0] = "123456789C";
+    window.apply(hover_frame(values, details));
+    RECT after_geometry{};
+    ::GetWindowRect(tip, &after_geometry);
+    check(::IsWindowVisible(tip), "a refresh that only moves the layout keeps the tip visible");
+    check(same_rect(before, after_geometry),
+          "a refresh that only moves the layout does not move the tip");
+    check(shown_hover_text(tip, hwnd) == expected[0], "the moved layout keeps the same tip text");
+
+    // (2) 同条目、换文本：指针仍然不动。
+    details[0] = "detail 0 changed";
+    window.apply(hover_frame(values, details));
+    RECT after_text{};
+    ::GetWindowRect(tip, &after_text);
+    check(::IsWindowVisible(tip), "a new tip text keeps the tip visible");
+    check(shown_hover_text(tip, hwnd) == deskfeed::wide_from_utf8("detail 0 changed"),
+          "the new tip text shows up without waiting for the pointer to move");
+    check(after_text.left == after_geometry.left && after_text.top == after_geometry.top,
+          "the new tip text keeps the tip where it was");
+
+    // 换文本之后整窗扫一遍：其它条目还是各自的文本，第一个条目是新文本。
+    std::vector<std::wstring> const expected_after = expected_node_tips(hover_frame(values, details));
+    std::vector<std::wstring> const tips = unique_in_order(non_empty(sweep_hover_texts(hwnd, tip)));
+    check(tips == expected_after, "after a text-only refresh every node still hovers its own text");
+
+    // (3) 悬停的条目在下一帧里没有了：只留两条时第二个视觉行整个消失。
+    POINT last{0, 0};
+    check(find_hover_point(hwnd, tip, expected_after[3], &last), "the fourth node was reachable");
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(last.x, last.y));
+    check(::IsWindowVisible(tip), "the fourth node shows a tip");
+    std::vector<std::string> const fewer_values{"1C", "2C"};
+    std::vector<std::string> const fewer_details{"detail 0 changed", "detail 1"};
+    window.apply(hover_frame(fewer_values, fewer_details));
+    check(!::IsWindowVisible(tip), "the hovered node disappearing hides the tip");
+
+    // (4) 内容清空：一样必须收掉。
+    POINT first{0, 0};
+    check(find_hover_point(hwnd, tip, deskfeed::wide_from_utf8("detail 0 changed"), &first),
+          "the first node is reachable again");
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(first.x, first.y));
+    check(::IsWindowVisible(tip), "the first node shows a tip again");
+    deskfeed::Frame empty;
+    empty.kind = deskfeed::ViewKind::Content;
+    window.apply(empty);
+    check(!::IsWindowVisible(tip), "an empty frame hides the tip of the displayed node");
+    window.destroy();
+}
+
+// ---- 双击：真实消息序列必须切换详细/精简，并且立刻落盘 --------------------------------
+
+void test_double_click_toggles_and_persists() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the double-click gate");
+    HWND const hwnd = window.handle();
+    window.apply(detailed_content_frame(2));
+
+    // 类带 CS_DBLCLKS：真实双击的第二次按下是 WM_LBUTTONDBLCLK，**不是** WM_LBUTTONDOWN。
+    check((::GetClassLongPtrW(hwnd, GCL_STYLE) & CS_DBLCLKS) != 0,
+          "the widget class asks the system for double-click messages");
+
+    int const saves_before = recorder.saves;
+    auto double_click = [hwnd] {
+        ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(20, 10));
+        ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(20, 10));
+        ::SendMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(20, 10));
+        ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(20, 10));
+    };
+    double_click();
+    check(recorder.saves == saves_before + 1, "a real double click persists the switch once");
+    check(recorder.last_saved.expanded, "a real double click switches to the detailed mode");
+    double_click();
+    check(recorder.saves == saves_before + 2, "the second double click persists once");
+    check(!recorder.last_saved.expanded, "the second double click switches back to compact");
+    // 双击留下的尾巴不能算成一次新的点按：紧接着的一次单click不该切模式。
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(20, 10));
+    ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(20, 10));
+    check(recorder.saves == saves_before + 2, "a single click right after a double click is not one");
+    // 两次抬起很近、但系统没发 DBLCLK 的那条兜底路径也要能切一次（只切一次）。
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(30, 12));
+    ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(30, 12));
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(30, 12));
+    ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(30, 12));
+    check(recorder.saves == saves_before + 3, "the two-tap fallback still switches exactly once");
+    check(recorder.last_saved.expanded, "the fallback switched the mode");
+
+    window.destroy();
+}
+
+// 拖动不能误判成双击：真正移动过的那一次按下，收尾之后系统仍可能补一条 DBLCLK。
+void test_drag_does_not_toggle_the_mode() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    preferences.anchor_known = true;
+    preferences.anchor = POINT{900, 700};
+    check(create_hidden(window, recorder, preferences, error), "create for the drag gate");
+    HWND const hwnd = window.handle();
+    window.apply(detailed_content_frame(2));
+    int const saves_before = recorder.saves;
+    LONG const height_before = window_size(hwnd).cy;
+
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(20, 10));
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(80, 70));
+    ::ReleaseCapture();  // 拖动收尾
+    // 拖动收尾之后系统补的那一条 DBLCLK 不该切模式。
+    ::SendMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(20, 10));
+    ::SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(20, 10));
+    check(recorder.saves == saves_before + 1, "the drag persisted the anchor exactly once");
+    check(!recorder.last_saved.expanded, "the drag did not switch the mode");
+    check(window_size(hwnd).cy == height_before, "the drag did not resize the window either");
+    window.destroy();
+}
+
+// ---- 压力循环：详细↔精简、取数刷新、悬停显示与定时器在同一轮里跑 --------------------------------
+
+// 不只断言“没崩”：每一轮都要核对待显示的条目与提示内容一致、句柄没被重建、
+// GDI/USER 对象不增长、提示不会留在屏幕上。
+void test_hover_and_detail_stress_keeps_state_consistent() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    check(create_hidden(window, recorder, preferences, error), "create for the stress gate");
+    HWND const hwnd = window.handle();
+    HWND const tip = find_tooltip(hwnd);
+    check(tip != nullptr, "the stress gate has a tooltip control");
+    if (tip == nullptr) {
+        window.destroy();
+        return;
+    }
+
+    int const gdi_before = gdi_objects();
+    int const user_before = user_objects();
+    bool nodes_always_match = true;
+    bool hidden_when_empty = true;
+    bool handles_stable = true;
+    int const rounds = 60;
+    for (int round = 0; round < rounds; ++round) {
+        std::size_t const items = static_cast<std::size_t>(round % 6) + 1;
+        deskfeed::Frame const frame = detailed_content_frame(items);
+        window.apply(frame);
+        if (round % 2 == 0) {
+            ::SendMessageW(hwnd, WM_COMMAND, kCmdExpanded, 0);
+        }
+        // 一次真实取数不会改变内容：再一次 apply 不该把提示弄丢。
+        window.apply(frame);
+        std::vector<std::wstring> const expected = expected_node_tips(frame);
+        std::vector<std::wstring> const tips =
+            unique_in_order(non_empty(sweep_hover_texts(hwnd, tip, 4)));
+        if (tips != expected) {
+            nodes_always_match = false;
+        }
+        if (::GetWindow(hwnd, GW_OWNER) != tip && !::IsWindow(tip)) {
+            handles_stable = false;
+        }
+        if (round % 5 == 0) {
+            deskfeed::Frame empty;
+            empty.kind = deskfeed::ViewKind::Content;
+            window.apply(empty);
+            ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(10, 10));
+            if (::IsWindowVisible(tip)) {
+                hidden_when_empty = false;
+            }
+        }
+        if (round % 4 == 3) {
+            pump_for(5);  // 让置顶守护/全屏判定的定时器也跑几轮
+        }
+    }
+    check(::IsWindow(hwnd), "the window survives the detail/hover stress loop");
+    check(::IsWindow(tip), "the tooltip control survives the stress loop");
+    check(window.handle() == hwnd, "the window handle was never recreated");
+    check(nodes_always_match, "every round hovers exactly the frame's own nodes");
+    check(hidden_when_empty, "an empty frame never leaves a tip on the screen");
+    check(handles_stable, "the tooltip handle stays alive for the whole loop");
+    int const gdi_after = gdi_objects();
+    int const user_after = user_objects();
+    check(gdi_after <= gdi_before + 4,
+          "the stress loop does not grow the GDI object count (" + std::to_string(gdi_before) +
+              " -> " + std::to_string(gdi_after) + ")");
+    check(user_after <= user_before + 4,
+          "the stress loop does not grow the USER object count (" + std::to_string(user_before) +
+              " -> " + std::to_string(user_after) + ")");
+    window.destroy();
+    check(!::IsWindow(tip), "destroying the widget destroys its tooltip");
+}
+
 // ---- 门禁 ----------------------------------------------------------------------------------
 
 void test_create_is_hidden_and_tooltips_are_configured() {
@@ -169,7 +672,7 @@ void test_create_is_hidden_and_tooltips_are_configured() {
     window.apply(content_frame(3));
     check(!::IsWindowVisible(window.handle()), "content does not reveal a force-hidden window");
     if (tip != nullptr) {
-        check(::SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0) == 3, "one hover tool per visible line");
+        check(::SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0) == 1, "exactly one hover tool");
         // 登记用的 cbSize 按候选试：至少有一个能被这一版 comctl32 接受。
         UINT const candidates[] = {sizeof(TOOLINFOW), TTTOOLINFOW_V2_SIZE,
                                    static_cast<UINT>(offsetof(TOOLINFOW, lParam))};
@@ -513,6 +1016,12 @@ int main() {
     test_alarm_keeps_two_rows_height();
     test_hidden_paint_smoke();
     test_drag_save_failure_rolls_the_anchor_back();
+    test_hover_shows_each_nodes_own_tip();
+    test_hover_in_detailed_mode_covers_only_nodes();
+    test_hover_same_node_survives_refresh();
+    test_double_click_toggles_and_persists();
+    test_drag_does_not_toggle_the_mode();
+    test_hover_and_detail_stress_keeps_state_consistent();
     test_fullscreen_signal_names_and_shape();
     test_fonts_are_non_bold_and_metrics_are_tight();
 

@@ -8,7 +8,7 @@
 | `tools_tests.cpp` | 注入器与探针工具的离线用例：目标解析、严格 PE 解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（后两者用下面三个夹具）。 |
 | `master_supervisor_tests.cpp` | 主进程侧任务栏编排的用例（配 `fake_injector.cpp`，只做假注入）。 |
 | `widget_tests.cpp` | 桌面悬浮窗的纯逻辑与偏好用例。 |
-| `widget_window_tests.cpp` | 悬浮窗隐藏窗口的门禁用例：真的建窗口，但强制隐藏。 |
+| `widget_window_tests.cpp` | 悬浮窗的隐藏窗口门禁：真的建窗口，但强制隐藏（`force_hidden`），所以真实窗口不会出现在桌面上。覆盖建窗与偏好回滚、菜单命令、外部销毁、拖动收尾与捕获被抢走、全屏信号口径、字体度量，以及**悬停与双击的真实消息路径**：合成 `WM_MOUSEMOVE` / `WM_MOUSELEAVE` / `WM_LBUTTONDOWN`+`WM_LBUTTONUP`+`WM_LBUTTONDBLCLK` 驱动生产代码，断言每个条目悬停出**自己**的提示（与任务栏同源的 `ReadingRow::tip`）、提示落在显示器工作区内、同一节点内不重发不移动、空内容不留提示，以及详细↔精简 + 悬停 + 定时器的压力循环里句柄不重建、GDI/USER 对象不增长。**不移动光标**（合成的消息就是生产路径：命中判定在窗口里，显示走 `TTM_TRACKACTIVATE`），也不注入 explorer、不碰用户实例。 |
 | `fake_injector.cpp` | **测试专用**假注入器：主进程任务栏编排用例的目标，不注入任何进程。 |
 | `reg_hook_caller.cpp` | **测试专用**夹具 DLL：只按名字导入 `Reg*` 三个入口，让 `reg_hook` 真的去补它的导入槽。 |
 | `remote_delay_writer.cpp` | **测试专用**夹具模块：一个"先睡、后写"的导出，用来确定性制造"调用已超时、写入还没发生"的窗口。 |

@@ -52,8 +52,22 @@ constexpr unsigned long long kDoubleTapMs = 400;
 // 又远比用户两次真的点菜单短。
 constexpr unsigned long long kMenuRepeatMs = 400;
 constexpr int kDoubleTapSlop = 8;
-// 视觉行最多 kMaxReadingLines 条，这里留一点余量。
-constexpr std::size_t kMaxTooltips = 8;
+// 视觉行的排版常量在 display/reading 里；悬停提示只登记**一个**工具（uId 固定），
+// 命中哪一行、哪一个条目由窗口自己按画出来的段落范围算。
+//
+// 这里不用 `TTF_SUBCLASS`，而是与任务栏负载同一条路：自己判定命中，再手动
+// `TTM_TRACKPOSITION` + `TTM_TRACKACTIVATE`。理由是**显示节奏要自己可控**：登记成
+// TTF_SUBCLASS 等于把“什么时候弹、弹哪一个”交给 comctl32——它按节点矩形与真实光标位置自己
+// 决定，合成鼠标消息推不动它，于是“按条目命中”“同节点刷新不重定位/不闪”“换文本不必等鼠标”
+// 这一组行为在离线门禁里一条都写不进用例。`TTF_ABSOLUTE` 让 TRACKPOSITION 按屏幕坐标摆放
+// （配合 TTF_TRACK 使用，只有跟踪模式才认这两个标志）。
+//
+// 这里说的只是**这个窗口自己的提示怎么弹**。给自家窗口挂子类化与替换别的进程的窗口过程不是
+// 一回事，主进程崩溃至今没有证据，这条改动不宣称修了任何崩溃。
+constexpr UINT kHoverToolId = 0;
+constexpr DWORD kHoverToolFlags = TTF_TRACK | TTF_ABSOLUTE;
+// 提示与节点之间留的空隙（像素）。
+constexpr int kTipGap = 8;
 // 提示文本的换行宽度（像素），与任务栏那份悬停提示同一个值。
 // **不设它就等于只有一行**：多行 tip 里的 '\n' 会被丢掉、整条挤成一行，而且那条绘制路径画出来
 // 的字明显更重。微软的文档也是这一条：多行 tooltip 要用 TTM_SETMAXTIPWIDTH 指定显示宽度。
@@ -124,6 +138,16 @@ void gdiplus_release() {
 
 std::wstring wide(std::string const& utf8) { return wide_from_utf8(utf8); }
 
+// 一个可悬停的节点：客户区矩形 + 提示文本。
+//
+// 文本取的是 `ReadingRow::tip`，与任务栏那一侧的悬停格用的是同一个字段（`row.tip`），
+// 所以“同一个条目在悬浮窗与任务栏上悬停出同样的内容”是同一份数据的两个消费端，不是两套文案。
+// 空文本不显示提示（任务栏那侧也是这个取舍）。
+struct HoverNode {
+    RECT rect{0, 0, 0, 0};
+    std::wstring text{};
+};
+
 // 全部实现状态。
 struct WidgetState {
     WidgetOptions options{};
@@ -168,13 +192,20 @@ struct WidgetState {
     RECT detail_rect{0, 0, 0, 0};
 
     HWND tip = nullptr;
-    std::vector<std::wstring> tooltip_text{};
-    std::vector<bool> tooltip_added{};
-    std::vector<RECT> tooltip_rects{};
+    // comctl32 那一侧持有的那一份提示文本：只在命中节点变化时才重发，鼠标每次移动不重写它。
+    std::wstring tip_text{};
     // 这一版 comctl32 认下的 TTM_* cbSize；0 = 还没定。
     UINT tool_info_size = 0;
-    // 上一次记进日志的“挂上提示的行数”，只为让那行日志在行数没变时闭嘴。
-    std::size_t registered_tooltip_rows = 0;
+    bool tool_ready = false;
+    // 可悬停节点与当前指针命中的那一个（-1 = 不在任何节点上）。
+    std::vector<HoverNode> nodes{};
+    int hover_node = -1;
+    // 已经登记过 TME_LEAVE；收到 WM_MOUSELEAVE 后清掉，下次移动再登记。
+    bool hover_tracking = false;
+    // 上一次记进日志的可悬停节点数：只为让那行日志在节点数没变时闭嘴。
+    std::size_t logged_hover_nodes = static_cast<std::size_t>(-1);
+    // 上一次按下算不算拖动：拖动收尾之后系统仍可能补一条 WM_LBUTTONDBLCLK，那一条不该当双击。
+    bool last_press_was_drag = false;
 
     HMENU menu = nullptr;
 
@@ -185,8 +216,17 @@ struct WidgetState {
 
 void create_tooltip_of(WidgetState& self);
 bool add_tool_of(WidgetState& self, TOOLINFOW& tool);
-void update_tooltips_of(WidgetState& self);
+TOOLINFOW hover_tool_of(WidgetState const& self);
+void sync_hover_nodes_of(WidgetState& self);
+int hover_node_at_of(WidgetState const& self, POINT client);
+void hide_hover_tip_of(WidgetState& self);
+void show_hover_tip_of(WidgetState& self, int node);
+void place_hover_tip_of(WidgetState& self, RECT const& node_screen);
+void track_mouse_leave_of(WidgetState& self);
+void on_mouse_leave_of(WidgetState& self);
 void create_context_menu_of(WidgetState& self);
+std::vector<std::pair<int, int>> segment_spans_of(WidgetState const& self, ReadingLine const& line,
+                                                  int left);
 int line_width_of(WidgetState const& self, ReadingLine const& line);
 void rebuild_lines_of(WidgetState& self);
 void relayout_of(WidgetState& self);
@@ -211,8 +251,9 @@ void set_user_hidden_of(WidgetState& self, bool hidden);
 void set_expanded_of(WidgetState& self, bool expanded);
 void record_status_of(WidgetState& self, std::wstring const& state, std::wstring const& reason);
 void on_lbutton_down_of(WidgetState& self, POINT screen);
-void on_mouse_move_of(WidgetState& self, POINT screen);
+void on_mouse_move_of(WidgetState& self, POINT screen, POINT client);
 void on_lbutton_up_of(WidgetState& self, POINT screen);
+void on_lbutton_dblclk_of(WidgetState& self, POINT screen);
 void finish_drag_after_move_of(WidgetState& self);
 void on_rbutton_up_of(WidgetState& self, POINT screen);
 void show_context_menu_of(WidgetState& self);
@@ -241,17 +282,222 @@ void create_tooltip_of(WidgetState& self) {
     }
     // 悬浮窗几乎总是非活动窗口，所以提示要带 TTS_ALWAYSTIP 才能在别处有焦点时弹出来。
     ::SetWindowPos(self.tip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    ::SendMessageW(self.tip, TTM_SETDELAYTIME, TTDT_INITIAL, MAKELPARAM(250, 0));
-    ::SendMessageW(self.tip, TTM_SETDELAYTIME, TTDT_RESHOW, MAKELPARAM(80, 0));
-    ::SendMessageW(self.tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAKELPARAM(30000, 0));
     // 换行宽度：折行之后一行的 tip 是多行文本，不设这一条就会被挤成一行。
     ::SendMessageW(self.tip, TTM_SETMAXTIPWIDTH, 0, kTipMaxWidth);
+    // 指针停在同一个条目上时提示不该自己消失：显隐完全由窗口管（换条目、离开窗口、整窗隐藏、
+    // 拖动、打开菜单时才收），所以自动弹出时间放到足够长。
+    ::SendMessageW(self.tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAKELPARAM(30000, 0));
 
-    self.tooltip_text.assign(kMaxTooltips, std::wstring());
-    self.tooltip_added.assign(kMaxTooltips, false);
-    self.tooltip_rects.assign(kMaxTooltips, RECT{0, 0, 0, 0});
-    // 这里不提前登记：行矩形还是空的时候登记进去就是个空的命中区，等第一次
-    // update_tooltips 拿到真实的行矩形再按行登记。
+    // 只登记一个工具，文本先留空：命中与文本都由窗口自己在指针移动时决定并更新。
+    // 空文本按 c_str() 传（不是空指针）——空指针在 comctl32 那里是另一层语义。
+    static constexpr wchar_t kEmptyTip[] = L"";
+    TOOLINFOW tool = hover_tool_of(self);
+    tool.uFlags = kHoverToolFlags;
+    tool.lpszText = const_cast<LPWSTR>(kEmptyTip);
+    if (!add_tool_of(self, tool)) {
+        log_format(L"widget: TTM_ADDTOOL failed for the hover tool (error=%lu); hover text will be "
+                   L"missing",
+                   ::GetLastError());
+        return;
+    }
+    self.tool_ready = true;
+}
+
+// 所有交给 comctl32 的工具结构都必须带同一个 cbSize（v6 是 sizeof(TOOLINFOW)，v5 更小）。
+TOOLINFOW hover_tool_of(WidgetState const& self) {
+    TOOLINFOW tool{};
+    tool.cbSize = self.tool_info_size != 0 ? self.tool_info_size : kToolInfoCandidates[0];
+    tool.hwnd = self.hwnd;
+    tool.uId = kHoverToolId;
+    return tool;
+}
+
+// 把当前排版下**每一个可悬停的条目**列出来：段落矩形（客户区）+ 该条目自己的提示文本。
+//
+// 文本取自 `ReadingRow::tip`，与任务栏那侧悬停格同源；空文本不显示提示（那边也是这个取舍）。
+// 这是“同节点同内容”的落地处：一条视觉行里有几个条目，就有几个互相独立的节点。
+void sync_hover_nodes_of(WidgetState& self) {
+    std::vector<HoverNode> nodes;
+    for (std::size_t index = 0; index < self.lines.size() && index < self.line_rects.size();
+         ++index) {
+        ReadingLine const& line = self.lines[index];
+        std::vector<std::pair<int, int>> const spans = segment_spans_of(self, line, 0);
+        if (spans.size() != line.segments.size()) {
+            continue;
+        }
+        RECT const band = self.line_rects[index];
+        for (std::size_t at = 0; at < spans.size(); ++at) {
+            HoverNode node;
+            node.rect = RECT{band.left + spans[at].first, band.top, band.left + spans[at].second,
+                             band.bottom};
+            node.text = wide(line.segments[at].tip);
+            nodes.push_back(std::move(node));
+        }
+    }
+
+    // 正在显示的那一个节点在新一轮排版里怎么样了。
+    //
+    // **同一节点、同一提示文本：什么都不做**。矩形变了也不管——位置是首次显示时定下的，
+    // 指针没动就不重定位；否则一次取数只要把数值排版宽度改一点，正在看的提示就会跳一下。
+    // 同一节点换了文本（例如生产端更新了 detail）：只换文本。提示不重新激活、位置不动，
+    // 也不必等下一次鼠标移动才显示新内容。
+    // 只有“这个节点没了 / 它的提示文本变成空”才收掉。
+    int const hovering = self.hover_node;
+    self.nodes = std::move(nodes);
+    if (hovering >= 0) {
+        if (static_cast<std::size_t>(hovering) >= self.nodes.size()) {
+            hide_hover_tip_of(self);
+        } else {
+            HoverNode const& now = self.nodes[static_cast<std::size_t>(hovering)];
+            if (now.text.empty()) {
+                hide_hover_tip_of(self);
+            } else if (now.text != self.tip_text && self.tip != nullptr && self.tool_ready) {
+                self.tip_text = now.text;
+                TOOLINFOW tool = hover_tool_of(self);
+                tool.uFlags = kHoverToolFlags;
+                tool.lpszText = self.tip_text.data();
+                ::SendMessageW(self.tip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+            }
+        }
+    }
+
+    // 悬停可用的唯一证据：有多少个节点、其中多少个真的带提示文本（文本空的节点不会冒提示）。
+    if (self.nodes.size() != self.logged_hover_nodes) {
+        self.logged_hover_nodes = self.nodes.size();
+        std::size_t with_text = 0;
+        for (HoverNode const& node : self.nodes) {
+            if (!node.text.empty()) {
+                ++with_text;
+            }
+        }
+        log_format(L"widget: hover ready: %zu node(s) over %zu row(s), %zu with tip text "
+                   L"(the control reports %lld tool(s), cbSize %u)",
+                   self.nodes.size(), self.lines.size(), with_text,
+                   self.tip != nullptr
+                       ? static_cast<long long>(::SendMessageW(self.tip, TTM_GETTOOLCOUNT, 0, 0))
+                       : -1,
+                   self.tool_info_size);
+    }
+}
+
+int hover_node_at_of(WidgetState const& self, POINT client) {
+    for (std::size_t index = 0; index < self.nodes.size(); ++index) {
+        RECT const& rect = self.nodes[index].rect;
+        if (client.x >= rect.left && client.x < rect.right && client.y >= rect.top &&
+            client.y < rect.bottom) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+void hide_hover_tip_of(WidgetState& self) {
+    if (self.tip == nullptr) {
+        self.hover_node = -1;
+        return;
+    }
+    if (self.hover_node < 0) {
+        return;
+    }
+    self.hover_node = -1;
+    if (!self.tool_ready) {
+        return;
+    }
+    TOOLINFOW const tool = hover_tool_of(self);
+    ::SendMessageW(self.tip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+}
+
+void show_hover_tip_of(WidgetState& self, int node) {
+    if (node < 0 || static_cast<std::size_t>(node) >= self.nodes.size()) {
+        hide_hover_tip_of(self);
+        return;
+    }
+    // 同一个节点：什么都不做。提示不随鼠标每次移动重发、重定位。
+    if (self.hover_node == node) {
+        return;
+    }
+    if (self.tip == nullptr || self.hwnd == nullptr || !self.tool_ready) {
+        return;
+    }
+    HoverNode const& target = self.nodes[static_cast<std::size_t>(node)];
+    if (target.text.empty()) {
+        // 与任务栏那侧同一个取舍：空提示不显示，也不留一个空泡泡。
+        hide_hover_tip_of(self);
+        return;
+    }
+    self.hover_node = node;
+
+    // 文本先落进我们自己的缓冲区，再交给 comctl32：这一份在整个显示期间不动（除非换节点），
+    // 所以 comctl32 无论保存的是文本副本还是我们给的指针，都不会读到已释放的内存。
+    self.tip_text = target.text;
+    TOOLINFOW tool = hover_tool_of(self);
+    tool.uFlags = kHoverToolFlags;
+    tool.lpszText = self.tip_text.data();
+    ::SendMessageW(self.tip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+
+    // 节点矩形换算到屏幕坐标：提示按节点摆（不是按指针），指针在同一个节点里怎么动都不挪。
+    RECT node_screen{target.rect.left, target.rect.top, target.rect.right, target.rect.bottom};
+    POINT const corners[2] = {POINT{node_screen.left, node_screen.top},
+                              POINT{node_screen.right, node_screen.bottom}};
+    POINT top_left = corners[0];
+    POINT bottom_right = corners[1];
+    ::ClientToScreen(self.hwnd, &top_left);
+    ::ClientToScreen(self.hwnd, &bottom_right);
+    node_screen = RECT{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+
+    ::SendMessageW(self.tip, TTM_TRACKPOSITION, 0,
+                   MAKELPARAM(node_screen.left, node_screen.top - kTipGap));
+    ::SendMessageW(self.tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    // 显示之后提示才知道自己多大：按真实尺寸把它夹进节点所在那块屏的工作区。
+    place_hover_tip_of(self, node_screen);
+}
+
+void place_hover_tip_of(WidgetState& self, RECT const& node_screen) {
+    RECT tip_rect{};
+    if (self.tip == nullptr || !::GetWindowRect(self.tip, &tip_rect)) {
+        return;
+    }
+    int const tip_width = std::max(static_cast<int>(tip_rect.right - tip_rect.left), 1);
+    int const tip_height = std::max(static_cast<int>(tip_rect.bottom - tip_rect.top), 1);
+
+    HMONITOR const monitor = ::MonitorFromRect(&node_screen, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT area{0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN)};
+    if (monitor != nullptr && ::GetMonitorInfoW(monitor, &info)) {
+        area = info.rcWork;
+    }
+    int const area_left = static_cast<int>(area.left);
+    int const area_top = static_cast<int>(area.top);
+    int const area_right = static_cast<int>(area.right);
+    int const area_bottom = static_cast<int>(area.bottom);
+    // 默认摆在节点上方：悬浮窗缺省就在屏幕右下角，往下摆会被任务栏与屏幕边裁掉。
+    int left = static_cast<int>(node_screen.left);
+    int top = static_cast<int>(node_screen.top) - kTipGap - tip_height;
+    if (top < area_top) {
+        top = static_cast<int>(node_screen.bottom) + kTipGap;
+    }
+    left = std::min(std::max(area_left, left), std::max(area_left, area_right - tip_width));
+    top = std::min(std::max(area_top, top), std::max(area_top, area_bottom - tip_height));
+    ::SendMessageW(self.tip, TTM_TRACKPOSITION, 0, MAKELPARAM(left, top));
+}
+
+void track_mouse_leave_of(WidgetState& self) {
+    if (self.hover_tracking || self.hwnd == nullptr) {
+        return;
+    }
+    TRACKMOUSEEVENT event{};
+    event.cbSize = sizeof(event);
+    event.dwFlags = TME_LEAVE;
+    event.hwndTrack = self.hwnd;
+    if (::TrackMouseEvent(&event)) {
+        self.hover_tracking = true;
+    }
+}
+
+void on_mouse_leave_of(WidgetState& self) {
+    self.hover_tracking = false;
+    hide_hover_tip_of(self);
 }
 
 bool add_tool_of(WidgetState& self, TOOLINFOW& tool) {
@@ -274,79 +520,6 @@ bool add_tool_of(WidgetState& self, TOOLINFOW& tool) {
         return true;
     }
     return false;
-}
-
-void update_tooltips_of(WidgetState& self) {
-    // 窗口已经不在了（外部 DestroyWindow）时不要向 comctl32 登记一个死句柄。
-    if (self.tip == nullptr || self.hwnd == nullptr) {
-        return;
-    }
-    for (std::size_t index = 0; index < self.tooltip_text.size(); ++index) {
-        bool const visible = index < self.lines.size() && index < self.line_rects.size();
-        // 悬停文本与量具的 `--reading` 走同一个函数，两边不可能对同一条行给出不同的提示。
-        std::wstring const text = visible ? wide(reading_line_tip(self.lines[index])) : std::wstring();
-
-        // 隐藏的行把命中矩形收成空的，鼠标扫过去不会冒提示。
-        RECT const rect = visible ? self.line_rects[index] : RECT{0, 0, 0, 0};
-        bool const has_rect = rect.right > rect.left && rect.bottom > rect.top;
-
-        TOOLINFOW tool{};
-        tool.cbSize = self.tool_info_size != 0 ? self.tool_info_size : kToolInfoCandidates[0];
-        tool.hwnd = self.hwnd;
-        tool.uId = static_cast<UINT>(index);
-        tool.rect = has_rect ? rect : RECT{0, 0, 0, 0};
-
-        if (self.tooltip_added[index]) {
-            RECT const& known = self.tooltip_rects[index];
-            bool const moved = tool.rect.left != known.left || tool.rect.top != known.top ||
-                               tool.rect.right != known.right || tool.rect.bottom != known.bottom;
-            if (!has_rect || moved) {
-                // 行没了，或者命中矩形挪了：先摘掉，下面按需要重新登记。
-                // 不用 TTM_NEWTOOLRECT——它的返回值不可信；TTM_DELTOOL 的返回值同样不可信，
-                // 但它对工具数量的影响看得见。
-                ::SendMessageW(self.tip, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
-                self.tooltip_added[index] = false;
-                self.tooltip_rects[index] = RECT{0, 0, 0, 0};
-            } else if (text != self.tooltip_text[index]) {
-                self.tooltip_text[index] = text;
-                tool.lpszText = self.tooltip_text[index].data();
-                ::SendMessageW(self.tip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
-            }
-        }
-
-        if (!self.tooltip_added[index]) {
-            if (!has_rect) {
-                continue;  // 这一行现在不该冒提示
-            }
-            self.tooltip_text[index] = text;
-            tool.uFlags = TTF_SUBCLASS;
-            tool.lpszText = self.tooltip_text[index].data();
-            if (!add_tool_of(self, tool)) {
-                log_format(L"widget: TTM_ADDTOOL failed for tool %zu (rect %ld,%ld,%ld,%ld) "
-                           L"error=%lu; hover text for this row is missing",
-                           index, tool.rect.left, tool.rect.top, tool.rect.right, tool.rect.bottom,
-                           ::GetLastError());
-                continue;
-            }
-            self.tooltip_added[index] = true;
-            self.tooltip_rects[index] = tool.rect;
-        }
-    }
-
-    // 登记成功后记一行：这一行是“悬停提示到底挂上了几行”的唯一证据。只在挂上的行数变化时记。
-    std::size_t added = 0;
-    for (bool const flag : self.tooltip_added) {
-        if (flag) {
-            ++added;
-        }
-    }
-    if (added != self.registered_tooltip_rows) {
-        self.registered_tooltip_rows = added;
-        log_format(L"widget: hover tips registered for %zu of %zu row(s) "
-                   L"(the control reports %lld tool(s))",
-                   added, self.lines.size(),
-                   static_cast<long long>(::SendMessageW(self.tip, TTM_GETTOOLCOUNT, 0, 0)));
-    }
 }
 
 void create_context_menu_of(WidgetState& self) {
@@ -375,21 +548,33 @@ void create_context_menu_of(WidgetState& self) {
                     MF_BYCOMMAND | (self.preferences.taskbar_component ? MF_CHECKED : MF_UNCHECKED));
 }
 
-int line_width_of(WidgetState const& self, ReadingLine const& line) {
-    int width = 0;
+// 一行里每个段落在客户区里的横向范围（[start, end)）。**量、画、命中判定共用这一份算术**：
+// 画在哪、量多宽、鼠标点在哪算同一个条目，三处一旦各写一遍就会各说各话。
+std::vector<std::pair<int, int>> segment_spans_of(WidgetState const& self, ReadingLine const& line,
+                                                  int left) {
+    std::vector<std::pair<int, int>> spans;
+    spans.reserve(line.segments.size());
+    int x = left;
     bool first = true;
     for (ReadingRow const& segment : line.segments) {
         if (!first) {
-            width += tight_width(self.measure_dc, kSegmentSeparator, self.fonts.row_value);
+            x += tight_width(self.measure_dc, kSegmentSeparator, self.fonts.row_value);
         }
         first = false;
+        int const start = x;
         if (!segment.label.empty()) {
-            width += tight_width(self.measure_dc, wide(segment.label), self.fonts.row_prefix) +
-                     self.metrics.space_width;
+            x += tight_width(self.measure_dc, wide(segment.label), self.fonts.row_prefix) +
+                 self.metrics.space_width;
         }
-        width += tight_width(self.measure_dc, wide(segment.value), self.fonts.row_value);
+        x += tight_width(self.measure_dc, wide(segment.value), self.fonts.row_value);
+        spans.emplace_back(start, x);
     }
-    return width;
+    return spans;
+}
+
+int line_width_of(WidgetState const& self, ReadingLine const& line) {
+    std::vector<std::pair<int, int>> const spans = segment_spans_of(self, line, 0);
+    return spans.empty() ? 0 : spans.back().second;
 }
 
 void rebuild_lines_of(WidgetState& self) {
@@ -426,6 +611,8 @@ void relayout_of(WidgetState& self) {
 
     int const width = std::max(content_width + kPaddingLeft + kPaddingRight, 1);
     int const height = std::max(y + kPaddingBottom, 1);
+    // 悬停命中用的是这一轮排版出来的行矩形：无论尺寸有没有变都要跟着更新。
+    sync_hover_nodes_of(self);
     if (width == self.width && height == self.height) {
         return;
     }
@@ -467,6 +654,7 @@ void update_fullscreen_state_of(WidgetState& self) {
 
     if (fullscreen) {
         // 整窗藏起来。用户隐藏标记一个字都不动：那是用户的意图，全屏不该把它抹掉。
+        hide_hover_tip_of(self);
         ::ShowWindow(self.hwnd, SW_HIDE);
         log_format(L"widget: a fullscreen application owns the screen (signal=%s, detail=%s); "
                    L"hiding until it ends",
@@ -518,31 +706,33 @@ void paint_of(WidgetState& self, HDC target) {
     for (std::size_t index = 0; index < self.lines.size() && index < self.line_rects.size(); ++index) {
         ReadingLine const& line = self.lines[index];
         RECT const rect = self.line_rects[index];
-        int x = rect.left;
-        bool first = true;
-        for (ReadingRow const& segment : line.segments) {
-            if (!first) {
+        std::vector<std::pair<int, int>> const spans = segment_spans_of(self, line, rect.left);
+        for (std::size_t at = 0; at < line.segments.size() && at < spans.size(); ++at) {
+            ReadingRow const& segment = line.segments[at];
+            int const x = spans[at].first;
+            if (at != 0) {
                 // 段与段之间的分隔符用弱色，与任务栏那块“前缀弱色、数值主色”的分工一致。
                 HGDIOBJ const previous = ::SelectObject(dc, self.fonts.row_value);
                 ::SetTextColor(dc, kTertiary);
-                RECT separator_rect{x, rect.top, rect.right, rect.bottom};
+                RECT separator_rect{x - tight_width(self.measure_dc, kSegmentSeparator,
+                                                    self.fonts.row_value),
+                                    rect.top, rect.right, rect.bottom};
                 ::DrawTextW(dc, kSegmentSeparator, -1, &separator_rect,
                             DT_LEFT | DT_TOP | DT_NOPREFIX | DT_SINGLELINE);
                 ::SelectObject(dc, previous);
-                x += tight_width(self.measure_dc, kSegmentSeparator, self.fonts.row_value);
             }
-            first = false;
 
+            int cursor = x;
             if (!segment.label.empty()) {
                 HGDIOBJ const previous = ::SelectObject(dc, self.fonts.row_prefix);
                 ::SetTextColor(dc, kTertiary);
-                RECT label_rect{x, rect.top, rect.right, rect.bottom};
+                RECT label_rect{cursor, rect.top, rect.right, rect.bottom};
                 std::wstring const label = wide(segment.label);
                 ::DrawTextW(dc, label.c_str(), -1, &label_rect,
                             DT_LEFT | DT_TOP | DT_NOPREFIX | DT_SINGLELINE);
                 ::SelectObject(dc, previous);
-                x += tight_width(self.measure_dc, label, self.fonts.row_prefix) +
-                     self.metrics.space_width;
+                cursor += tight_width(self.measure_dc, label, self.fonts.row_prefix) +
+                          self.metrics.space_width;
             }
 
             COLORREF const tone = segment.tone == ReadingTone::Error   ? kError
@@ -550,12 +740,11 @@ void paint_of(WidgetState& self, HDC target) {
                                                                        : kPrimary;
             HGDIOBJ const previous = ::SelectObject(dc, self.fonts.row_value);
             ::SetTextColor(dc, tone);
-            RECT value_rect{x, rect.top, rect.right, rect.bottom};
+            RECT value_rect{cursor, rect.top, rect.right, rect.bottom};
             std::wstring const value = wide(segment.value);
             ::DrawTextW(dc, value.c_str(), -1, &value_rect,
                         DT_LEFT | DT_TOP | DT_NOPREFIX | DT_SINGLELINE);
             ::SelectObject(dc, previous);
-            x += tight_width(self.measure_dc, value, self.fonts.row_value);
         }
     }
 
@@ -859,6 +1048,7 @@ void set_user_hidden_of(WidgetState& self, bool hidden) {
         return;  // 已回滚，可见性一个像素都不动
     }
     if (hidden) {
+        hide_hover_tip_of(self);
         ::ShowWindow(self.hwnd, SW_HIDE);
         record_status_of(self, L"隐藏", L"用户从菜单隐藏了悬浮窗");
         log_line(L"widget: hidden from the menu (process, taskbar component and fetch loop keep "
@@ -881,12 +1071,10 @@ void set_expanded_of(WidgetState& self, bool expanded) {
     self.preferences.expanded = expanded;
     rebuild_lines_of(self);
     relayout_of(self);
-    update_tooltips_of(self);
     if (!save_preferences_of(self, before)) {
         // 落盘失败：回滚并重新排版回原来的样子。
         rebuild_lines_of(self);
         relayout_of(self);
-        update_tooltips_of(self);
         return;
     }
     if (self.menu != nullptr) {
@@ -906,8 +1094,11 @@ void record_status_of(WidgetState& self, std::wstring const& state, std::wstring
 }
 
 void on_lbutton_down_of(WidgetState& self, POINT screen) {
+    // 按下就把提示收掉：拖动与点按都不该让提示挂在半空中。
+    hide_hover_tip_of(self);
     self.dragging = true;
     self.drag_moved = false;
+    self.last_press_was_drag = false;
     self.drag_from = screen;
     self.drag_before = self.preferences;
     RECT rect{};
@@ -916,29 +1107,44 @@ void on_lbutton_down_of(WidgetState& self, POINT screen) {
     ::SetCapture(self.hwnd);
 }
 
-void on_mouse_move_of(WidgetState& self, POINT screen) {
-    if (!self.dragging) {
+void on_mouse_move_of(WidgetState& self, POINT screen, POINT client) {
+    if (self.dragging) {
+        int const dx = screen.x - self.drag_from.x;
+        int const dy = screen.y - self.drag_from.y;
+        if (!self.drag_moved &&
+            (dx > kDragSlop || dx < -kDragSlop || dy > kDragSlop || dy < -kDragSlop)) {
+            self.drag_moved = true;
+            hide_hover_tip_of(self);
+        }
+        if (!self.drag_moved) {
+            return;
+        }
+        POINT const origin =
+            clamp_point_of(self, POINT{self.drag_origin.x + dx, self.drag_origin.y + dy},
+                           SIZE{self.width, self.height});
+        ::SetWindowPos(self.hwnd, nullptr, origin.x, origin.y, 0, 0,
+                       SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        remember_anchor_of(self);
         return;
     }
-    int const dx = screen.x - self.drag_from.x;
-    int const dy = screen.y - self.drag_from.y;
-    if (!self.drag_moved &&
-        (dx > kDragSlop || dx < -kDragSlop || dy > kDragSlop || dy < -kDragSlop)) {
-        self.drag_moved = true;
-    }
-    if (!self.drag_moved) {
+
+    // 没在拖动：这一段是悬停的生产路径。命中哪个条目由我们自己算（客户区坐标），
+    // 提示只在“换了一个条目”时才更新一次，指针在同一个条目里怎么动都不重发。
+    track_mouse_leave_of(self);
+    int const node = hover_node_at_of(self, client);
+    if (node < 0) {
+        hide_hover_tip_of(self);
         return;
     }
-    POINT const origin = clamp_point_of(
-        self, POINT{self.drag_origin.x + dx, self.drag_origin.y + dy}, SIZE{self.width, self.height});
-    ::SetWindowPos(self.hwnd, nullptr, origin.x, origin.y, 0, 0,
-                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    remember_anchor_of(self);
+    show_hover_tip_of(self, node);
 }
 
 // 一次“真的移动过”的拖动收尾：记住新的右下角锚点并立刻落盘（落盘失败就按旧的角重新落位）。
 // 鼠标抬起与被外部抢走捕获（WM_CAPTURECHANGED）都走这一条，两条路的行为必须一致。
 void finish_drag_after_move_of(WidgetState& self) {
+    // 这一次按下是拖动：收尾之后系统仍可能补一条 WM_LBUTTONDBLCLK，那一条不该当双击。
+    // 抬起与捕获被抢走两条路都经过这里，所以旗子落在这里最保险。
+    self.last_press_was_drag = true;
     remember_anchor_of(self);
     ::KillTimer(self.hwnd, kTimerSaveState);
     self.anchor_dirty = false;
@@ -953,6 +1159,7 @@ void on_lbutton_up_of(WidgetState& self, POINT screen) {
         return;
     }
     bool const moved = self.drag_moved;
+    self.last_press_was_drag = moved;
     // 先落旗再 ReleaseCapture：释放捕获会同步送来 WM_CAPTURECHANGED，那一条不该再收尾一次。
     self.dragging = false;
     ::ReleaseCapture();
@@ -960,7 +1167,9 @@ void on_lbutton_up_of(WidgetState& self, POINT screen) {
         finish_drag_after_move_of(self);
         return;
     }
-    // 没挪动：自己判双击（不依赖现成控件的双击事件，它会在拖动中途误触）。
+    // 没挪动：自己判双击。真实双击的第二下会被系统换成 WM_LBUTTONDBLCLK（类带 CS_DBLCLKS），
+    // 走 on_lbutton_dblclk_of；这一段兜的是“系统没发 DBLCLK 但两次抬手很近”的情形
+    // （例如用户把系统的双击间隔调得比 kDoubleTapMs 还短）。
     unsigned long long const now = now_ms();
     bool const double_tap = self.last_tap_ms != 0 && now - self.last_tap_ms <= kDoubleTapMs &&
                             screen.x - self.last_tap_point.x <= kDoubleTapSlop &&
@@ -976,6 +1185,25 @@ void on_lbutton_up_of(WidgetState& self, POINT screen) {
     self.last_tap_point = screen;
 }
 
+// 双击的第二次按下。
+//
+// 类注册时带了 CS_DBLCLKS，所以系统在第二次按下时发的是 WM_LBUTTONDBLCLK，**不发**
+// WM_LBUTTONDOWN；旧代码没有这个 case，于是第二次按下既不进入拖动、也没记成一次点按，
+// 紧接着的 WM_LBUTTONUP 因为 dragging 是假被直接丢掉——双击在真实消息路径上永远不会生效。
+void on_lbutton_dblclk_of(WidgetState& self, POINT screen) {
+    (void)screen;
+    // 上一次按下是拖动收尾的：那一次不该算双击（拖动结束后系统仍可能补一条 DBLCLK）。
+    if (self.last_press_was_drag) {
+        self.last_tap_ms = 0;
+        return;
+    }
+    // Windows 只在两次按下都落在系统自己的双击矩形与双击间隔之内时才发这一条，到此为止已经
+    // 是“用户确实双击了”的证据；这里不再用 kDoubleTapMs 复核一遍（那会把系统双击间隔调大的
+    // 用户挡在外面）。按下时已经把拖动状态收干净了，这里也不再取捕获。
+    self.last_tap_ms = 0;
+    set_expanded_of(self, !self.preferences.expanded);
+}
+
 void on_rbutton_up_of(WidgetState& self, POINT client) {
     (void)client;
     // 记下这次手势的时刻：Windows 可能紧接着补一条 WM_CONTEXTMENU，那一条要按这个时刻去重。
@@ -987,6 +1215,8 @@ void show_context_menu_of(WidgetState& self) {
     if (self.menu == nullptr) {
         return;
     }
+    // 菜单是模态的：弹出前先把悬停提示收掉，免得它盖在菜单上。
+    hide_hover_tip_of(self);
     // 菜单打开时按当前状态回填。
     ::CheckMenuItem(self.menu, kCmdTopmost,
                     MF_BYCOMMAND | (self.preferences.topmost ? MF_CHECKED : MF_UNCHECKED));
@@ -1090,6 +1320,8 @@ void run_command_of(WidgetState& self, UINT command) {
 }
 
 void teardown_window_of(WidgetState& self) {
+    // 提示先收掉再拆：它是独立的顶层小窗，直接销毁窗口会留下一个悬空的可见提示。
+    hide_hover_tip_of(self);
     if (self.hwnd != nullptr) {
         // 计时器只在窗口还活着时碰：窗口已经没了的时候那个句柄可能已经被系统复用。
         ::KillTimer(self.hwnd, kTimerTopmost);
@@ -1316,14 +1548,22 @@ LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPA
             return 0;
         }
         case WM_MOUSEMOVE: {
-            if (!self.dragging) {
-                return 0;
-            }
-            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            ::ClientToScreen(hwnd, &point);
-            on_mouse_move_of(self, point);
+            // 拖动的时候走拖动；没拖动的时候这一段就是悬停的生产路径（合成消息也走这里）。
+            POINT screen{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            POINT const client = screen;
+            ::ClientToScreen(hwnd, &screen);
+            on_mouse_move_of(self, screen, client);
             return 0;
         }
+        case WM_LBUTTONDBLCLK: {
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ::ClientToScreen(hwnd, &point);
+            on_lbutton_dblclk_of(self, point);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            on_mouse_leave_of(self);
+            return 0;
         case WM_LBUTTONUP: {
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             ::ClientToScreen(hwnd, &point);
@@ -1417,11 +1657,12 @@ void WidgetWindow::apply(Frame const& frame) {
     self.has_content = !self.content.rows.empty();
     rebuild_lines_of(self);
     relayout_of(self);
-    update_tooltips_of(self);
 
     std::wstring const reason = content_reason_of(self);
     if (!self.has_content) {
-        // 等待首份快照，或合法的空条目：整窗隐藏，不露空窗。
+        // 等待首份快照，或合法的空条目：整窗隐藏，不露空窗。提示是独立的顶层小窗，
+        // 窗口藏起来时必须一起收掉，否则它会留在屏幕上。
+        hide_hover_tip_of(self);
         record_status_of(self, L"隐藏", reason);
         ::ShowWindow(hwnd_, SW_HIDE);
         return;

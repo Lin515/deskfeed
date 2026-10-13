@@ -2222,13 +2222,20 @@ void test_guard_recovery_table() {
           "guard: an unknown snapshot stays uncertain");
 }
 
-// ---------------------------------------------------------- 悬停的"对应节点"约束
+// ---------------------------------------------------------- 悬停的"对应节点"与"不跟随鼠标"约束
 //
 // 悬停提示的命中路径只在**真任务栏**上跑得到：`PointerRoutedEventArgs` 造不出来，探针又不许移动
 // 真实光标。所以这里不做"把命中逻辑抄一份到用例里"的假用例——镜像一份逻辑等于两边可以各错各的；
-// 改做**源码反例**判定：两条回归（指针不在任何条目上也显示整块详情；没有 detail 的条目借用同一行
-// 其它条目的提示）在源码里各只有一种写法，改回去就一定被这里咬住。行为本身由真机肉眼验收，
-// 这条只保证回归不会被悄悄写回来。
+// 改做**源码反例**判定：每一条回归在源码里都只有一种写法，改回去就一定被这里咬住。这条门禁**明确
+// 只到源码结构这一层**：它不驱动真实 XAML、不合成指针、不假宣"真实鼠标已验证"，最后的行为由人工
+// 在真任务栏上验收。
+//
+// 这里咬住的负反馈环（本文件对应的那次修复）：读数帧每次 apply 都会重建命中模型，如果重建顺手把
+// "提示框正显示着哪一条"的判据清掉，那么只要指针还在动，下一次 pointermove 就会重新 show 一次并按
+// **当前光标**重新定位——表现就是提示框跟着鼠标跳/闪。所以：
+//   * 重建模型不许无条件清掉"已显示身份"，只在显示中的条目消失/detail 变空时才隐藏；
+//   * 指针处理只在"命中条目变了"时才重新定位，同条目只换文字时不定位；
+//   * 重新定位/激活在全文件各只有一个出处（`show_tip`）。
 bool find_production_source(std::wstring& path) {
     wchar_t buffer[MAX_PATH]{};
     DWORD const length = ::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
@@ -2295,6 +2302,19 @@ void test_hover_regressions() {
     check(count_occurrences(moved, "show_tip(") == 1,
           "hover: the handler shows a tooltip in exactly one place (the entry that was hit)");
 
+    // "同一条目、同一份文字"的判据必须比对**已显示身份**，而不是一条会被内容重建清掉的游标；
+    // 同条目只换文字走那条不重新定位的刷新。
+    check(moved.find("hover_last_hit") == std::string::npos,
+          "hover: the handler must not go back to the hit cursor that a content rebuild resets");
+    check(moved.find("hover_shown_hit") != std::string::npos &&
+              moved.find("hover_shown_tip") != std::string::npos,
+          "hover: the handler compares the entry and the exact text that are already displayed");
+    check(count_occurrences(moved, "update_tip_text(") == 1,
+          "hover: an unchanged entry whose text changed goes to the text-only refresh");
+    check(moved.find("TTM_TRACKPOSITION") == std::string::npos &&
+              moved.find("TTM_TRACKACTIVATE") == std::string::npos,
+          "hover: the handler decides, and only the show path talks to the tooltip window");
+
     std::string const model =
         slice_between(source, "void rebuild_hover_model(", "\n// ---------- 悬停提示");
     check(!model.empty(), "hover: the hover model builder is present");
@@ -2306,6 +2326,44 @@ void test_hover_regressions() {
           "hover: the row height must not be a measured width");
     check(model.find("plan.height / static_cast<double>(plan.lines)") != std::string::npos,
           "hover: the row height comes from the same measurement's actual height");
+    // 负反馈环的那一半：读数每次 apply 都重建模型（insert/update 都调它），重建绝不能把"提示框正
+    // 显示着哪一条"清掉，否则指针再动一下就重新 show + 按当前光标重新定位。
+    check(model.find("hover_last_hit") == std::string::npos,
+          "hover: a content rebuild must not invalidate the shown-entry cache");
+    check(model.find("g_state.hover_shown_hit =") == std::string::npos &&
+              model.find("hover_shown_tip.clear()") == std::string::npos,
+          "hover: a content rebuild never clears the displayed entry");
+    // 但指针可能一直不动，就不会再有 pointermove 来校正：重建之后必须就地核对屏幕上那份文字，
+    // 条目没了/detail 变成空就地隐藏——旧内容不许长期留在屏幕上。
+    check(count_occurrences(model, "update_tip_text(") == 1 &&
+              model.find("hide_tip()") != std::string::npos,
+          "hover: a content rebuild refreshes or hides the text that is on screen");
+
+    // 隐藏必须清掉那份缓存：否则从块外重新进入同一条目时会被一条早就不成立的缓存挡掉。
+    std::string const hide =
+        slice_between(source, "void hide_tip() {", "\n// ---------- 菜单");
+    check(!hide.empty(), "hover: the hide path is present");
+    check(hide.find("g_state.hover_shown_hit = -1") != std::string::npos &&
+              hide.find("g_state.hover_shown_tip.clear()") != std::string::npos,
+          "hover: hiding clears the shown-entry cache so that re-entering shows again");
+
+    // 内容变化走的那条路**只换文字**：不重新定位、不重新激活（重新定位就是"跟着鼠标走"）。
+    std::string const retip = slice_between(source, "void update_tip_text(std::wstring const& text) {",
+                                            "\nvoid hide_tip() {");
+    check(!retip.empty(), "hover: the text-only refresh path is present");
+    check(retip.find("TTM_UPDATETIPTEXTW") != std::string::npos,
+          "hover: the text-only refresh rewrites the text");
+    check(retip.find("TTM_TRACKPOSITION") == std::string::npos &&
+              retip.find("TTM_TRACKACTIVATE") == std::string::npos,
+          "hover: the text-only refresh must not reposition or reactivate the tooltip");
+
+    // 全文件的调用计数：重定位与激活各只有一个出处（`show_tip`，也就是"命中条目变了"那条路）。
+    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_TRACKPOSITION") == 1,
+          "hover: repositioning happens in exactly one place (a new hit target)");
+    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_TRACKACTIVATE") == 2,
+          "hover: activation happens once on show and once on hide");
+    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW") == 2,
+          "hover: the text is written on show and on the text-only refresh");
 }
 
 }  // namespace

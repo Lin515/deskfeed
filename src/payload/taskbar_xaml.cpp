@@ -102,7 +102,11 @@ struct State {
 
     // 悬停命中模型：每个条目在块内的矩形与它**自己**的 tip（为空表示这一条没有可显示的提示）。
     std::vector<HoverCell> hover_cells;
-    int hover_last_hit = -2;
+    // 提示框此刻**已经显示**的是哪一条、哪份文字：`hover_shown_hit < 0` 表示现在什么都没显示。
+    // 这一对是"同一条目、同一份文字"的唯一判据——内容重建（`rebuild_hover_model`）刻意不清它们，
+    // 否则每刷新一次读数都会让下一次指针移动重新弹一次提示框，看上去就是提示框跟着光标跳。
+    int hover_shown_hit = -1;
+    std::wstring hover_shown_tip;
     double hover_width = 0.0;
     double hover_height = 0.0;
     double hover_font = 0.0;
@@ -397,13 +401,19 @@ double segment_width(std::wstring const& text, double font) {
     return probe.DesiredSize().Width;
 }
 
+// 悬停提示的三个动作（定义在下面的"悬停提示"一节）。内容重建时也要在**指针静止**的情况下校正屏幕
+// 上那份文字，所以先在这里给出声明。
+void update_tip_text(std::wstring const& text);
+void hide_tip();
+
 void rebuild_hover_model(deskfeed::ReadingContent const& content, ReadingPlan const& plan,
                          double width, double height) {
     g_state.hover_cells.clear();
     g_state.hover_width = width;
     g_state.hover_height = height;
     g_state.hover_font = plan.font;
-    g_state.hover_last_hit = -2;
+    // 这里**只**重建几何与每格自己的文字；"提示框正显示着哪一条"那份状态原样留着。读数换了内容但
+    // 命中的还是同一条、文字也没变时，指针再移动也不会重新 show/重新定位（见 on_pointer_moved）。
 
     std::vector<deskfeed::ReadingLine> const lines = deskfeed::reading_pack(content, plan.per_line);
     // 行高必须**按同一次测量的实际高度**算：`plan.height` 是这整块文字量出来的总高度，除以行数
@@ -434,6 +444,22 @@ void rebuild_hover_model(deskfeed::ReadingContent const& content, ReadingPlan co
             }
         }
         top += line_height;
+    }
+
+    // 指针可能一直不动（就不会再有 pointermove 来校正）：重建之后要就地核对屏幕上那份文字。
+    // 索引仍是"当前显示的是第几条"（条目重排会让它落到别的条目上，那就当作刷新，允许）；那一条
+    // 已经不在模型里、或它的 detail 变成了空，就立刻隐藏——绝不把旧内容长期留在屏幕上。
+    int const shown_index = g_state.hover_shown_hit;
+    if (shown_index >= 0) {
+        if (shown_index >= static_cast<int>(g_state.hover_cells.size()) ||
+            g_state.hover_cells[static_cast<size_t>(shown_index)].tip.empty()) {
+            hide_tip();
+        } else {
+            std::wstring const& now_tip = g_state.hover_cells[static_cast<size_t>(shown_index)].tip;
+            if (now_tip != g_state.hover_shown_tip) {
+                update_tip_text(now_tip);
+            }
+        }
     }
 }
 
@@ -491,7 +517,9 @@ bool create_tooltip(HWND owner) {
     return true;
 }
 
-void show_tip(std::wstring const& text, POINT screen_at) {
+// 命中条目变了（或刚从隐藏状态回到这一条）才走这里：换文字 + 定位 + 激活。这是**唯一**给提示框定
+// 位置的地方，并把"现在显示的是哪一条、哪份文字"记进状态。
+void show_tip(int hit, std::wstring const& text, POINT screen_at) {
     if (g_tooltip == nullptr || text.empty()) {
         return;
     }
@@ -503,9 +531,30 @@ void show_tip(std::wstring const& text, POINT screen_at) {
     ::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
     ::SendMessageW(g_tooltip, TTM_TRACKPOSITION, 0, MAKELPARAM(screen_at.x, screen_at.y));
     ::SendMessageW(g_tooltip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    g_state.hover_shown_hit = hit;
+    g_state.hover_shown_tip = text;
+}
+
+// 还是同一条目，只是它自己的显示内容变了：只换文字，**绝不**重新定位、绝不重新激活。位置只在命中
+// 条目变化时给一次，提示框弹出来之后就不再跟着光标走。
+void update_tip_text(std::wstring const& text) {
+    if (g_tooltip == nullptr || g_state.hover_shown_hit < 0 || text.empty()) {
+        return;
+    }
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(TOOLINFOW);
+    tool.hwnd = g_state.tray;
+    tool.uId = 1;
+    tool.lpszText = const_cast<LPWSTR>(text.c_str());
+    ::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+    g_state.hover_shown_tip = text;
 }
 
 void hide_tip() {
+    // 状态先清：提示框窗口已经不在了（拆块之后）也必须记住"现在什么都没显示"，否则重新进入同一条
+    // 目时会被那条早就不成立的缓存挡掉。
+    g_state.hover_shown_hit = -1;
+    g_state.hover_shown_tip.clear();
     if (g_tooltip == nullptr) {
         return;
     }
@@ -514,7 +563,6 @@ void hide_tip() {
     tool.hwnd = g_state.tray;
     tool.uId = 1;
     ::SendMessageW(g_tooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
-    g_state.hover_last_hit = -2;
 }
 
 // ---------- 菜单（自己一条线程：TrackPopupMenu 内部是模态消息循环） ----------
@@ -691,29 +739,39 @@ void on_pointer_moved(wuxc::Border const& block, wuxi::PointerRoutedEventArgs co
                 break;
             }
         }
-        if (hit == g_state.hover_last_hit) {
+        std::wstring const tip =
+            hit >= 0 ? g_state.hover_cells[static_cast<size_t>(hit)].tip : std::wstring();
+
+        // 还是同一条目、还是同一份文字，而且提示框正显示着它：这一次移动什么都不做。**这一条就是
+        // "提示框不跟随鼠标"的全部依据**——重写文字、重新定位、重新激活都会让已经弹出来的框跳一下。
+        // 内容重建不会清掉这份"已显示身份"，所以读数跨帧刷新（哪怕内容一样）也仍然稳定。
+        if (g_state.hover_shown_hit >= 0 && hit == g_state.hover_shown_hit &&
+            tip == g_state.hover_shown_tip) {
             return;
         }
-        g_state.hover_last_hit = hit;
 
         // 只有**命中具体条目**才显示提示。指针在节点之外（条目之间的分隔符、行长之后的空白、
         // 块的边缘）时什么都不显示：这里绝不退回"整块详情"，那会让指针在节点之间移动时忽然
-        // 抽出一大块内容并来回闪。
-        if (hit < 0) {
-            hide_tip();
+        // 抽出一大块内容并来回闪。本来就没显示的时候也不必再发一次"隐藏"。
+        if (hit < 0 || tip.empty()) {
+            if (g_state.hover_shown_hit >= 0) {
+                hide_tip();
+            }
             return;
         }
-        // 条目自己没有 detail 就是没有可显示的东西：不借同一行别的条目的提示，直接隐藏。
-        std::wstring const& text = g_state.hover_cells[static_cast<size_t>(hit)].tip;
-        if (text.empty()) {
-            hide_tip();
+        // 同一条目自己的 detail 变了：只换文字，位置保持不动。
+        if (hit == g_state.hover_shown_hit) {
+            update_tip_text(tip);
             return;
         }
+        // 命中条目变了（或刚从隐藏状态回到这一条）——这里才重新定位 + 激活。
         POINT cursor{};
-        ::GetCursorPos(&cursor);
+        if (::GetCursorPos(&cursor) == FALSE) {
+            return;
+        }
         cursor.x += 12;
         cursor.y += 20;
-        show_tip(text, cursor);
+        show_tip(hit, tip, cursor);
     } catch (winrt::hresult_error const& failure) {
         log_format(L"hover handling threw %s", hresult_text(failure.code()).c_str());
     } catch (...) {
@@ -849,7 +907,6 @@ void remove_block() {
     g_state.runs.clear();
     g_state.applied.clear();
     g_state.hover_cells.clear();
-    g_state.hover_last_hit = -2;
     g_block_present.store(false);
     hide_tip();
 }

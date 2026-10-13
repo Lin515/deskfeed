@@ -28,6 +28,7 @@
 #include "platform/win32_util.h"
 #include "probe/host_gate.h"
 #include "probe/host_wait.h"
+#include "probe/mock_producer.h"
 
 #include <windows.h>
 
@@ -2985,6 +2986,222 @@ void run_host_safety_cases() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 探针的 scope 规则与显示邮箱占用
+//
+// `--scope` 会被带进内核对象名与共享内存名，所以自测宿主必须非空 + 过公共白名单；而"同 scope
+// 再来一个生产者"必须被**拒绝**：`DisplayFrameProducer::create` 对已存在的同名 section 照样成功，
+// 并且会把帧头 memset 成零（覆写别人的邮箱）。这两条判据与探针运行时用的是同一份实现
+// （`probe_scope_ok` 在 probe/host.h，`ProbeScopeClaim` 在 probe/scope_claim.h，后者抢的是
+// **主进程同一个**实例仲裁名字 `scoped_name(L"Local\\DeskFeed-master", scope)`）。
+// ---------------------------------------------------------------------------
+void run_probe_scope_cases() {
+    if (wanted("probe/scope-whitelist")) {
+        std::wstring error;
+        check(!deskfeed::probe::probe_scope_ok(L"", error),
+              "probe/scope-whitelist the empty (production) scope is refused");
+        check(deskfeed::probe::probe_scope_ok(L"probe-1_x", error),
+              "probe/scope-whitelist a 1..32 [A-Za-z0-9_-] name is accepted");
+        check(!deskfeed::probe::probe_scope_ok(std::wstring(33, L'a'), error),
+              "probe/scope-whitelist a 33-character name is refused");
+        check(!deskfeed::probe::probe_scope_ok(L"../evil", error),
+              "probe/scope-whitelist path traversal is refused");
+        check(!deskfeed::probe::probe_scope_ok(L"a\\b", error),
+              "probe/scope-whitelist a separator is refused");
+        check(!deskfeed::probe::probe_scope_ok(L"has space", error),
+              "probe/scope-whitelist whitespace is refused");
+    }
+
+    if (wanted("probe/scope-occupied-master")) {
+        // **真实仲裁对象**：主进程的实例锁就是 `CreateMutexW(scoped_name(L"Local\\DeskFeed-master",
+        // scope))` + `ERROR_ALREADY_EXISTS`。这里直接建出那个名字（不必 spawn 一个 master），探针
+        // 必须看到"已被占用"并拒绝；对象消失之后同一个 scope 又能被探针正常占用。
+        std::wstring const scope = L"toolstest-master-" + std::to_wstring(::GetCurrentProcessId());
+        std::wstring const name = deskfeed::scoped_name(L"Local\\DeskFeed-master", scope);
+        HANDLE const master = ::CreateMutexW(nullptr, FALSE, name.c_str());
+        check(master != nullptr, "probe/scope-occupied-master the master arbitration object exists");
+        deskfeed::probe::ProbeScopeClaim claim;
+        std::string error;
+        check(!claim.acquire(scope, error),
+              "probe/scope-occupied-master a scope whose master arbitration exists is refused");
+        check(!claim.held(), "probe/scope-occupied-master a refused claim holds nothing");
+        if (master != nullptr) {
+            ::CloseHandle(master);
+        }
+        check(claim.acquire(scope, error),
+              "probe/scope-occupied-master the scope frees when the arbitration object goes away");
+        claim.release();
+    }
+
+    if (wanted("probe/scope-claim-unique")) {
+        // 两个探针抢同一个 scope：恰好一个赢（claim 就是那个"存在即占用"的内核对象）。
+        std::wstring const scope = L"toolstest-unique-" + std::to_wstring(::GetCurrentProcessId());
+        deskfeed::probe::ProbeScopeClaim first;
+        deskfeed::probe::ProbeScopeClaim second;
+        std::string error;
+        check(first.acquire(scope, error), "probe/scope-claim-unique the first claim wins");
+        check(!second.acquire(scope, error), "probe/scope-claim-unique the second claim is refused");
+        check(!second.held(), "probe/scope-claim-unique the loser holds nothing");
+        first.release();
+        check(second.acquire(scope, error), "probe/scope-claim-unique the scope frees after release");
+        second.release();
+    }
+
+    if (wanted("probe/scope-occupied-live")) {
+        // 已有活邮箱：探针必须拒绝，而且**绝不 touch** 那块邮箱——帧头不被 memset、内容照旧。
+        // `MockProducer::create` 的第一句就是同一个 claim（见 probe/mock_producer.cpp），所以
+        // "拒绝"必然发生在任何 `DisplayFrameProducer::create` 之前。
+        std::wstring const scope = L"toolstest-live-" + std::to_wstring(::GetCurrentProcessId());
+        deskfeed::DisplayFrameProducer existing;
+        std::string error;
+        if (!existing.create(scope, nullptr, error)) {
+            check(false, "probe/scope-occupied-live could not create the live mailbox");
+        } else {
+            deskfeed::probe::ProbeScopeClaim claim;
+            check(!claim.acquire(scope, error),
+                  "probe/scope-occupied-live refuses a scope that already has a live mailbox");
+            check(!claim.held(), "probe/scope-occupied-live a refused claim holds nothing");
+            // 拒绝必须**真的**保护了那块邮箱：它还是原来那个生产者建的，内容照常发得出去、
+            // 读得回来（没有被第二个人的 create memset 掉）。
+            deskfeed::Frame frame;
+            frame.kind = deskfeed::ViewKind::Content;
+            deskfeed::FrameItem item;
+            item.id = "cpu";
+            item.label = "CPU";
+            item.value = "54C";
+            frame.items.push_back(item);
+            check(existing.publish(frame, 1000),
+                  "probe/scope-occupied-live the live mailbox still publishes");
+            deskfeed::DisplayFrameConsumer consumer;
+            bool const attached = consumer.attach(scope, error);
+            check(attached, "probe/scope-occupied-live the live mailbox is still attachable");
+            if (attached) {
+                deskfeed::Frame read{};
+                check(consumer.read(read) && read.items.size() == 1,
+                      "probe/scope-occupied-live the live mailbox still carries its own frame");
+                consumer.detach();
+            }
+            existing.close();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G-G：退休门禁的**真实**证据（retained fixture 的 ordinary-detach 标记）
+//
+// 夹具模块只在普通 detach（`lpReserved == nullptr`，= 真的有人 `FreeLibrary`）时写标记文件；
+// 进程退出（`lpReserved != nullptr`）绝不写。于是：
+//   Stop == 0 ⇒ 子进程必须不卸载、exit 1、标记 ABSENT ——"进程结束了"本身不是 Free 的证据；
+//   Stop == 1 ⇒ 子进程卸载、refs == 1、exit 0、标记 PRESENT。
+// 卸载决策用**同一份** `probe/host_gate.h::unload_allowed`：把它变异成"无视未退休"之后，Stop=0
+// 那一轮会真的卸载（标记出现 + exit 0），用例必红。
+// ---------------------------------------------------------------------------
+
+std::wstring retained_fixture_path() {
+    return fixture_dir() + L"\\deskfeed-test-retained-fixture.dll";
+}
+
+// 子进程模式：LoadLibrary 夹具 → 生产 ABI 各调一次 → 用真实的卸载门禁决定要不要 FreeLibrary。
+int run_retained_fixture_child(std::wstring const& dll_path) {
+    using namespace deskfeed::probe;
+    HMODULE const module = ::LoadLibraryW(dll_path.c_str());
+    if (module == nullptr) {
+        std::printf("retained-child: LoadLibrary failed (%lu)\n", ::GetLastError());
+        return 3;
+    }
+    auto start = reinterpret_cast<DWORD(WINAPI*)(void*)>(::GetProcAddress(module, "DeskFeedStart"));
+    auto stop = reinterpret_cast<DWORD(WINAPI*)(void*)>(::GetProcAddress(module, "DeskFeedStop"));
+    auto status =
+        reinterpret_cast<DWORD(WINAPI*)(void*)>(::GetProcAddress(module, "DeskFeedGetStatus"));
+    if (start == nullptr || stop == nullptr || status == nullptr) {
+        std::printf("retained-child: the fixture does not export the production ABI\n");
+        return 4;
+    }
+    std::wstring scope = L"retained-fixture";
+    DWORD const started = start(&scope);
+    deskfeed::payload::PayloadStatusPod pod{};
+    pod.size = sizeof(pod);
+    pod.abi = deskfeed::payload::kPayloadStatusAbi;
+    pod.width = deskfeed::payload::kPayloadStatusWidth;
+    DWORD const status_ok = status(&pod);
+    DWORD const stopped = stop(reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
+
+    UnloadGate gate;
+    gate.worker_exited = true;  // 本子进程的"工作线程"就是它自己，已经走到这里
+    gate.stop_ran = stopped == 1;
+    gate.dangling_clear = true;
+    gate.feed_mode = true;
+    gate.status_clear =
+        status_ok == 1 && pod.thread_alive == 0 && pod.unload_safe == 1 && pod.dangling == 0;
+    std::printf("retained-child: start=%lu status=%lu stop=%lu\n", started, status_ok, stopped);
+    if (!unload_allowed(gate)) {
+        std::printf("retained-child: the gate refuses to unload; leaving the module mapped\n");
+        return 1;  // 绝不 FreeLibrary：进程退出的 DETACH(lpReserved != nullptr) 不写标记
+    }
+    int references = 0;
+    while (::FreeLibrary(module)) {
+        ++references;
+    }
+    std::printf("retained-child: freed, references=%d\n", references);
+    return references == 1 ? 0 : 5;
+}
+
+// 只终止**本用例自己** CreateProcessW 出来的那个 PID；绝不按镜像名杀进程。
+bool run_retained_fixture_case(bool stop_ok, std::wstring const& marker, DWORD& exit_code) {
+    std::wstring const dll = retained_fixture_path();
+    if (::GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    ::DeleteFileW(marker.c_str());
+    std::wstring const command = L"\"" + std::wstring(deskfeed::module_self_path()) +
+                                 L"\" --retained-fixture-child \"" + dll + L"\"";
+    std::wstring const block = build_environment({
+        {L"DESKFEED_FIXTURE_STOP_CODE", stop_ok ? L"1" : L"0"},
+        {L"DESKFEED_FIXTURE_DETACH_MARKER", marker},
+    });
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (::CreateProcessW(nullptr, const_cast<wchar_t*>(command.c_str()), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                         const_cast<wchar_t*>(block.c_str()), nullptr, &startup, &process) == FALSE) {
+        return false;
+    }
+    ::WaitForSingleObject(process.hProcess, 30000);
+    exit_code = 0;
+    ::GetExitCodeProcess(process.hProcess, &exit_code);
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(process.hProcess);
+    return true;
+}
+
+void run_retained_fixture_cases() {
+    if (!wanted("hostgate/retained-fixture")) {
+        return;
+    }
+    std::wstring const dir = temp_dir();
+    std::wstring const marker_bad = dir + L"\\retained-stop0.marker";
+    DWORD exit_code = 0;
+    if (!run_retained_fixture_case(/*stop_ok=*/false, marker_bad, exit_code)) {
+        check(false, "hostgate/retained-fixture the fixture child could not be launched");
+        return;
+    }
+    check_eq(exit_code, static_cast<DWORD>(1),
+             "hostgate/retained-fixture Stop=0 makes the child exit 1 without unloading");
+    check(::GetFileAttributesW(marker_bad.c_str()) == INVALID_FILE_ATTRIBUTES,
+          "hostgate/retained-fixture Stop=0 never ran FreeLibrary (no ordinary-detach marker)");
+
+    std::wstring const marker_ok = dir + L"\\retained-stop1.marker";
+    if (!run_retained_fixture_case(/*stop_ok=*/true, marker_ok, exit_code)) {
+        check(false, "hostgate/retained-fixture the healthy fixture child could not be launched");
+        return;
+    }
+    check_eq(exit_code, static_cast<DWORD>(0),
+             "hostgate/retained-fixture a healthy Stop=1 child exits 0 with references==1");
+    check(::GetFileAttributesW(marker_ok.c_str()) != INVALID_FILE_ATTRIBUTES,
+          "hostgate/retained-fixture a healthy Stop=1 really ran FreeLibrary (marker present)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3003,6 +3220,11 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[index], "--remote-writer") == 0) {
             // 子进程模式：只装载延迟写 DLL 并停在那里，给父用例制造真实的远程调用超时。
             return run_remote_writer_child();
+        } else if (std::strcmp(argv[index], "--retained-fixture-child") == 0 && index + 1 < argc) {
+            // 子进程模式：装载 retained fixture，走一遍生产 ABI，再用真实的卸载门禁决定要不要
+            // FreeLibrary；夹具的 ordinary-detach 标记是"到底有没有卸"的机械证据。
+            std::string const narrow(argv[++index]);
+            return run_retained_fixture_child(widen(narrow.c_str()));
         }
     }
 
@@ -3019,6 +3241,8 @@ int main(int argc, char** argv) {
     run_guard_cases();
     run_leased_action_cases();
     run_host_safety_cases();
+    run_probe_scope_cases();
+    run_retained_fixture_cases();
     run_state_gate_cases();
     run_frame_cases();
     run_gate_cases();

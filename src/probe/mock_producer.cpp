@@ -1,20 +1,25 @@
 #include "probe/mock_producer.h"
 
-#include "display/mailbox.h"
-
 namespace deskfeed::probe {
 
 MockProducer::~MockProducer() { close(); }
 
 bool MockProducer::create(std::wstring const& scope, std::string& error) {
     close();
+    // 先抢实例仲裁（与主进程同一个名字），抢不到就什么都不碰：`DisplayFrameProducer::create` 对
+    // 已存在的同名 section 照样成功，会把别人的帧头 memset 掉。
+    if (!claim_.acquire(scope, error)) {
+        return false;
+    }
     auto* producer = new (std::nothrow) DisplayFrameProducer();
     if (producer == nullptr) {
         error = "cannot allocate the display frame producer";
+        close();
         return false;
     }
     if (!producer->create(scope, nullptr, error)) {
         delete producer;
+        close();
         return false;
     }
     producer_ = producer;
@@ -28,6 +33,7 @@ void MockProducer::close() {
         delete static_cast<DisplayFrameProducer*>(producer_);
         producer_ = nullptr;
     }
+    claim_.release();
     created_ = false;
 }
 

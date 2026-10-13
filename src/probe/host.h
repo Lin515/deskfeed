@@ -4,6 +4,8 @@
 
 #include <string>
 
+#include "platform/paths.h"
+
 namespace deskfeed::probe {
 
 // 退出码语义（README 与命令行用法同步）：
@@ -34,10 +36,24 @@ struct HostOptions {
     unsigned install_delay_ms = 0;     // 安装竞态窗口（发布句柄之前人为延迟）
     unsigned hang_ui_ms = 0;           // UI 线程停止取消息若干毫秒
     unsigned slow_apply_ms = 0;        // 让 UI 线程上的 apply 慢若干毫秒
-    // `--feed` 的帧序列（空 = 不发帧，只跑生产入口与收尾）。每一步都由宿主自己的 UI 线程
-    // 读**自己那棵树**来判定，而不是只看状态 POD 的标记位。
+    // `--feed` 的帧序列。**空 = 默认步**：发一帧通用 CPU 帧并验证它真的变成块——"只跑生产入口
+    // 与收尾"曾经让默认 `--feed` 连邮箱都不建，于是整条"帧 → 块"的路根本没被走到。每一步都由
+    // 宿主自己的 UI 线程读**自己那棵树**来判定，而不是只看状态 POD 的标记位。
     std::wstring frame_script;
 };
+
+// `--scope` 的探针规则：自测宿主**绝不**碰生产命名空间，也绝不用非法名去建内核对象或共享内存。
+// 必须非空，并且过平台的公共白名单（1..32 个 [A-Za-z0-9_-]，见 platform/paths.h 的
+// `scope_validate`）。空串在平台层表示"生产实例"（合法），对自测宿主而言这正是必须拒绝的输入。
+// 纯函数：命令行、宿主与离线用例共用同一份判据，不允许"命令行接受、宿主不认识"这种分叉。
+inline bool probe_scope_ok(std::wstring const& scope, std::wstring& error) {
+    error.clear();
+    if (scope.empty()) {
+        error = L"the self-test host requires a non-empty instance name";
+        return false;
+    }
+    return deskfeed::scope_validate(scope, error);
+}
 
 // `--frame-script` 的合法名字。纯函数：命令行与离线用例共用同一份清单，不允许"命令行接受、
 // 宿主不认识"这种分叉。

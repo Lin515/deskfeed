@@ -1,5 +1,6 @@
 #include "probe/host.h"
 
+#include "display/mailbox.h"
 #include "inject/status_pod.h"
 #include "platform/log.h"
 #include "platform/win32_util.h"
@@ -8,6 +9,7 @@
 #include "probe/mock_producer.h"
 #include "probe/observer_pod.h"
 #include "probe/probe_hooks.h"
+#include "probe/scope_claim.h"
 
 #include <windows.h>
 
@@ -53,6 +55,9 @@ constexpr UINT kCheckMessage = WM_APP + 3;
 
 // 定义在"`--feed` 的帧序列"那一节；窗口过程在它之前，所以先声明。
 void run_feed_check(unsigned index, unsigned deadline_ms);
+// 辅助生产者子进程的启动/结束（探针绝不自己冒充死掉的邮箱属主）；定义同样在帧序列那一节。
+bool spawn_producer_child(std::wstring const& scope, std::wstring& error);
+void stop_producer_child();
 
 // 负载给自测宿主用的一组导出（签名与负载侧 common ABI 头逐字一致，见
 // src/payload/probe_api.h 与 dllmain.cpp；这里只按名字解析，不链接负载）。
@@ -113,6 +118,22 @@ bool g_check_ran = false;
 std::wstring g_check_detail;
 winrt::Windows::UI::Color g_normal_value_color{};
 bool g_normal_color_known = false;
+// 三档颜色的**观测**基线（ok 用上面那个正常档）。它们全部是从宿主自己那棵树上读回来的，绝不抄
+// 负载的调色板：抄一份就等于"两边对同一件事有两套解释"。
+winrt::Windows::UI::Color g_warn_state_color{};
+winrt::Windows::UI::Color g_error_state_color{};
+bool g_state_colors_known = false;
+
+// `ownerdeath` 的辅助生产者子进程：邮箱由**另一条进程**持有（探针自己不建 producer，否则就是
+// "自己发 closed 帧冒充 owner 死亡"）。句柄由工作线程登记，收尾时再兜底杀一次。
+HANDLE g_producer_child = nullptr;
+bool g_owner_child_ready = false;
+// `ownerdeath` 期间由**父进程**持有的实例仲裁（与主进程同一个名字，见 probe/scope_claim.h）。
+// 子进程用 `--parent-claim` 复用这份持有期，不再自己去抢同一个名字而自拒。
+ProbeScopeClaim g_feed_claim;
+// 生产收尾的结论：由**工作线程**发起 DeskFeedStop 并记在这里，UI 线程只读取（见 worker 里的说明）。
+bool g_feed_stop_ran = false;
+DWORD g_feed_stop_result = 0;
 
 std::wstring directory_of(std::wstring const& path) {
     std::wstring::size_type const slash = path.find_last_of(L"\\/");
@@ -593,14 +614,21 @@ bool run_hang_case() {
 // 不把负载的调色板抄一份到探针里：抄一份就等于"两边对同一件事有两套解释"。
 struct FeedStep {
     wchar_t const* name = L"";
-    Frame frame;                 // 要发布的帧（closed/owner_death 不用它）
-    bool closed = false;         // true = publish_closed（生产者正常收尾）
-    bool owner_death = false;    // 由**辅助生产者进程**持有邮箱（本轮未建 target ⇒ NOT-RUN）
+    // 这一步判定**之前**要按顺序发布的帧。一步可以发多帧：`latest` 的背压突发就是一次发一批，
+    // 然后判定树上只能是最后那一帧。帧序列由工作线程发，判定由 UI 线程读自己那棵树做。
+    std::vector<Frame> frames;
+    bool closed = false;         // 发完 frames 后再 publish_closed（生产者正常收尾）
+    bool owner_death = false;    // 这一批帧由**辅助生产者进程**持有邮箱（探针自己不建 producer）
+    bool kill_owner = false;     // 判定前真的结束辅助生产者进程（不是发一个 closed 帧冒充）
     bool expect_block = true;
     wchar_t const* expect_contains = L"";
     wchar_t const* expect_absent = L"";
+    std::vector<std::wstring> absent_values;  // 这些子串全部不得出现（排队/复活/残留检查）
     // 0 = 不查色；1 = 该子串必须用**正常**档（并与首次记录的正常色一致）；
-    // 2 = 该子串必须**不是**正常档；3 = 这些 value 全部同色且**不是**正常档（整体失效）。
+    // 2 = 该子串必须**不是**正常档；3 = 这些 value 全部同色且**不是**正常档（整体失效）；
+    // 4 = values 恰好三个（ok/warn/error 顺序）两两不同、ok 等于已记录的正常档，并**记录**三档
+    //     观测色；5 = values 恰好三个，每一个都必须回到它自己 state 记录过的观测色（warn 不许被
+    //     折成正常档）。全部是观测来的相对关系，探针不抄负载调色板。
     int tone = 0;
     wchar_t const* tone_subject = L"";
     std::vector<std::wstring> values;
@@ -612,76 +640,146 @@ Frame content_frame(std::vector<FrameItem> items) {
     return make_content_frame(std::move(items));
 }
 
+// `--feed` 默认步（空脚本）与 `ownerdeath` 用的通用条目/值：只有协议字段，没有任何业务语义。
+constexpr wchar_t kDefaultValue[] = L"54C";
+constexpr wchar_t kDefaultDetail[] = L"cpu sample detail";
+constexpr wchar_t kOwnerValue[] = L"AUX-ALIVE";
+constexpr char kOwnerValueUtf8[] = "AUX-ALIVE";
+constexpr int kBurstFrames = 8;
+
+Frame cpu_frame(std::string value, std::string detail) {
+    return content_frame({make_item("cpu", "CPU", std::move(value), ItemState::Ok,
+                                    std::move(detail))});
+}
+
+// ok/warn/error 三档同时出现在**同一批真实帧**里：这是"三档互不相同"唯一能一次证明的组合。
+Frame trio_frame(bool alarm, std::string reason) {
+    return make_content_frame({make_item("cpu", "CPU", "54C", ItemState::Ok, "cpu detail"),
+                               make_item("disk", "DISK", "7C", ItemState::Warn),
+                               make_item("net", "NET", "ERR", ItemState::Error)},
+                              alarm, FailureKind::Timeout, std::move(reason));
+}
+
 void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
     out.clear();
-    if (script.empty()) {
-        return;
-    }
     auto step = [&out](wchar_t const* name) -> FeedStep& {
         out.push_back(FeedStep{});
         out.back().name = name;
         return out.back();
     };
-    auto cpu = []() { return make_item("cpu", "CPU", "54C"); };
+    if (script.empty()) {
+        // **默认步**：`--feed` 不带脚本时也必须证明"帧 → 块"。曾经的实现只在有脚本时才建
+        // producer，于是默认 `--feed` 连邮箱都没有，整条生产路径根本没被走到。
+        FeedStep& only = step(L"default/generic-frame");
+        only.frames.push_back(cpu_frame("54C", "cpu sample detail"));
+        only.expect_contains = kDefaultValue;
+        only.tone = 1;
+        only.tone_subject = kDefaultValue;
+        return;
+    }
 
     if (script == L"latest") {
         FeedStep& first = step(L"latest/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", "cpu sample detail"));
         first.expect_contains = L"54C";
         first.tone = 1;
         first.tone_subject = L"54C";
-        FeedStep& next = step(L"latest/next");
-        next.frame = content_frame({make_item("mem", "MEM", "61%")});
-        next.expect_contains = L"61%";
-        next.expect_absent = L"54C";  // 邮箱只保留最新一帧，不排队
+        // **真实有界突发**：一次发 8 帧再判定。邮箱只保留最新一帧 ⇒ 树上只能是 burst-8；若通道
+        // 排队积压，前面任何一帧都会被抓到。这就是"不排队"的机械证据，不是把期望调绿的措辞。
+        FeedStep& burst = step(L"latest/bounded-burst");
+        for (int index = 1; index <= kBurstFrames; ++index) {
+            burst.frames.push_back(cpu_frame("burst-" + std::to_string(index),
+                                             "burst detail " + std::to_string(index)));
+        }
+        burst.expect_contains = L"burst-8";
+        for (int index = 1; index < kBurstFrames; ++index) {
+            burst.absent_values.push_back(L"burst-" + std::to_wstring(index));
+        }
+        burst.absent_values.push_back(L"54C");  // 旧值被整份替换，不能残留
+
+        // 数组顺序 = 显示顺序（重排必须真的反映到树上）。
+        FeedStep& reorder = step(L"latest/reorder");
+        reorder.frames.push_back(
+            content_frame({make_item("mem", "MEM", "61%"), make_item("cpu", "CPU", "54C")}));
+        reorder.expect_contains = L"61%";
+        reorder.order_first = L"61%";
+        reorder.order_second = L"54C";
+        reorder.absent_values.push_back(L"burst-8");
+
+        // 未出现的旧条目立即消失（完整替换，不是增量补丁）。
+        FeedStep& omit = step(L"latest/omit");
+        omit.frames.push_back(content_frame({make_item("mem", "MEM", "61%")}));
+        omit.expect_contains = L"61%";
+        omit.absent_values.push_back(L"54C");
+        omit.absent_values.push_back(L"cpu sample detail");
+
+        // 合法空列表 = 清空内容（不是取数失败，也不显示 ERROR）。
+        FeedStep& cleared = step(L"latest/clear-empty");
+        cleared.frames.push_back(content_frame({}));
+        cleared.expect_block = false;
+
+        // 清空之后再失败：只能显示 ERROR，**绝不**找回清空前的历史值（连 detail 也不行）。
+        FeedStep& error_after = step(L"latest/error-after-clear");
+        error_after.frames.push_back(make_error_frame(FailureKind::Timeout, "connect failed"));
+        error_after.expect_contains = L"ERROR";
+        error_after.absent_values = {L"54C", L"61%", L"burst-8", L"cpu sample detail"};
     } else if (script == L"warn") {
         FeedStep& first = step(L"warn/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", {}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& warn = step(L"warn/distinct-tone");
-        warn.frame = content_frame({cpu(), make_item("disk", "DISK", "7C", ItemState::Warn)});
+        warn.frames.push_back(content_frame(
+            {make_item("cpu", "CPU", "54C"), make_item("disk", "DISK", "7C", ItemState::Warn)}));
         warn.expect_contains = L"7C";
         warn.tone = 2;
         warn.tone_subject = L"7C";
     } else if (script == L"failure") {
         FeedStep& first = step(L"failure/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", {}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& failed = step(L"failure/error-row");
-        failed.frame = make_error_frame(FailureKind::Timeout, "connect failed");
+        failed.frames.push_back(make_error_frame(FailureKind::Timeout, "connect failed"));
         failed.expect_contains = L"ERROR";
         failed.tone = 2;
         failed.tone_subject = L"ERROR";
     } else if (script == L"alarm") {
         FeedStep& first = step(L"alarm/baseline");
-        first.frame = content_frame({cpu(), make_item("mem", "MEM", "61%")});
+        first.frames.push_back(
+            content_frame({make_item("cpu", "CPU", "54C"), make_item("mem", "MEM", "61%")}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& alarm = step(L"alarm/all-red");
-        alarm.frame = make_content_frame({cpu(), make_item("mem", "MEM", "61%")}, /*alarm=*/true,
-                                         FailureKind::Timeout, "connect failed");
+        alarm.frames.push_back(make_content_frame(
+            {make_item("cpu", "CPU", "54C"), make_item("mem", "MEM", "61%")}, /*alarm=*/true,
+            FailureKind::Timeout, "connect failed"));
         alarm.expect_contains = L"54C";  // 整体失效时值必须**保留**，不能被折成"没有值"
         alarm.tone = 3;
         alarm.values = {L"54C", L"61%"};
     } else if (script == L"restore") {
-        FeedStep& first = step(L"restore/baseline");
-        first.frame = content_frame({cpu()});
-        first.tone = 1;
-        first.tone_subject = L"54C";
-        FeedStep& alarm = step(L"restore/alarm");
-        alarm.frame = make_content_frame({cpu()}, true, FailureKind::Timeout, "connect failed");
-        alarm.tone = 2;
-        alarm.tone_subject = L"54C";
-        FeedStep& back = step(L"restore/back-to-normal");
-        back.frame = content_frame({cpu()});
+        // 同一批真实帧上的三档颜色：ok/warn/error 必须两两不同（tone 4 记录三档观测色），整体失效
+        // 时三条**全部**同色且不等于正常档（tone 3），恢复后每条必须回到**它自己** state 的观测色
+        // （tone 5：warn 不许被折成正常档，error 也不许）。旧实现只证明"各自 != 正常档"，
+        // 证明不了 warn 与 error 是两档。
+        FeedStep& record = step(L"restore/three-states");
+        record.frames.push_back(trio_frame(false, {}));
+        record.expect_contains = L"54C";
+        record.tone = 4;
+        record.values = {L"54C", L"7C", L"ERR"};
+        FeedStep& alarm = step(L"restore/alarm-all-red");
+        alarm.frames.push_back(trio_frame(true, "connect failed"));
+        alarm.expect_contains = L"54C";  // 整体失效时值必须保留
+        alarm.tone = 3;
+        alarm.values = {L"54C", L"7C", L"ERR"};
+        FeedStep& back = step(L"restore/producer-states-back");
+        back.frames.push_back(trio_frame(false, {}));
         back.expect_contains = L"54C";
-        back.tone = 1;
-        back.tone_subject = L"54C";
+        back.tone = 5;
+        back.values = {L"54C", L"7C", L"ERR"};
     } else if (script == L"closed") {
         FeedStep& first = step(L"closed/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", {}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& closed = step(L"closed/removes-block");
@@ -689,30 +787,112 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         closed.expect_block = false;
     } else if (script == L"empty") {
         FeedStep& first = step(L"empty/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", {}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& waiting = step(L"empty/waiting-removes-block");
-        waiting.frame = make_waiting_frame();  // 0 行：不显示读数，也不显示 ERROR
+        waiting.frames.push_back(make_waiting_frame());  // 0 行：不显示读数，也不显示 ERROR
         waiting.expect_block = false;
         waiting.expect_absent = L"ERROR";
     } else if (script == L"delete") {
         FeedStep& first = step(L"delete/baseline");
-        first.frame = content_frame({cpu()});
+        first.frames.push_back(cpu_frame("54C", {}));
         first.tone = 1;
         first.tone_subject = L"54C";
         FeedStep& cleared = step(L"delete/clear-removes-block");
-        cleared.frame = content_frame({});  // 空列表：清空，不是 ERROR
+        cleared.frames.push_back(content_frame({}));  // 空列表：清空，不是 ERROR
         cleared.expect_block = false;
         cleared.expect_absent = L"ERROR";
     } else if (script == L"ownerdeath") {
         // 生产者进程死亡与"正常 closed"是**两条**不同的清块路径：这一条要求邮箱的属主是**另一个
-        // 进程**，宿主自己活着。它需要辅助生产者夹具进程（本轮没有这个 target）⇒ 报 NOT-RUN，
-        // 绝不用"宿主自己死"或"发一个 closed 帧"冒充。
-        FeedStep& owner = step(L"ownerdeath/auxiliary-producer-exit");
-        owner.owner_death = true;
-        owner.expect_block = false;
+        // 进程**，宿主自己活着。帧必须由辅助生产者进程发（探针自己不建 producer，否则就是自己发
+        // closed 帧或让宿主自己去死来冒充）。辅助进程不存在时这一条记 NOT-RUN，绝不当通过。
+        FeedStep& foreign = step(L"ownerdeath/foreign-frame");
+        foreign.owner_death = true;
+        foreign.expect_contains = kOwnerValue;
+        FeedStep& gone = step(L"ownerdeath/producer-exit-clears");
+        gone.kill_owner = true;  // 判定前真的结束那条进程；由它的**真实句柄已触发**让负载清块
+        gone.expect_block = false;
     }
+}
+
+// ---- 辅助生产者子进程（`ownerdeath` 专用）---------------------------------
+//
+// 邮箱的属主必须是**另一条进程**：探针自己建 producer 就是"自己发 closed 帧冒充 owner 死亡"，
+// 而"宿主自己死"更是什么都证明不了（树跟着一起没了）。所以这里 spawn 一个真实进程持有邮箱、
+// 发布一帧、驻留到被父进程结束；结束用的是本进程自己 `CreateProcessW` 出来的那个句柄，
+// **绝不**按镜像名杀进程、也绝不碰任何不属于本次运行的进程。
+std::wstring producer_child_path() {
+    return deskfeed::join_path(directory_of(deskfeed::module_self_path()),
+                               L"deskfeed-probe-producer-child.exe");
+}
+
+bool spawn_producer_child(std::wstring const& scope, std::wstring& error) {
+    stop_producer_child();  // 幂等：先清掉上一轮留下的
+    std::wstring const path = producer_child_path();
+    if (::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = L"the auxiliary producer fixture is not next to this tool";
+        return false;
+    }
+    // `--parent-claim`：实例仲裁由父进程持有（贯穿整段 ownerdeath 运行），子进程不再自己去抢
+    // 同一个名字——那会撞上父进程而自拒。两条路径共用 probe/scope_claim.h 的同一份实现。
+    std::wstring command =
+        L"\"" + path + L"\" --scope " + scope + L" --value " + kOwnerValue + L" --parent-claim";
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                         nullptr, nullptr, &startup, &process) == FALSE) {
+        error = L"cannot start the auxiliary producer: " + deskfeed::last_error_text();
+        return false;
+    }
+    ::CloseHandle(process.hThread);
+    g_producer_child = process.hProcess;
+    return true;
+}
+
+void stop_producer_child() {
+    g_owner_child_ready = false;
+    if (g_producer_child == nullptr) {
+        return;
+    }
+    ::TerminateProcess(g_producer_child, 0);
+    ::WaitForSingleObject(g_producer_child, 5000);
+    ::CloseHandle(g_producer_child);
+    g_producer_child = nullptr;
+}
+
+// R2 只读诊断：把钩子门的当前状态记进日志。它**只读**负载的固定 POD（不新增 ABI、不改负载状态），
+// 用途是在收尾失败时把"到底哪一条证明没拿到"变成可归因的事实，而不是靠猜。
+void log_hook_status(wchar_t const* when) {
+    if (g_probe.hook_status == nullptr) {
+        return;
+    }
+    deskfeed::payload::HookProbeStatus status{};
+    status.size = deskfeed::payload::kProbeStatusSize;
+    status.version = deskfeed::payload::kProbeStatusVersion;
+    if (g_probe.hook_status(&status, static_cast<unsigned>(sizeof(status))) != 1) {
+        deskfeed::log_format(L"hook status (%s): the payload refused the query", when);
+        return;
+    }
+    deskfeed::log_format(L"hook status (%s): installed=%u retired=%u still_installed=%u in_flight=%u "
+                         L"pending=%u expected=%u dangling=%u done=%u",
+                         when, status.hook_installed, status.retired, status.still_installed,
+                         status.in_flight, status.pending, status.completion_expected,
+                         status.dangling, status.done_signaled);
+    if (g_probe.observer_stage == nullptr) {
+        return;
+    }
+    deskfeed::payload::HookProbeStage stage{};
+    stage.size = deskfeed::payload::kProbeStageSize;
+    stage.version = deskfeed::payload::kProbeStageVersion;
+    if (g_probe.observer_stage(&stage, static_cast<unsigned>(sizeof(stage))) != 1) {
+        return;
+    }
+    deskfeed::log_format(L"observer (%s): stage=%u sequence=%u complete=%u", when, stage.stage,
+                         stage.sequence, stage.complete);
 }
 
 // UI 线程：读宿主自己的树。返回 false 表示这棵树根本读不到（宿主自己的对象，那是内部错误）。
@@ -787,6 +967,9 @@ bool evaluate_step(FeedStep const& step, std::wstring& why) {
         return false;
     }
     if (!step.expect_block) {
+        // 树上确实没有块 ⇒ 读回来的文字就是空的，`expect_absent` 在这里天然空集（不是被忽略）。
+        // "清空后不许复活旧值"的判定落在"ERROR 帧仍在块里、而旧值必须 absent"那一步上，那一步真的
+        // 会咬：值/详情只要有一个残留就红。
         return true;
     }
     if (step.expect_contains[0] != L'\0' && text.find(step.expect_contains) == std::wstring::npos) {
@@ -797,6 +980,12 @@ bool evaluate_step(FeedStep const& step, std::wstring& why) {
         why = L"the block text still contains a value that must be gone";
         return false;
     }
+    for (std::wstring const& gone : step.absent_values) {
+        if (!gone.empty() && text.find(gone) != std::wstring::npos) {
+            why = L"the block still carries a value that this frame must have removed";
+            return false;
+        }
+    }
     if (step.order_first[0] != L'\0' && step.order_second[0] != L'\0') {
         std::size_t const first = text.find(step.order_first);
         std::size_t const second = text.find(step.order_second);
@@ -806,6 +995,54 @@ bool evaluate_step(FeedStep const& step, std::wstring& why) {
         }
     }
     if (step.tone == 0) {
+        return true;
+    }
+    if (step.tone == 4 || step.tone == 5) {
+        // 三档颜色判定：values 恰好三个，顺序固定为 ok/warn/error。tone 4 要求"两两不同 + ok 是正常
+        // 档"并**记录**这一次真实渲染出来的三档色；tone 5 要求每条回到它自己记录过的色。这样 warn 与
+        // error 是不是两档、恢复时 warn 有没有被折成正常档，都是可判定的，而不是只跟正常档比一次。
+        if (step.values.size() != 3) {
+            why = L"the three-state tone check needs exactly three subjects (ok/warn/error)";
+            return false;
+        }
+        winrt::Windows::UI::Color observed[3]{};
+        for (std::size_t index = 0; index < step.values.size(); ++index) {
+            if (!color_of(runs, step.values[index], observed[index])) {
+                why = L"a three-state subject is not painted in the block";
+                return false;
+            }
+        }
+        if (step.tone == 4) {
+            if (same_color(observed[0], observed[1]) || same_color(observed[0], observed[2]) ||
+                same_color(observed[1], observed[2])) {
+                why = L"ok/warn/error do not use three distinct tones";
+                return false;
+            }
+            if (g_normal_color_known && !same_color(observed[0], g_normal_value_color)) {
+                why = L"the ok entry does not use the normal tone";
+                return false;
+            }
+            g_normal_value_color = observed[0];
+            g_normal_color_known = true;
+            g_warn_state_color = observed[1];
+            g_error_state_color = observed[2];
+            g_state_colors_known = true;
+            return true;
+        }
+        if (!g_state_colors_known || !g_normal_color_known) {
+            why = L"no three-state tone baseline was recorded before this step";
+            return false;
+        }
+        winrt::Windows::UI::Color const want[3] = {g_normal_value_color, g_warn_state_color,
+                                                   g_error_state_color};
+        for (std::size_t index = 0; index < 3; ++index) {
+            if (!same_color(observed[index], want[index])) {
+                why = index == 0   ? L"the ok entry did not return to the normal tone"
+                      : index == 1 ? L"the warn entry did not return to its own tone"
+                                   : L"the error entry did not return to its own tone";
+                return false;
+            }
+        }
         return true;
     }
     winrt::Windows::UI::Color color{};
@@ -873,14 +1110,35 @@ void run_feed_check(unsigned index, unsigned deadline_ms) {
         return;
     }
     FeedStep const& step = steps[index];
-    if (step.owner_death) {
-        g_check_ran = false;  // NOT-RUN：没有辅助生产者夹具进程，这一条没有被执行过
-        g_check_detail = L"owner death needs the auxiliary producer fixture process";
+    if (step.owner_death && !g_owner_child_ready) {
+        g_check_ran = false;  // NOT-RUN：辅助生产者进程没起来，这一条真的没被执行过
+        g_check_detail = L"the auxiliary producer process is not available (fixture missing?)";
         return;
     }
     DWORD const deadline = ::GetTickCount() + deadline_ms;
     std::wstring why;
+    unsigned packed_previous = 0xffffffffu;
     for (;;) {
+        if (g_probe.hook_status != nullptr) {
+            deskfeed::payload::HookProbeStatus status{};
+            status.size = deskfeed::payload::kProbeStatusSize;
+            status.version = deskfeed::payload::kProbeStatusVersion;
+            if (g_probe.hook_status(&status, static_cast<unsigned>(sizeof(status))) == 1) {
+                unsigned const packed = status.hook_installed | (status.retired << 1) |
+                                        (status.still_installed << 2) | (status.in_flight << 3) |
+                                        (status.pending << 4) | (status.completion_expected << 5) |
+                                        (status.dangling << 6) | (status.done_signaled << 7);
+                if (packed != packed_previous) {
+                    deskfeed::log_format(L"in-check: installed=%u retired=%u still=%u in_flight=%u "
+                                         L"pending=%u expected=%u dangling=%u done=%u",
+                                         status.hook_installed, status.retired,
+                                         status.still_installed, status.in_flight, status.pending,
+                                         status.completion_expected, status.dangling,
+                                         status.done_signaled);
+                    packed_previous = packed;
+                }
+            }
+        }
         if (evaluate_step(step, why)) {
             g_check_pass = true;
             return;
@@ -971,28 +1229,117 @@ DWORD WINAPI worker_entry(LPVOID) {
     }
 
     if (g_options.feed) {
-        // 生产路径：负载自己 attach mock 邮箱、自己把帧渲染进宿主的岛。**不做** inline 应用：
+        // 生产路径：负载自己 attach 隔离邮箱、自己把帧渲染进宿主的岛。**不做** inline 应用：
         // XAML 元素有线程亲和性，内容必须由负载经真实 hook 编组到 UI 线程。
-        // 帧序列：生产者必须在 `DeskFeedStart` **之前**就位并发出第一帧。负载线程 attach 之后
-        // 立刻读一次最新帧，读到 0 行就不会插块（也就没有"帧 → 块"这条路可验）。
+        //
+        // 帧必须在 `DeskFeedStart` **之前**就位并真的发出去：负载线程 attach 之后立刻读一次最新帧，
+        // 读到 0 行就不会插块（也就没有"帧 → 块"这条路可验）。**默认步（空脚本）也走这条路**——
+        // 旧实现只在有脚本时才建 producer，于是默认 `--feed` 连邮箱都没有，什么都没证明。
         std::vector<FeedStep> steps;
         build_feed_steps(g_options.frame_script, steps);
-        if (!steps.empty()) {
+        bool const owner_death_script = !steps.empty() && steps.front().owner_death;
+        auto publish_step = [](FeedStep const& step) -> bool {
+            for (Frame const& frame : step.frames) {
+                if (!g_producer.publish(frame)) {
+                    return false;
+                }
+            }
+            return !step.closed || g_producer.publish_closed();
+        };
+        // 生产收尾：**由工作线程**发起 `DeskFeedStop`，绝不在 UI 线程上做。负载的退休门禁要求向
+        // T（= 我们的 UI 线程）发一次跨线程 `WM_NULL` 并拿到应答；如果 Stop 就跑在 T 上，T 正卡在
+        // 这次调用里，那个 ping 永远拿不到应答 ⇒ 必然误报"未退休"。注入器的真实形态也正是从
+        // **另一条**线程远程调用它。窗口必须活到 Stop 结束，因为收尾的 ping 打的就是它。
+        auto finish_feed = []() {
+            if (g_feed_retired) {
+                return;  // 对抗路径（挂住 UI / 慢执行）已经拿到过"可以卸载"
+            }
+            DWORD const stopped = g_probe.feed_stop(
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
+            g_feed_stop_ran = true;
+            g_feed_stop_result = stopped;
+            g_feed_retired = stopped == 1;
+            deskfeed::log_format(L"DeskFeedStop -> %lu (%s)", stopped,
+                                 stopped == 1 ? L"retired" : L"NOT retired");
+            if (stopped != 1) {
+                g_failed = true;
+            }
+        };
+
+        bool producer_ready = false;
+        if (owner_death_script) {
+            // 邮箱属主是**另一条进程**：探针自己不建 producer（自己建就成了"自己发帧冒充 owner
+            // 死亡"）。父进程先把实例仲裁拿到手（与主进程同一个名字），再拉起子进程；辅助进程真的
+            // 发布之后才继续。起不来就 NOT-RUN + 失败，绝不带着一个证明不了的前提去跑生产入口。
+            std::wstring spawn_error;
+            std::string claim_error;
+            if (!g_feed_claim.acquire(g_options.scope, claim_error)) {
+                spawn_error.clear();
+                for (char const character : claim_error) {
+                    spawn_error.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
+                }
+            } else if (spawn_producer_child(g_options.scope, spawn_error)) {
+                DisplayFrameConsumer peek;
+                std::string peek_error;
+                bool published = false;
+                for (int attempt = 0; attempt < 200 && !published; ++attempt) {
+                    if (!peek.attached()) {
+                        peek.attach(g_options.scope, peek_error);
+                    } else {
+                        Frame current{};
+                        published = peek.read(current) && !current.items.empty() &&
+                                    current.items[0].value == kOwnerValueUtf8;
+                    }
+                    if (!published) {
+                        ::Sleep(50);
+                    }
+                }
+                peek.detach();
+                if (published) {
+                    g_owner_child_ready = true;
+                    producer_ready = true;
+                    deskfeed::log_format(L"ownerdeath: the auxiliary producer (pid %lu) published its "
+                                         L"frame; this host is not the mailbox owner",
+                                         ::GetProcessId(g_producer_child));
+                } else {
+                    spawn_error = L"the auxiliary producer did not publish within the deadline";
+                }
+            }
+            if (!producer_ready) {
+                deskfeed::log_format(L"NOT-RUN: ownerdeath (%s)", spawn_error.c_str());
+                g_failed = true;
+            }
+        } else {
             std::string producer_error;
             if (!g_producer.create(g_options.scope, producer_error)) {
                 deskfeed::log_format(L"cannot create the isolated mock producer: %S",
                                      producer_error.c_str());
                 g_failed = true;
-            } else if (!g_producer.publish(steps[0].frame)) {
-                deskfeed::log_line(L"the isolated mock producer refused the first frame");
+            } else if (!publish_step(steps.front())) {
+                deskfeed::log_line(L"the isolated mock producer refused the first frames");
                 g_failed = true;
             } else {
+                producer_ready = true;
                 deskfeed::log_format(L"frame script <%s>: %zu step(s); step 0 published before "
                                      L"DeskFeedStart",
                                      g_options.frame_script.c_str(), steps.size());
             }
         }
+        if (!producer_ready) {
+            // fail closed：没有"已发布的帧"就没有可验的"帧 → 块"，绝不带着这个前提去跑生产入口。
+            deskfeed::log_line(L"the feed precondition (a live mailbox with a published frame) was not "
+                               L"met; the production entry point was not run");
+            finish_feed();  // 没有 Start 也要走一次 Stop：门禁与"能不能卸"由它给结论
+            g_producer.close();
+            stop_producer_child();
+            g_feed_claim.release();
+            ::PostMessageW(g_window, WM_CLOSE, 0, 0);
+            return 0;
+        }
         // R5：把宿主的岛登记成托盘目标。返回 0 = 负载拒绝了这个窗口，那是失败而不是跳过。
+        if (g_probe.set_observer != nullptr) {
+            g_probe.set_observer(1);  // 只记录回调阶段（只读诊断），不改变任何行为
+        }
         int const tray_ok = g_probe.set_tray_window(g_window);
         DWORD owner_pid = 0;
         DWORD const owner_thread = ::GetWindowThreadProcessId(g_window, &owner_pid);
@@ -1006,8 +1353,13 @@ DWORD WINAPI worker_entry(LPVOID) {
                                  owner_pid, owner_thread, ::GetCurrentProcessId(), g_ui_thread);
             g_failed = true;
         }
-        std::wstring scope = g_options.scope;
-        DWORD const started = g_probe.feed_start(&scope);
+        // ABI：`DeskFeedStart(void* scope_or_null)` 收的是**目标进程里的 NUL 结尾宽字符串**
+        // （注入器也是把 `scope.c_str()` 写进目标进程再远程调用），nullptr = 生产实例。
+        // 这里曾经把 `&std::wstring` 当参数传进去：负载按字符串读会读到对象头，于是直接以
+        // "请求非法(2)" 拒绝——自测宿主只有在真的跑起来之后才会暴露这条。
+        std::wstring const scope = g_options.scope;
+        DWORD const started = g_probe.feed_start(
+            scope.empty() ? nullptr : const_cast<wchar_t*>(scope.c_str()));
         deskfeed::log_format(L"DeskFeedStart -> %lu (%s)", started,
                              started == 1 ? L"started" : L"not started");
         if (started != 1 && started != 3) {
@@ -1034,10 +1386,13 @@ DWORD WINAPI worker_entry(LPVOID) {
         // 逐步发帧 + 由 UI 线程读宿主自己的树判定。PASS/FAIL/NOT-RUN 三态都写进日志：
         // NOT-RUN（超时，或这一步需要的东西不存在）**不算通过**，也不允许把整轮当绿。
         for (size_t index = 0; index < steps.size(); ++index) {
-            if (index != 0 && !steps[index].owner_death) {
-                bool const published = steps[index].closed ? g_producer.publish_closed()
-                                                           : g_producer.publish(steps[index].frame);
-                if (!published) {
+            if (index != 0) {
+                if (steps[index].kill_owner) {
+                    // 真的结束那条辅助生产者进程：负载是靠**它的真实进程句柄已触发**清块的，
+                    // 不是靠探针发一个 closed 帧冒充。
+                    deskfeed::log_line(L"ownerdeath: ending the auxiliary producer process now");
+                    stop_producer_child();
+                } else if (!publish_step(steps[index])) {
                     deskfeed::log_format(L"NOT-RUN: %s (the producer refused the frame)",
                                          steps[index].name);
                     g_failed = true;
@@ -1070,10 +1425,11 @@ DWORD WINAPI worker_entry(LPVOID) {
                 deskfeed::log_format(L"FAIL: %s (%s)", steps[index].name, g_check_detail.c_str());
                 g_failed = true;
             }
+            log_hook_status(steps[index].name);
         }
         ::PostMessageW(g_window, kRunMessage, 0, 0);
         ::WaitForSingleObject(g_ui_done, 30000);
-
+        log_hook_status(L"before DeskFeedStop");
         // 收尾的对抗：挂住 UI / 让 apply 变慢时，**短超时**的 stop 必须报"未退休"（0），
         // 恢复之后重试必须报"可以卸载"（1）。绝不在这两种情况下强卸模块。
         if (g_options.slow_apply_ms != 0 || g_options.hang_ui_ms != 0) {
@@ -1095,7 +1451,11 @@ DWORD WINAPI worker_entry(LPVOID) {
                 g_failed = true;
             }
         }
+        finish_feed();  // 窗口还活着：收尾的 ping 要打到它，之后才允许关窗口
+        log_hook_status(L"after DeskFeedStop");
         g_producer.close();  // 隔离 scope 的邮箱随最后一个句柄关闭而消失
+        stop_producer_child();  // 幂等：判定循环提前 continue 时也不能留下辅助生产者进程
+        g_feed_claim.release();  // 全部 probe producer 都结束了，才归还实例仲裁
         ::PostMessageW(g_window, WM_CLOSE, 0, 0);
         return 0;
     }
@@ -1305,6 +1665,25 @@ int run_host(HostOptions const& options) {
         }
     }
 
+    // 收尾次序是有意的：宿主自己那棵树是**本线程**持有的 COM 引用，必须在 XAML source 与 manager
+    // 析构之前松开（它们在函数返回时析构）；两个收尾事件只在这条 UI 线程上被使用，而工作线程已经
+    // 拿到**真实**退出证明，所以关掉它们不会与任何等待者并发（无 UAF）。工作线程没真退出时什么都
+    // 不碰——宁可让进程退出时统一回收，也不在别人还在用的时候动这些东西。
+    if (worker_exited) {
+        stop_producer_child();  // ownerdeath 的辅助生产者进程必须真的结束，绝不留下孤儿
+        g_producer.close();     // 工作线程早退/BLOCKED 时可能还留着邮箱句柄
+        g_feed_claim.release(); // 实例仲裁也只在全部 producer 结束后才归还
+        g_tray_grid = nullptr;  // 松开宿主自己那棵树的引用（树本身仍由 XAML source 持有）
+        if (g_check_done != nullptr) {
+            ::CloseHandle(g_check_done);
+            g_check_done = nullptr;
+        }
+        if (g_ui_done != nullptr) {
+            ::CloseHandle(g_ui_done);
+            g_ui_done = nullptr;
+        }
+    }
+
     if (g_blocked) {
         // BLOCKED：除了"装载 + 解析导出 + 本进程那一次 LoadLibrary"，一条用例都没跑。所以只归还
         // **自己这一份**引用；绝不循环 FreeLibrary 去清"未知的引用"——那会把别的持有者（含第三方
@@ -1315,19 +1694,16 @@ int run_host(HostOptions const& options) {
         gate.worker_exited = worker_exited;
         gate.feed_mode = options.feed;
 
-        if (options.feed && !g_feed_retired) {
-            // 生产收尾：只有返回 1 才表示门禁全过。
-            DWORD const stopped = g_probe.feed_stop(
-                reinterpret_cast<void*>(static_cast<std::uintptr_t>(10000)));
-            deskfeed::log_format(L"DeskFeedStop -> %lu (%s)", stopped,
-                                 stopped == 1 ? L"retired" : L"NOT retired");
-            gate.stop_ran = stopped == 1;
-            if (stopped != 1) {
+        if (options.feed) {
+            // 生产收尾由**工作线程**发起并记下结论（见 worker 里 `finish_feed` 的说明：Stop 跑在
+            // T 上会让负载的 `WM_NULL` ping 永远拿不到应答）。这里只读那次调用的结论，绝不补一次
+            // UI 线程上的 Stop。
+            gate.stop_ran = g_feed_stop_ran && g_feed_stop_result == 1;
+            if (!gate.stop_ran) {
+                deskfeed::log_format(L"DeskFeedStop did not report a safe retirement (ran=%d result=%lu)",
+                                     g_feed_stop_ran ? 1 : 0, g_feed_stop_result);
                 g_failed = true;
             }
-        } else if (options.feed) {
-            // 早先那一轮（挂住 UI / 慢执行）已经拿到过"可以卸载"，那正是 g_feed_retired 的含义。
-            gate.stop_ran = true;
         }
         if (options.feed) {
             // 状态 POD 复核：线程必须已经不在跑、unload_safe 必须为真、不得有悬挂。

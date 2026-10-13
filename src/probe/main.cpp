@@ -181,9 +181,15 @@ bool parse(int argc, wchar_t** argv, ParseResult& out) {
         return false;
     }
     // 宿主模式绝不碰生产命名空间：空 scope 表示生产实例，那是注入器的事，不是自测宿主的事。
-    if (out.host.scope.empty()) {
-        ::fwprintf(stderr, L"the self-test host requires a non-empty --scope\n");
-        return false;
+    // 判据用 `probe_scope_ok`（非空 + 公共白名单 1..32 个 [A-Za-z0-9_-]），而且必须在**任何**
+    // 模块装载、窗口、线程与共享内存之前就 fail closed —— scope 会被带进内核对象名与共享内存名，
+    // 非法名要么建不出来，要么落到别人的命名空间里。
+    {
+        std::wstring scope_error;
+        if (!deskfeed::probe::probe_scope_ok(out.host.scope, scope_error)) {
+            ::fwprintf(stderr, L"invalid --scope: %s\n", scope_error.c_str());
+            return false;
+        }
     }
     // 帧序列只有生产入口（真实 mailbox → 真实钩子 → XAML）能消费。
     if (!out.host.frame_script.empty() && !out.host.feed) {

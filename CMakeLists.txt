@@ -434,13 +434,42 @@ add_executable(deskfeed-tools-fixture-host
 )
 target_link_libraries(deskfeed-tools-fixture-host PRIVATE deskfeed_base)
 
+# 工具用例（`deskfeed-tools-tests`）另外两个**测试专用**夹具，与上面同一套纪律：不部署、不安装、
+# 不进任何交付二进制。两者都必须真的构建出来——工具用例是按"与本可执行文件同目录"的绝对路径去
+# 拉起它们的，缺一个就是硬失败，不是跳过：
+#   * `deskfeed-probe-producer-child`（EXE）是"独立帧生产者进程"，给"邮箱属主死掉"那条路径提供
+#     一个真实的、由用例自己 spawn 的属主（用真实的 scope 仲裁名先抢名字再发帧）；它链
+#     `deskfeed_display`（帧生产者与邮箱）、`deskfeed_core_text`、`deskfeed_base`；
+#   * `deskfeed-test-retained-fixture`（MODULE）扮演一个"Stop 说未退休"的负载：只导出真实的生产
+#     ABI，DllMain 里只写普通 detach 标记，用来咬住"探针绝不 `FreeLibrary` 一个未退休的模块"。
+# 默认输出目录就是 `bin/`，与用例同目录。
+add_executable(deskfeed-probe-producer-child
+    tests/probe_producer_child.cpp
+)
+target_link_libraries(deskfeed-probe-producer-child PRIVATE
+    deskfeed_display
+    deskfeed_core_text
+    deskfeed_base
+)
+
+add_library(deskfeed-test-retained-fixture MODULE
+    tests/probe_retained_fixture.cpp
+)
+target_link_libraries(deskfeed-test-retained-fixture PRIVATE deskfeed_base)
+set_target_properties(deskfeed-test-retained-fixture PROPERTIES
+    OUTPUT_NAME "deskfeed-test-retained-fixture"
+    PREFIX ""
+)
+
 add_executable(deskfeed-tools-tests
     tests/tools_tests.cpp
 )
 target_link_libraries(deskfeed-tools-tests PRIVATE deskfeed_inject_support)
-# 工具用例按"与本可执行文件同目录"找这三个夹具（默认输出目录就是 `bin/`），所以必须一起构建出来。
+# 工具用例按"与本可执行文件同目录"找这些夹具（默认输出目录就是 `bin/`），所以必须一起构建出来；
+# 少一个工具用例就会在干净克隆上直接硬红。
 add_dependencies(deskfeed-tools-tests deskfeed-test-remote-writer
-    deskfeed-test-fixture-payload deskfeed-tools-fixture-host)
+    deskfeed-test-fixture-payload deskfeed-tools-fixture-host
+    deskfeed-probe-producer-child deskfeed-test-retained-fixture)
 add_test(NAME deskfeed-tools-tests COMMAND deskfeed-tools-tests)
 
 # ---------------------------------------------------------------------------

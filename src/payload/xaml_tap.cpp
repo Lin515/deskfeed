@@ -510,6 +510,17 @@ std::vector<XamlTapSite> xaml_tap_sites() {
     return result;
 }
 
+size_t xaml_tap_wait_for_sites(size_t deadline_ms) {
+    std::unique_lock<std::mutex> guard(g_state.mutex);
+    // 判据是"站点数追平本轮应答的端口数"：references_taken 是唯一已知的"这一轮该来几个"的
+    // 线索。它只用来决定**等多久**，不参与归还——补引用那条老路已经在第三次 FreeLibrary 上
+    // 真崩过，这里一行都不碰。
+    g_state.sites_changed.wait_for(
+        guard, std::chrono::milliseconds(deadline_ms),
+        [] { return g_state.sites.size() >= static_cast<size_t>(g_state.references_taken); });
+    return g_state.sites.size();
+}
+
 namespace {
 
 // 某个站点的诊断对象，加上属于它的走查状态。

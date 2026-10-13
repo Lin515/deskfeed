@@ -37,6 +37,16 @@ bool xaml_tap_start(std::wstring& error);
 // 到目前为止连上的站点，按连接顺序。
 std::vector<XamlTapSite> xaml_tap_sites();
 
+// 等**本轮应答过的端口**把站点交出来，最多等 deadline_ms；到限就带着现有站点返回。
+//
+// 为什么需要它：端口应答是异步的，每个核心在自己的线程上稍后才调用 SetSite。只等"有一个站点
+// 就行"是过早的——其余核心的 SetSite 这时还在路上，而走查一开始、`xaml_tap_stop` 一跑，
+// `stopping` 就置位，晚到的站点被拒收，那个端口取走的模块引用就留在 loader 账上。
+//
+// 返回值只是现有的站点数：到限时不按端口数补引用（归还规则见 xaml_tap_stop），也不改变任何
+// 引用归属。没连接时调用安全，返回 0。
+size_t xaml_tap_wait_for_sites(size_t deadline_ms);
+
 // 走查一个核心的树一次，记下叫这个名字的元素的句柄（如果树里有）。此时还没有解析任何东西，
 // 上报过的句柄也还没有还回去。
 //

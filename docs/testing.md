@@ -167,7 +167,27 @@ Get-Content inspect.json
 | HTTP | **单元层**（CTest 内的 `deskfeed-tests`，只连进程内 `127.0.0.1` 的 mock 生产端）：仅 200 接纳、204/304 不代替清空、有界 redirect、正文超限、慢头部/慢滴流、取消；**真实 HTTPS/TLS** 不在 CTest 里，见下面"独立 HTTPS 检查器验收" |
 | 配置事务 | URL 落盘/重启独立、PID 不落盘、无 URL、不同字符串换源清缓存、同 URL 重绑；非法 PID/保存失败整条无副作用 |
 | 命令与竞态 | 无参不接管、`--url` 单独解绑、并发短命客户端、就绪/发送超时、迟到旧 HTTP、旧绑定退出不影响新绑定 |
-| 显示与任务栏 | 显示帧/邮箱与负载侧收尾协议在**离线与自测宿主**范围内已验证（含进程守卫与两侧 DLL 审计）；真机 `explorer.exe`、真 XAML 走查与 `--cores 1/2/3` 矩阵**尚未**验收 |
+| 显示与任务栏 | 显示帧/邮箱与负载侧收尾协议在**离线与自测宿主**范围内已验证（含进程守卫与两侧 DLL 审计）；自测宿主的真实 XAML `--feed --cores 1/2/3` 矩阵按"卸载引用必须正好为 1"硬判（见下一节）；真机 `explorer.exe` 注入**尚未**验收 |
+
+### 负载卸载引用判据（`--feed --cores 2/3`，2026-10-13）
+
+自测宿主的 `--feed` 走的是**生产入口**（`DeskFeedStart` / `DeskFeedStop`），真实 XAML 诊断连接在宿主
+自己的进程里跑（连接生命周期见 [native-safety.md](native-safety.md)）。收尾分两步，不要把两步混成
+一句：**门禁**（`unload_allowed`）没过时——`DeskFeedStop` 返回 0/未知、悬挂判据非 0、宿主工作线程
+没有真的退出——探针**不进**引用计数量具，模块保持映射到本进程结束（`retained/unverifiable`，
+不 `FreeLibrary`）；只有门禁全部通过（feed 另要求状态 POD 报 `thread_alive=0 / unload_safe=1 /
+dangling=0`）才进 `report_module_references`，它逐次 `FreeLibrary` **直到失败**来数引用，健康路径
+必须正好是 1（那一次是探针自己的 `LoadLibrary`），`refs != 1` 就如实报红。注意这套计数量具是在
+"数账"、按数到的次数把引用还掉了，所以它的报红**不**表示"替调用方保住了映射"；门禁那道才是。
+判据**不放宽**：`refs != 1` 一律红，不按"应答端口数"补还引用。这套量具只是自测夹具，**不是**生产
+注入器的清理策略：生产 `deskfeed-inject.exe` 只归还自己那一次 `LoadLibrary` 的引用，绝不为"未知
+引用"循环 `FreeLibrary`。
+
+- 绿判据三条同时成立：`DeskFeedStop == 1`、`refs == 1`、模块 `fully unloaded`。
+- 证据（2026-10-13；Debug `96B3841D…` 与 Release `64E570E8…` 各自 `--feed --cores 2/3` 各 20 轮）：
+  **80/80 绿**，且每轮"应答端口数 = 交出站点数"（`answered on N port(s)` 与 `diagnostics ready:
+  N site(s)` 相等），没有一次拒收迟到站点。
+- 每轮用独立的 `--scope` 与独立的 `LOCALAPPDATA`：负载日志每注入一次截断，不隔离就会串。
 
 ### 独立 HTTPS 检查器验收（2026-10-13）
 

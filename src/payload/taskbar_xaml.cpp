@@ -1096,9 +1096,12 @@ bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
         return false;
     }
 
-    for (int attempt = 0; attempt < kSiteAttempts && xaml_tap_sites().empty(); ++attempt) {
-        ::Sleep(kSiteDelayMs);
-    }
+    // 等到本轮应答过的端口都把站点交出来再走查：首站点一到就往下走是过早的，其余核心的
+    // SetSite 常常还在路上；走查一开始、诊断关闭一跑，它们就会在关闭标志之后到达并被拒收，
+    // 端口取走的那份模块引用就留在 loader 账上（回到注入器手里就是"引用不是 1"）。
+    // 期限仍是原来的 kSiteAttempts * kSiteDelayMs；到限就用现有站点如实继续，不按端口数补引用。
+    size_t const sites_ready = xaml_tap_wait_for_sites(kSiteAttempts * kSiteDelayMs);
+    log_format(L"diagnostics ready: %zu site(s) attached before the walk", sites_ready);
     // 连接过程里 XAML 可能又载入了模块，补扫一次导入表。
     reg_hook_rescan();
 

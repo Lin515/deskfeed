@@ -254,6 +254,70 @@ void test_hook_gate() {
     ::CloseHandle(pump.thread);
 }
 
+// 连续投递（不夹收尾）：生产里 `taskbar_xaml_attach` 先投一次 Apply，之后每一帧更新再投一次，
+// 中间**没有** `hook_post_retire`。这条序列是"完成事件在上一轮已经被置位、本轮必须自己重新装一次
+// 钩子"的正常形态，所以它必须能一轮一轮地做下去。这里把它做成可复现的用例。
+void print_hook_status(char const* when) {
+    deskfeed::payload::HookProbeStatus status{};
+    status.size = deskfeed::payload::kProbeStatusSize;
+    status.version = deskfeed::payload::kProbeStatusVersion;
+    if (!deskfeed::payload::hook_post_probe_status(status)) {
+        std::printf("hookseq[%s]: the payload refused the status POD\n", when);
+        return;
+    }
+    deskfeed::payload::HookProbeStage stage{};
+    stage.size = deskfeed::payload::kProbeStageSize;
+    stage.version = deskfeed::payload::kProbeStageVersion;
+    unsigned const have_stage =
+        deskfeed::payload::hook_post_probe_observer_stage(stage) ? 1u : 0u;
+    std::printf("hookseq[%s]: installed=%u retired=%u still=%u in_flight=%u pending=%u "
+                "expected=%u dangling=%u done=%u | stage=%u seq=%u complete=%u (observer=%u)\n",
+                when, status.hook_installed, status.retired, status.still_installed,
+                status.in_flight, status.pending, status.completion_expected, status.dangling,
+                status.done_signaled, stage.stage, stage.sequence, stage.complete, have_stage);
+}
+
+void test_hook_sequence() {
+    if (!name_matches("hookseq")) {
+        return;
+    }
+
+    PumpThread pump;
+    pump.thread = ::CreateThread(nullptr, 0, pump_entry, &pump, 0, nullptr);
+    check(pump.thread != nullptr, "hookseq: the pump thread starts");
+    for (int attempt = 0; attempt < 200 && pump.thread_id == 0; ++attempt) {
+        ::Sleep(5);
+    }
+    check(pump.thread_id != 0 && pump.window != nullptr, "hookseq: the pump thread owns a window");
+
+    deskfeed::payload::hook_post_set_executor(&test_executor, nullptr);
+    deskfeed::payload::hook_post_set_ack_window(pump.window);
+    deskfeed::payload::hook_post_probe_set_observer(true);
+    print_hook_status("before any run");
+
+    for (int round = 0; round < 4; ++round) {
+        int const before = g_applies.load();
+        auto const posted = deskfeed::payload::hook_post_run(
+            pump.thread_id, deskfeed::payload::HookAction::Apply, 3000);
+        std::printf("hookseq: round %d ok=%d retired=%d armed=%d applies=%d error=%ls\n", round,
+                    posted.ok ? 1 : 0, posted.retired ? 1 : 0, posted.armed ? 1 : 0,
+                    g_applies.load() - before, posted.error.c_str());
+        print_hook_status("after run");
+        check(posted.ok && posted.retired, "hookseq: every round really applies and retires");
+        check(g_applies.load() == before + 1, "hookseq: the executor runs exactly once per round");
+    }
+
+    deskfeed::payload::hook_post_probe_set_observer(false);
+    std::wstring detail;
+    check(deskfeed::payload::hook_post_retire(pump.window, pump.thread_id, 3000, detail),
+          "hookseq: the repeated arm/disarm sequence still proves quiescence at the end");
+    check(!deskfeed::payload::hook_post_dangling(), "hookseq: nothing dangles after the final retire");
+
+    pump.quit.store(true);
+    ::WaitForSingleObject(pump.thread, 5000);
+    ::CloseHandle(pump.thread);
+}
+
 // ---------------------------------------------------------------- 成品审计
 
 struct ImportNames {
@@ -613,6 +677,9 @@ void test_reg_hook() {
     // 所以 rescan 会补它的槽。经它的导出调用就走的是"caller → 替身 → 缓存真实入口"这条链。
     HMODULE const caller = ::LoadLibraryW(caller_dll_path().c_str());
     check(caller != nullptr, "reghook: the test-only caller DLL loads");
+    // 调用方会按契约关掉它拿到的替身键句柄；这个 canary 就放在那些 close 之后，用来咬"恢复阶段
+    // 拿着一个已经被关掉、可能已被复用的句柄值再 `RegCloseKey` 一次"这条真实缺陷。
+    HANDLE canary = nullptr;
     if (caller != nullptr) {
         auto const call_open = reinterpret_cast<CallerOpenFn>(::GetProcAddress(caller, "CallerRegOpen"));
         auto const call_query =
@@ -634,6 +701,16 @@ void test_reg_hook() {
             HKEY key = nullptr;
             LONG const opened = call_open(HKEY_LOCAL_MACHINE, kXamlDebugPath, KEY_READ, &key);
             check(opened == ERROR_SUCCESS, "reghook: the stand-in answers the caller's open");
+            // 替身键是**本模块自己的**句柄。`RegOpenKeyExW` 的契约是调用方自己 `RegCloseKey`，所以
+            // 绝不能把同一份句柄交给两个调用方：一旦被关掉，这个值就会被系统复用给随后创建的任何
+            // 内核对象，而恢复阶段会再关它一次。两次打开必须给出两个不同的句柄。
+            HKEY second = nullptr;
+            LONG const opened_again = call_open(HKEY_LOCAL_MACHINE, kXamlDebugPath, KEY_READ, &second);
+            check(opened_again == ERROR_SUCCESS && second != nullptr && second != key,
+                  "reghook: the stand-in hands every caller its own key handle");
+            if (second != nullptr) {
+                call_close(second);
+            }
             DWORD value = 0;
             DWORD size = sizeof(value);
             DWORD type = 0;
@@ -646,6 +723,8 @@ void test_reg_hook() {
             if (key != nullptr) {
                 call_close(key);
             }
+            canary = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            check(canary != nullptr, "reghook: the recycled-handle canary is created");
 
             // 反向（不递归）：同一个模块去读一条**真实存在**的键，替身不答话，必须原样转发给
             // 真实入口并拿到真实结果。替身如果还经 `::Reg*` 转发，这里就会栈溢出。
@@ -676,6 +755,12 @@ void test_reg_hook() {
 
     // P2：恢复之后替身键必须被删掉，而且"已观测在途"必须归零。
     check(deskfeed::payload::reg_hook_restore(error), "reghook: restore succeeds");
+    DWORD canary_flags = 0;
+    check(canary != nullptr && ::GetHandleInformation(canary, &canary_flags) != FALSE,
+          "reghook: restore never closes a handle the caller already recycled");
+    if (canary != nullptr) {
+        ::CloseHandle(canary);
+    }
     check(!key_exists(HKEY_CURRENT_USER, deskfeed::payload::reg_hook_self_test_stand_in_path().c_str()),
           "reghook: the HKCU stand-in key is deleted on restore");
 
@@ -1409,26 +1494,27 @@ int child_actor_held_references() {
 //   1. 三个守卫对象消失（E 的机械证据：泄漏一个 `Open*` 就还能成功）；
 //   2. 命名清理事件的对象消失（`OpenEventW` 失败）：它同时证明 DETACH 真的跑到了，并且本 own-PID
 //      fixture 里没有别的持有者（真实机器上不能据此断言，见 `cleanup_event_name` 的口径）；
-//   3. **进程句柄数逐轮零增长**：`DllMain(DETACH)` 归还本模块自己拿的那 4 个句柄（命名清理事件 +
-//      守卫 mutex/event/mapping），所以"装载之后比上一轮的稳态恰好多 4 个、卸载之后一个不剩"这
-//      两条等式必须在第一轮之后的每一轮都成立。
-// 首轮会额外产生一次性的**进程级**状态（user32/COM/WinRT 的进程级缓存：这里实测 +35，之后恒定），
-// 所以用它之后的稳态值当参考。这条断言对"少一次 CloseHandle"是确定性的：删掉任一归还，句柄数就
-// 每轮 +1/+2，两条等式立刻不成立。
+//   3. **逐轮净零**：把"上一轮的收尾值"当作唯一参考，本轮结尾必须回到它（本轮开头自然也回到它）。
+//      这是一个**相对**判据，不假定任何绝对的装载增量。user32/COM/WinRT 的进程级缓存在首轮会一次性
+//      长出来并在此后恒定，而不同构建（Debug/Release）、不同环境下"一次装载会多开几个句柄"根本不
+//      相同——把"装载后 == 稳态 + 4"这种绝对值写死是环境依赖的错误断言，不是泄漏证据。
+// 净零判据对"少一次 CloseHandle"仍然是确定性的：删掉任一归还，本轮结尾就比参考高，等式立刻不成立；
+// 上面两条"对象消失"断言再从内核对象一侧独立咬一次。
 int child_reload_objects_gone() {
     constexpr int kCycles = 6;
     DWORD baseline = 0;
     ::GetProcessHandleCount(::GetCurrentProcess(), &baseline);
     std::printf("reload: handles before any load=%lu\n", static_cast<unsigned long>(baseline));
-    DWORD plateau = 0;
+    DWORD reference = 0;  // 上一轮的收尾值；首轮那一次性增长之后它就是这条路径的稳态
+    bool have_reference = false;
     for (int cycle = 0; cycle < kCycles; ++cycle) {
+        DWORD before = 0;
+        ::GetProcessHandleCount(::GetCurrentProcess(), &before);
         PayloadApi api;
         check(api.load(L"deskfeed-payload-test.dll"), "reload: the self-test payload loads");
         if (api.module == nullptr) {
             break;
         }
-        DWORD loaded = 0;
-        ::GetProcessHandleCount(::GetCurrentProcess(), &loaded);
         check(cleanup_event_exists(),
               "reload: the named cleanup event exists while the payload is mapped");
         check(api.start(const_cast<wchar_t*>(L"nativeguard")) == 1, "reload: Start accepts");
@@ -1438,15 +1524,17 @@ int child_reload_objects_gone() {
         check(!cleanup_event_exists(), "reload: the named cleanup event is gone after FreeLibrary");
         DWORD after = 0;
         ::GetProcessHandleCount(::GetCurrentProcess(), &after);
-        std::printf("reload: cycle %d loaded=%lu after=%lu\n", cycle,
-                    static_cast<unsigned long>(loaded), static_cast<unsigned long>(after));
-        if (cycle == 0) {
-            plateau = after;
+        std::printf("reload: cycle %d before=%lu after=%lu reference=%lu\n", cycle,
+                    static_cast<unsigned long>(before), static_cast<unsigned long>(after),
+                    static_cast<unsigned long>(reference));
+        if (!have_reference) {
+            // 首轮允许一次性的进程级增长；从第二轮起必须逐轮净零。
+            reference = after;
+            have_reference = true;
             continue;
         }
-        check(loaded == plateau + 4,
-              "reload: one load adds exactly the module's four own handles (cleanup + guard x3)");
-        check(after == plateau, "reload: FreeLibrary returns every one of the module's own handles");
+        check(before == reference, "reload: the previous round returned every handle it took");
+        check(after == reference, "reload: FreeLibrary returns every one of the module's own handles");
     }
     return child_result("reload");
 }
@@ -2116,6 +2204,7 @@ int main(int argc, char** argv) {
         test_feed_policy();
         test_seh_boundary();
         test_hook_gate();
+        test_hook_sequence();
         test_reg_hook();
         test_retire_gates();
         test_status_abi();

@@ -242,6 +242,32 @@ HKEY stand_in_key() {
     return g_stand_in;
 }
 
+// 给**调用方**开一份指向替身键的独立句柄。
+//
+// 为什么不能直接把 `g_stand_in` 交出去：`RegOpenKeyExW` 的契约是"调用方拿到 HKEY，用完了自己
+// `RegCloseKey`"。XAML 走查正是这么做的，所以交出去的那一份会被关掉；句柄值一旦被系统回收，就会
+// 复用给它之后创建的任何内核对象。恢复阶段再 `RegCloseKey` 那个旧的 `g_stand_in`，关掉的就是那个
+// 被复用的对象——实测会把钩子门的完成事件关掉，之后每一轮 `hook_post_run` 都在入口等待上拿到
+// `WAIT_FAILED`，永远等不到"完成"，收尾门只能报未退休。
+//
+// 所以本模块独占 `g_stand_in`（只由 `stand_in_key()` 持有、只由 `reg_hook_restore` 关闭），每次应答
+// 开一份新的给调用方。辨认仍然只认标记值（`is_stand_in`），指向同一个键的每一份句柄都成立。
+bool open_stand_in_for_caller(HKEY& out) {
+    out = nullptr;
+    LSTATUS status = ERROR_INVALID_FUNCTION;
+    if (g_open != nullptr) {
+        status = g_open(HKEY_CURRENT_USER, kStandInPath, 0, KEY_READ | KEY_WRITE, &out);
+    } else {
+        // 本模块自己的导入表**从不**被补（见文件头纪律 2），所以这里仍然是真实入口。
+        status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kStandInPath, 0, KEY_READ | KEY_WRITE, &out);
+    }
+    if (status != ERROR_SUCCESS || out == nullptr) {
+        out = nullptr;
+        return false;
+    }
+    return true;
+}
+
 // 经**保存下来的真实入口**调用查询（不是 `::RegQueryValueExW`）。替身自己的辨认逻辑也走这里：
 // 本模块（或把本文件一起编进去的自测可执行文件）的导入表槽可能已经被改成替身，走导入就是自我递归。
 LSTATUS call_real_query(HKEY key, LPCWSTR value_name, LPDWORD type, LPBYTE data, LPDWORD size) {
@@ -298,11 +324,14 @@ bool answer_open(LPCWSTR sub_key, PHKEY result, LSTATUS& status) {
         _wcsicmp(sub_key, kXamlDebugPath) != 0) {
         return false;
     }
-    HKEY const stand_in = stand_in_key();
-    if (stand_in == nullptr) {
+    if (stand_in_key() == nullptr) {
         return false;
     }
-    *result = stand_in;
+    HKEY for_caller = nullptr;
+    if (!open_stand_in_for_caller(for_caller)) {
+        return false;
+    }
+    *result = for_caller;
     status = ERROR_SUCCESS;
     return true;
 }

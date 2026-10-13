@@ -26,7 +26,7 @@ CTest 注册 8 条：
 | `deskfeed-tests` | 协议/状态机/帧/邮箱/检查器/主进程事务与条件退出 |
 | `deskfeed-native-tests` | 负载侧：显示帧消费策略、钩子门收尾协议、C++/SEH 边界、导入表改写、回收门位、真 DLL 的 `status` / `glue` / `failclosed` / 进程守卫 |
 | `deskfeed-supervisor-tests` | 主进程侧任务栏编排，配 `deskfeed-fake-injector`（**不注入任何进程**的假注入器） |
-| `deskfeed-tools-tests` | 注入器工具：目标解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（配 `deskfeed-test-remote-writer`、`deskfeed-test-fixture-payload` 与 `deskfeed-tools-fixture-host` 三个**测试专用**夹具） |
+| `deskfeed-tools-tests` | 注入器工具：目标解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（配 `deskfeed-test-remote-writer`、`deskfeed-test-fixture-payload`、`deskfeed-tools-fixture-host`、`deskfeed-probe-producer-child` 与 `deskfeed-test-retained-fixture` 五个**测试专用**夹具） |
 | `deskfeed-payload-audit` | 成品**生产** DLL 的导入表 / 导出名 / map 审计 |
 | `deskfeed-payload-test-audit` | 成品**自测** DLL 的同款审计（探针入口必须仍在） |
 | `deskfeed-widget-tests` | 悬浮窗纯逻辑与偏好 |
@@ -34,18 +34,46 @@ CTest 注册 8 条：
 
 一律带 `--no-tests=error`，避免“没有注册用例”被当成绿。
 
-`deskfeed-native-tests` 的过滤器：`--filter feed` / `seh` / `retire` / `status` / `glue` / `failclosed` /
-`guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十三条进程守卫场景各自在**新子进程**里跑
+`deskfeed-native-tests` 的过滤器：`--filter feed` / `seh` / `hook` / `hookseq` / `reghook` / `retire` /
+`status` / `glue` / `failclosed` / `guard`；`--audit <dll>` 只跑成品审计。`--filter guard` 里的十三条
+进程守卫场景各自在**新子进程**里跑
 （父进程用 `CreateProcessW` 起自己，`--guard-child <场景>`，断言退出码）：守卫对象名按目标
 pid + 创建时间命名、`DllMain` 每个进程只 attach 一次，所以“Native 自己 init / actor 先 init /
 粘性事件已置位 / 坏 header / 错类型对象 / 只读零 header / abandoned 恢复 / 引用跨 FreeLibrary /
-每轮 reload 不泄漏（含逐轮句柄数回到基线、命名清理事件在 `FreeLibrary` 后必须消失）/
+每轮 reload 不泄漏（含**逐轮净零**、命名清理事件在 `FreeLibrary` 后必须消失）/
 无名钩子事件在 DETACH 归还 / R5 登记的托盘目标真的是这次 attach 的 T（`probtray`）以及登记之后它
 消失时绝不回退真实 `Shell_TrayWnd`（`probtraydead`）”必须分别是新进程。这些用例只碰**用例自己的
-进程**：`LoadLibrary` 成品 DLL、建自己的命名对象、线程、一条**隐藏**的合成 UI 线程（`hookevents` 与
-`probtray*` 用它把真实的 `WH_GETMESSAGE` 线程钩子装到自己的线程上）与一个自己的显示邮箱生产者
-（`probtray*` 用它让负载真的走到 attach）；窗口都是不可见的 STATIC，不注入 explorer、不起可见 GUI、
-不碰真实任务栏与光标。
+进程**：`LoadLibrary` 成品 DLL、建自己的命名对象、线程、一条**隐藏**的合成 UI 线程（`hookevents`、
+`hookseq` 与 `probtray*` 用它把真实的 `WH_GETMESSAGE` 线程钩子装到自己的线程上）与一个自己的显示
+邮箱生产者（`probtray*` 用它让负载真的走到 attach）；窗口都是不可见的 STATIC，不注入 explorer、
+不起可见 GUI、不碰真实任务栏与光标。
+
+### 句柄判据为什么是“逐轮净零”，不是“装载后 = 稳态 + N”
+
+`reload` 场景曾经断言“一次装载恰好比上一轮稳态多 4 个句柄”（本模块自有的清理事件 + 守卫
+mutex/event/mapping）。这条**绝对**断言是环境依赖的错误：Debug 与 Release、甚至同一构建的两次独立
+运行里，`LoadLibrary` 那一刻的进程句柄数可以相差十几个（user32/COM/WinRT 的进程级缓存何时长出来、
+由哪条线程长出来都不确定）。
+
+现在的判据是**相对**的：首轮之后的每一轮，本轮结尾必须回到上一轮的收尾值，本轮开头也必须回到它。
+它对“少一次 `CloseHandle`”仍然是确定性的——删掉任一归还，本轮结尾就比参考高。另外两条“内核对象
+消失”断言（命名清理事件消失、三个守卫对象消失）从内核对象一侧独立咬一次。
+
+### 替身键的句柄所有权（一次真实缺陷的回归）
+
+`reg_hook` 通过改写各模块导入表让 XAML 读到 `DisableCompositionDiag=1`。它给调用方的“替身键”
+是**本模块自己的** HKEY，而 `RegOpenKeyExW` 的契约是调用方自己 `RegCloseKey`。曾经直接把那一份共享
+句柄交出去：调用方一关，这个句柄值就被系统回收，并可能复用给本模块随后创建的任何内核对象；恢复
+阶段再 `RegCloseKey` 那个旧值，关掉的就是被复用的对象——实测会关掉钩子门的完成事件，于是之后每一轮
+`hook_post_run` 都在入口等待上拿到 `WAIT_FAILED`，永远等不到“完成”，`DeskFeedStop` 只能报未退休。
+
+现在每次应答都给调用方开一份独立句柄，本模块独占自己那一份。`reghook` 用例咬两条：两次打开必须
+给出两个不同的句柄；调用方关掉它们之后再创建的内核对象，必须活过 `reg_hook_restore`。
+
+`--mock --hook`（即负载导出的 `DeskFeedProbeHook(1)`）确认的是**安装**：`reg_hook_install` 成功之后
+返回 `reg_hook_installed()`。它不声称"负载自己那次 `HKLM\Software\Microsoft\XAML\Debug` 读取被拦截
+了"——`reg_hook` 的纪律就是本模块自己的导入表从不被补，所以那次自读在负载进程里永远读不到替身，这
+不是功能失败。跨模块的真实拦截由上面 `reghook` 那批经 `deskfeed-reg-hook-caller.dll` 的断言验证。
 
 ## 离线检查器
 

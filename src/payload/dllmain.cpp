@@ -393,20 +393,30 @@ extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeHook(int enable) {
         std::wstring error;
         return deskfeed::payload::reg_hook_restore(error) ? 1 : 0;
     }
+    // 这里的结论是**安装确认**，不是"负载自己那次 HKLM 读取被拦截了"。
+    //
+    // `reg_hook_probe_read` 走的是**本模块自己的** `::RegOpenKeyExW`，而 `reg_hook` 的纪律之一就是
+    // 本模块自己的导入表从不被补（见 `src/payload/reg_hook.cpp` 顶部说明与 `rescan_locked` 里的
+    // self 判断）。所以在负载进程里它**永远**读不到替身——真实 `HKLM\Software\Microsoft\XAML\Debug`
+    // 确实不存在。这既不是安装失败，也不是功能失败；它只是"从模块内部看不见跨模块的那层拦截"。
+    // 因此这一轮只把它当一条诚实的边界记录，判断改用安装本身：`reg_hook_install` 成功即已保证
+    // "至少补了一个槽"（补不到槽时它自己会失败），`reg_hook_installed()` 就是那条状态确认。
+    //
+    // 跨模块的真实拦截由 `deskfeed-native-tests --filter reghook` 经 `deskfeed-reg-hook-caller.dll`
+    // 验证（那里的断言才是"替身真的答话"的证据），这里不重复、也不弱化它。
     std::wstring detail;
-    bool const before = deskfeed::payload::reg_hook_probe_read(detail);
-    deskfeed::log_format(L"probe: hook selftest before install (%s): %s", before ? L"passed" : L"failed",
-                         detail.c_str());
+    bool const scope_read = deskfeed::payload::reg_hook_probe_read(detail);
+    deskfeed::log_format(L"probe: the payload's own HKLM read is %s (expected: the module's own IAT "
+                         L"is never patched, so the stand-in cannot answer here): %s",
+                         scope_read ? L"answered" : L"not answered", detail.c_str());
     std::wstring error;
     if (!deskfeed::payload::reg_hook_install(error)) {
         deskfeed::log_format(L"probe: cannot install the reg hook: %s", error.c_str());
         return 0;
     }
-    detail.clear();
-    bool const after = deskfeed::payload::reg_hook_probe_read(detail);
-    deskfeed::log_format(L"probe: hook selftest after install (%s): %s", after ? L"passed" : L"failed",
-                         detail.c_str());
-    return after ? 1 : 0;
+    bool const installed = deskfeed::payload::reg_hook_installed();
+    deskfeed::log_format(L"probe: reg hook installed=%s", installed ? L"true" : L"false");
+    return installed ? 1 : 0;
 }
 
 extern "C" __declspec(dllexport) int __stdcall DeskFeedProbeBlockVisible() {

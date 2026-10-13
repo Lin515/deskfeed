@@ -261,14 +261,16 @@ LRESULT CALLBACK hook_proc_impl(int code, WPARAM wparam, LPARAM lparam) {
 
         // ⑤ 第三方钩子可能在这里泵消息：到此为止一切都必须做完。
         DESKFEED_OBSERVE(HookObserverStage::CallNextEntered);
-        next = ::CallNextHookEx(nullptr, code, wparam, lparam);
-        DESKFEED_OBSERVE(HookObserverStage::CallNextReturned);
 
 #ifdef DESKFEED_PAYLOAD_PROBE_BUILD
-        // 探针的对抗开关：把完成事件故意提前到 CallNextHookEx 之前。正常路径下事件只在下面是
-        // **最后一次**模块 API；变异路径下它落在 CallNext 之前，用来证明验收能抓住这类错误。
+        // 探针的对抗开关：把完成事件故意提前到 `CallNextHookEx` **之前**。这里必须真的是"之前"——
+        // 变异要咬住的正是"第三方钩子在 `CallNextHookEx` 内层帧里泵消息、把收尾 ping 的 ACK 在我们
+        // 那一帧弹出之前就送到"这条路径；如果把它放在 CallNext 之后，那次泵已经不在这段代码的
+        // 下游，failpoint 就不再对抗任何东西了。
+        //
         // 一旦真的走过这条路，就置**粘性**的 `completion_mutated`：收尾那边见到它就一律按"未退休"
-        // 处理、不归还自引用（提前置位的事件证明不了我们那一帧已经从 T 的栈上弹掉）。
+        // 处理、不归还自引用（提前置位的事件证明不了我们那一帧已经从 T 的栈上弹掉）。正常路径下
+        // 事件仍然只在下面**最后一次**模块 API 处置位；生产构建里整段都不编译。
         if (g.completion_mutation.load(std::memory_order_acquire) ==
             static_cast<unsigned>(CompletionMutation::EarlyBeforeCallNext)) {
             if (g.done != nullptr) {
@@ -278,6 +280,9 @@ LRESULT CALLBACK hook_proc_impl(int code, WPARAM wparam, LPARAM lparam) {
             }
         }
 #endif
+
+        next = ::CallNextHookEx(nullptr, code, wparam, lparam);
+        DESKFEED_OBSERVE(HookObserverStage::CallNextReturned);
     }
 
     // ⑥ 完成事件是最后一条模块 API；⑦ 之后是裸返回。

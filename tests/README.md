@@ -14,6 +14,15 @@
 | `remote_delay_writer.cpp` | **测试专用**夹具模块：一个"先睡、后写"的导出，用来确定性制造"调用已超时、写入还没发生"的窗口。 |
 | `fixture_payload.cpp` | **测试专用**夹具负载 DLL：扮演被注入的负载（真实的生产 ABI，行为开关全走环境变量），只被工具用例装进它自己 spawn 的隐藏夹具主机。 |
 | `tools_fixture_host.cpp` | **测试专用**夹具主机 EXE：只装载夹具负载然后等在那里，给动作路径一个真实的远程目标；绝不碰真实 `explorer.exe`。 |
+| `probe_producer_child.cpp` | **测试专用**夹具生产者 EXE：`deskfeed-probe.exe` 的"独立帧生产者进程"，给"邮箱属主死掉"那条路径一个真实的、由探针自己 spawn 的属主（先抢真实 scope 仲裁名再发帧）。 |
+| `probe_retained_fixture.cpp` | **测试专用**夹具 MODULE：扮演"`DeskFeedStop` 报未退休"的负载，用来咬住"探针绝不 `FreeLibrary` 一个未退休的模块"。 |
+
+**当前状态**：`deskfeed-native-tests` 与其余离线用例在 Debug/Release 下都是绿的。工具用例
+`deskfeed-tools-tests` 与 `deskfeed-probe.exe` 的真实 `--feed` 路径目前是**部分阻塞**的：探针宿主的
+UI 窗口在收尾之前就被销毁（`kRunMessage` 立刻 `DestroyWindow`），负载向它发的非排队 `WM_NULL`
+因此拿不到"同一窗口、同一主人"的证明，`DeskFeedStop` 只能如实报"未退休"。这是**探针侧**的窗口
+生命周期问题，与负载的回收门无关；负载侧的完成事件与逐轮净零在 `native_tests` 里独立为绿。
+详见 [docs/testing.md](../docs/testing.md)。
 
 覆盖范围：严格 JSON 与深度上限、`expiresAtMs` 的数值整数语义、容量边界、单行/空白判据
 （含 VT/FF 等 Unicode 硬换行）、完整替换与失效恢复、独立到期与不续期、首份即过期、调度夹取、

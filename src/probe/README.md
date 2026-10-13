@@ -75,17 +75,28 @@
 
 "负载正处在自己的 `CallNext`"这个判断走 common ABI 的 **R3 拉模型**：负载侧
 `DeskFeedProbeSetObserver(1)` 打开阶段记录，宿主把 `DeskFeedProbeObserverStage` 的函数指针交给
-第三方钩子，钩子在**自己的回调帧里、同一条线程上**取一份阶段快照（`stage == CallNextEntered`
+第三方钩子，钩子在**自己的回调帧里、同一条线程上**取一次阶段快照（`stage == CallNextEntered`
 且 `complete == 0` 且在观测中）。common ABI **刻意没有**任何"回调已返回"的字段：`done` 之后负载
 只剩一次裸返回，不许再写字段、调 API、跑析构；"帧真的弹掉了"由宿主自己的 ack 观测证明。
+
+宿主窗口（含作为它子窗口的 ack 窗口）必须**活到这次 ping 之后**：`resolve_ack_window` 只认
+"属于同一个 T、同一个进程"的窗口，窗口没了就会回退去 `FindWindow(Shell_TrayWnd)`，被 PID 判据
+拒绝，收尾如实报未退休。所以结构自测的 `kRunMessage` **不**结束消息循环——它只跑完"解析 + 应用"；
+请工作线程退出、`DestroyWindow` 并让循环结束是工作线程末尾那次 `WM_CLOSE` 的事（它的每一条返回
+路径都要发）。同理，`--hang-ui-ms` / `--feed` 的收尾也依赖这个窗口还活着。
 
 ## 对抗用例
 
 - `--third-party-hook-pump`：装第三方钩子并断言 `entries > 0`，且
-  `ack.hits_while_third_party_active == 0` 与 `ping_in_frame == 0`。
+  `ack.hits_while_third_party_active == 0` 与 `ping_in_frame == 0`。第三方钩子的泵**不得吞掉宿主
+  自己的退出消息**：`PeekMessage` 取到 `WM_QUIT` 时必须重新入队并停止这一轮泵，否则宿主的消息循环
+  会因为队列里再没有退出消息而永久阻塞（这条曾经真的挂死过收尾）。
 - `--mutation-early-done`：对抗 failpoint（把 `done` 提前到 `CallNext` 之前）。此时**必须**观察到
   `ack.hits_while_third_party_active > 0` 或 `ping_in_frame > 0` —— 一个硬失败；观察不到就说明
   量具根本没咬住。failpoint 只在探针会话里存在，收尾前强制复位为 0。
+  变异路径下负载刻意按"未退休"处理并置 `dangling`，所以这条用例的**成功形态是负向的**：
+  退出码非 0、模块保持映射（`retained/unverifiable`），日志里有明确的"咬合"证据；绝不能为了让它
+  以 0 退出而把悬挂判据或卸载门禁放宽。
 - `--install-race`（默认 300 ms）：把"存好钩子句柄"这一步人为推迟，确定性地制造"回调先于发布
   进入"这个窗口。
 - `--hang-ui-ms N` / `--slow-apply-ms N`：UI 线程停止取消息 / 让一次 apply 变慢；此时
@@ -124,6 +135,20 @@ site 记的引用已经由负载在解析阶段还清。数到 0 说明多还了
   运行的 scope；任何一条不过就 fail closed，绝不把半份 POD 当结论。
 - 本宿主**没有**在真实 explorer.exe 上跑过任何一次：真机实验只能在明确授权后按
   "注入 → 观察 → 立刻 stop"逐轮做。
-- 负载侧的状态读取与收尾仍有已知缺陷（由 Native 作者修）：在这些修好、并拿到稳定 DLL 与明确
-  放行之前，`--mock` / `--feed` 与对抗矩阵**没有**真实运行过，`deskfeed-probe.exe` 的构建成功
-  只能说明它编译得过。
+- 用**真实稳定负载 DLL** 跑过的部分（`--scope` 隔离、隐藏窗口、不注入 explorer）：`--mock` 结构化
+  路径全绿——`--cores 1/2/3`（各 site 恰好归还、引用数 1、模块完全卸下）、`--teardown`、
+  `--balance-check`、`--dump-only`、`--hook`、`--third-party-hook-pump`、`--install-race`、
+  `--hang-ui-ms`（短超时 0、恢复后重试 1）；`--feed` 全帧矩阵同样通过（默认帧、`latest` 的
+  baseline → 有界突发 → reorder → omit → 空列表清块 → ERROR 不复活旧值、`warn`/`failure`/`alarm`/
+  `restore`、`closed`、`empty`、`delete`、`ownerdeath` 的属主死后清块），每条都以 `DeskFeedStop -> 1`
+  与 `refs = 1` 收尾，`--feed --hang-ui-ms` 的短超时 0 / 重试 1 也拿到。
+- **两个仍然是红/不稳的点（都在负载侧，探针如实报红，不放宽任何判据）**：
+  * `--feed --cores 2/3` 的引用数会间歇变成 2：负载自己的日志写着 "the diagnostics answered on N
+    port(s)" 却只有 "only N-1 ... attached a site; giving back N-1 module reference(s)"——被应答但
+    没交出 site 的那个诊断端口，它拿走的模块引用没有归还。`--feed --cores 1` 与 `--mock --cores
+    1/2/3` 都稳定是 1。
+  * `--mutation-early-done` 的咬合是**竞态**：收尾那次 ping 必须正好落在负载的 `CallNext` 帧里才会
+    被记进 `ack_in_frame` / `ping_in_frame`，所以判据是"多次运行里观察到过"；单次没咬到会如实打印
+    "NOT observable"，观察到一次即证明 failpoint 的位置正确、量具真的会咬。
+- ownerdeath 需要与探针同目录的辅助生产者可执行文件，retained-fixture 门禁用例需要退休门禁夹具
+  DLL；两者是独立的构建目标（源码在 `tests/`），缺了就是真的没跑，不软跳过。

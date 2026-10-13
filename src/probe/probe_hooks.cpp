@@ -74,6 +74,15 @@ LRESULT CALLBACK third_party_proc(int code, WPARAM wparam, LPARAM lparam) {
         for (int index = 0; index < 16 && ::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++index) {
             g_sentinels.fetch_add(1, std::memory_order_relaxed);
             g_last_sentinel_tick.store(::GetTickCount64(), std::memory_order_relaxed);
+            if (message.message == WM_QUIT) {
+                // 泵消息**不得吞掉宿主自己的退出消息**：PeekMessage 已经把它从队列里取走，而
+                // `DispatchMessage` 对 hwnd 为空的 WM_QUIT 什么都不做——丢掉它等于把宿主的
+                // `GetMessage` 循环变成永远等不到退出的假死（`--third-party-hook-pump` 在收尾之后
+                // 挂住就是这么来的）。重新入队，交给宿主自己的循环；**不 Dispatch**，并且立刻停止
+                // 这一轮泵——重投的 WM_QUIT 会被下一次 PeekMessage 再取到，继续泵就是在反复重投。
+                ::PostQuitMessage(static_cast<int>(message.wParam));
+                break;
+            }
             if (g_ack_window != nullptr && message.hwnd == g_ack_window &&
                 message.message == WM_NULL) {
                 g_ping_in_frame.fetch_add(1, std::memory_order_relaxed);

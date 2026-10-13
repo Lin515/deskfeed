@@ -447,14 +447,13 @@ bool run_ordering_case() {
                         status.hook_installed, status.retired, status.still_installed, status.in_flight,
                         status.pending, status.completion_expected, status.dangling,
                         status.done_signaled);
-    if (status.dangling != 0) {
-        deskfeed::log_line(L"ordering: the hook gate still reports a dangling record");
-        return false;
-    }
-
     if (g_options.mutation_early_done) {
         // 对抗：done 被提前，收尾会在负载的 CallNext 帧里被处理 —— 必须**观察到**这个症状，
         // 否则说明量具根本没咬住。
+        //
+        // 这一段必须在下面的 dangling 判据**之前**：变异路径下负载刻意按"未退休"处理并置
+        // `dangling`（提前置位的完成事件证明不了帧已弹掉），那是这条对抗的**预期结果**，不是失败。
+        // 先看 dangling 就会把每一条变异运行都判成"门还报悬挂"，咬没咬到永远无从得知。
         bool const bit = ack.hits_while_third_party_active > 0 || third.ping_in_frame > 0;
         if (!bit) {
             deskfeed::log_line(L"ordering: the early-done mutation was NOT observable; the "
@@ -463,6 +462,11 @@ bool run_ordering_case() {
         }
         deskfeed::log_line(L"ordering: the early-done mutation is observable (hard failure seen)");
         return true;
+    }
+
+    if (status.dangling != 0) {
+        deskfeed::log_line(L"ordering: the hook gate still reports a dangling record");
+        return false;
     }
 
     // 正常顺序：第三方在 CallNext 里跑过（entries>0），但 ack 绝不能在 CallNext 帧里被处理。
@@ -502,6 +506,11 @@ bool run_on_ui() {
         g_probe.set_host(g_ack);
         if (g_probe.run(g_dump_only ? 1 : 0) != 1) {
             deskfeed::log_line(L"run: the payload did not apply the reading");
+            // 与这一段的其它失败早退一样**放行工作线程**：run 已经返回，UI 线程不会再有别的进展。
+            // 漏掉这一句会让工作线程白等满 30 秒才继续——"没等到信号"于是被伪装成"等了很久才成功"。
+            if (g_ui_done != nullptr) {
+                ::SetEvent(g_ui_done);
+            }
             return false;
         }
         deskfeed::log_line(L"run: ok");
@@ -553,7 +562,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 g_failed = true;
                 deskfeed::log_line(L"the probe faulted on the UI thread");
             }
-            ::DestroyWindow(window);
+            // 这里**不销毁**宿主窗口：它（连同作为它子窗口的 ack 窗口）必须活到
+            // `--third-party-hook-pump` / `--hang-ui-ms` / `--feed` 的收尾之后——负载的
+            // `hook_post_retire` 要向"属于同一个 T 与同一个进程的窗口"发那次证明帧已弹掉的 ping。
+            // 早先在这里 `DestroyWindow` 会把 ack 窗口一起带走，`resolve_ack_window` 于是回退到
+            // 真实的 `Shell_TrayWnd`，被 PID 判据拒绝 ⇒ `retire=0 / ack_hits=0`，而且 worker 末尾
+            // 那次 `WM_CLOSE` 变成对已销毁窗口的空投 ⇒ UI 线程永远等不到退出消息。
+            // 结束消息循环是**工作线程**的事：它的每一条返回路径都发 `WM_CLOSE`（BLOCKED、装载
+            // 失败、feed 的每条收尾路径与结构自测的末尾），收到它才 `DestroyWindow` + 退出。
             return 0;
         case kHangMessage:
             // 停在窗口过程里 = 这条线程不检索消息。负载的钩子记录留在链上，收尾会超时（0）。
@@ -1447,6 +1463,12 @@ DWORD WINAPI worker_entry(LPVOID) {
             deskfeed::log_format(L"stop (retry, must be 1 = retired) -> %lu", retry);
             ok = ok && retry == 1;
             g_feed_retired = retry == 1;
+            // 收尾门禁读的是 `g_feed_stop_ran && g_feed_stop_result == 1`，而 `finish_feed()` 在
+            // `g_feed_retired` 为真时直接返回——所以"生产 Stop 真的跑过、结论是可以卸载"必须在
+            // **这里**记下来。漏记过一次：短超时 0 与重试 1 都拿到了、状态 POD 也报
+            // `unload_safe=1 / dangling=0`，门禁却因 ran=0 把模块留在映射里，白判一次未退休。
+            g_feed_stop_ran = true;
+            g_feed_stop_result = retry;
             if (!ok) {
                 g_failed = true;
             }

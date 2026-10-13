@@ -945,15 +945,9 @@ bool apply_task(bool allow_placeholder, bool& visible, std::wstring& error) {
     Colors const colors = colors_for(light_taskbar(g_state.tray_element));
     double const max_width = block_max_width();
 
-    if (content.rows.empty()) {
-        // 没有可显示的条目：把块摘掉（整块隐藏），之后读数回来时会用已经持有的元素补插。
-        if (g_state.block != nullptr) {
-            remove_block();
-        }
-        visible = false;
-        return true;
-    }
-
+    // 首次解析并持有托盘元素必须在"条目为空就摘块"这个判断**之前**：诊断连接只走查一次、随后立刻
+    // 关闭，而合法的 Waiting/[]（刚开始取数、还没有条目）同样是有效读数。这一次不把元素拿住，
+    // 之后的正常快照就再也插不进去——`request_update` 只能用已持有的元素补插，绝不重连、绝不重走查。
     if (g_state.tray_element == nullptr) {
         winrt::Windows::Foundation::IInspectable element{nullptr};
         if (!resolve_tray_element(element, error)) {
@@ -967,6 +961,15 @@ bool apply_task(bool allow_placeholder, bool& visible, std::wstring& error) {
         g_tray_element_held.store(true);
         log_format(L"resolved %s (held for the whole run; the diagnostics are closed right after this)",
                    winrt::get_class_name(g_state.tray_element).c_str());
+    }
+
+    if (content.rows.empty()) {
+        // 没有可显示的条目：把块摘掉（整块隐藏），元素照旧持有；读数回来时由 `request_update` 补插。
+        if (g_state.block != nullptr) {
+            remove_block();
+        }
+        visible = false;
+        return true;
     }
 
     if (g_state.block == nullptr) {
@@ -1129,8 +1132,11 @@ bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
         log_format(L"reg hook: restore failed: %s", restore_error.c_str());
     }
 
-    g_attached.store(watched && g_block_present.load());
-    return watched && g_block_present.load();
+    // 成功的判据是"走查成功 + 真的持有了托盘元素"，**不是**"此刻树上有一个块"：首次读数是合法的
+    // Waiting/[] 时块本来就不该在（`xaml_block_present` 独立表达这件事），把"当前没有块"当成 attach
+    // 失败会让负载随后丢掉每一个正常快照。
+    g_attached.store(watched && g_tray_element_held.load());
+    return watched && g_tray_element_held.load();
 }
 
 bool taskbar_xaml_request_update(deskfeed::ReadingContent const& content) {

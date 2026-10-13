@@ -819,6 +819,35 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         cleared.frames.push_back(content_frame({}));  // 空列表：清空，不是 ERROR
         cleared.expect_block = false;
         cleared.expect_absent = L"ERROR";
+    } else if (script == L"waiting-first") {
+        // 首次 attach 时邮箱里就是合法的 Waiting/[] 帧（刚开始取数、还没有条目），正常快照随后才来。
+        // 这条路径曾经整条断掉：负载在"条目为空就摘块"处提前返回，没在那唯一一次走查里解析并持有托盘
+        // 元素，诊断随即关闭 ⇒ 之后的正常帧永远插不进去（真机上表现为 attach 失败 + 每 250 ms 一次
+        // "update dropped"）。这里逐步发真实帧，每一步都由宿主的 UI 线程读**自己那棵树**判定。
+        FeedStep& waiting = step(L"waiting-first/waiting-frame-no-block");
+        waiting.frames.push_back(make_waiting_frame());  // 0 行、Waiting：不显示读数，也不显示 ERROR
+        waiting.expect_block = false;
+
+        FeedStep& first = step(L"waiting-first/first-content");
+        first.frames.push_back(cpu_frame("WF-1", "waiting-first detail"));
+        first.expect_contains = L"WF-1";
+        first.tone = 1;  // 第一次看到正常档：记录基准，后续必须回到同一个色
+        first.tone_subject = L"WF-1";
+
+        FeedStep& second = step(L"waiting-first/second-content");
+        second.frames.push_back(cpu_frame("WF-2", "waiting-first detail 2"));
+        second.expect_contains = L"WF-2";
+        second.absent_values.push_back(L"WF-1");  // 第二次变化必须整份替换，不是把旧值留着
+
+        FeedStep& cleared = step(L"waiting-first/clear-empty");
+        cleared.frames.push_back(content_frame({}));  // 合法空列表：清空（不是 ERROR）
+        cleared.expect_block = false;
+
+        FeedStep& fresh = step(L"waiting-first/fresh-after-clear");
+        fresh.frames.push_back(cpu_frame("WF-3", "waiting-first detail 3"));
+        fresh.expect_contains = L"WF-3";
+        fresh.tone = 1;  // 清空后的新快照必须真的恢复，且回到已记录的正常档
+        fresh.tone_subject = L"WF-3";
     } else if (script == L"ownerdeath") {
         // 生产者进程死亡与"正常 closed"是**两条**不同的清块路径：这一条要求邮箱的属主是**另一个
         // 进程**，宿主自己活着。帧必须由辅助生产者进程发（探针自己不建 producer，否则就是自己发

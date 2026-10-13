@@ -140,15 +140,15 @@ site 记的引用已经由负载在解析阶段还清。数到 0 说明多还了
   `--balance-check`、`--dump-only`、`--hook`、`--third-party-hook-pump`、`--install-race`、
   `--hang-ui-ms`（短超时 0、恢复后重试 1）；`--feed` 全帧矩阵同样通过（默认帧、`latest` 的
   baseline → 有界突发 → reorder → omit → 空列表清块 → ERROR 不复活旧值、`warn`/`failure`/`alarm`/
-  `restore`、`closed`、`empty`、`delete`、`ownerdeath` 的属主死后清块），每条都以 `DeskFeedStop -> 1`
+  `restore`、`closed`、`empty`、`delete`、`ownerdeath` 的属主死后清块、
+  `waiting-first` 的"首次读数就是合法 Waiting/[]、随后正常快照恢复"，每条都以 `DeskFeedStop -> 1`
   与 `refs = 1` 收尾，`--feed --hang-ui-ms` 的短超时 0 / 重试 1 也拿到。
-- **两个仍然是红/不稳的点（都在负载侧，探针如实报红，不放宽任何判据）**：
-  * `--feed --cores 2/3` 的引用数会间歇变成 2：负载自己的日志写着 "the diagnostics answered on N
-    port(s)" 却只有 "only N-1 ... attached a site; giving back N-1 module reference(s)"——被应答但
-    没交出 site 的那个诊断端口，它拿走的模块引用没有归还。`--feed --cores 1` 与 `--mock --cores
-    1/2/3` 都稳定是 1。
+- **一个仍然是红/不稳的点（在探针侧，判据未放宽）**：
   * `--mutation-early-done` 的咬合是**竞态**：收尾那次 ping 必须正好落在负载的 `CallNext` 帧里才会
     被记进 `ack_in_frame` / `ping_in_frame`，所以判据是"多次运行里观察到过"；单次没咬到会如实打印
     "NOT observable"，观察到一次即证明 failpoint 的位置正确、量具真的会咬。
+- 曾经红的 `--feed --cores 2/3` 引用数间歇为 2 已在负载侧修掉：走查前先等本轮应答的端口把站点交齐
+  （`xaml_tap_wait_for_sites`，上限仍是原来的 3 秒），之后的 Debug/Release `--cores 2/3` 各 20 轮
+  90/90 全绿，每轮"应答端口数 = 交出站点数 = 归还引用数"。
 - ownerdeath 需要与探针同目录的辅助生产者可执行文件，retained-fixture 门禁用例需要退休门禁夹具
   DLL；两者是独立的构建目标（源码在 `tests/`），缺了就是真的没跑，不软跳过。

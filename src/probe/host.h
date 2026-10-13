@@ -60,7 +60,7 @@ inline bool probe_scope_ok(std::wstring const& scope, std::wstring& error) {
 inline bool frame_script_known(std::wstring const& name) {
     return name == L"latest" || name == L"warn" || name == L"failure" || name == L"alarm" ||
            name == L"restore" || name == L"closed" || name == L"empty" || name == L"delete" ||
-           name == L"ownerdeath";
+           name == L"ownerdeath" || name == L"waiting-first";
 }
 
 // 跑一次自测宿主。返回 0 表示按预期完成（对抗用例里"观察到对抗症状"也算按预期）。

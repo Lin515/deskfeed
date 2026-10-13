@@ -107,11 +107,17 @@ void clear_status_producer() {
 
 // 负载线程 attach 成功之后登记身份：dup 一份**独立**的生产者进程句柄。之后任何查询都不再需要
 // 那个栈上的 `DisplayFrameConsumer` 还活着。
+//
+// dup 必须带 `DUPLICATE_SAME_ACCESS`：消费端打开生产者进程时拿的是
+// `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`（见 display/mailbox.cpp 的
+// `open_process_with_start_time`），而 `DuplicateHandle` 在既不给 `dwDesiredAccess`、
+// 又不给 `DUPLICATE_SAME_ACCESS` 时复制出来的是**零权限**句柄——`WaitForSingleObject`、
+// `GetProcessId`、`GetProcessTimes` 会全部失败，状态 POD 于是假报"生产者已经不在了"。
 void publish_status_producer(HANDLE producer) {
     HANDLE duplicate = nullptr;
     if (producer != nullptr) {
         if (::DuplicateHandle(::GetCurrentProcess(), producer, ::GetCurrentProcess(), &duplicate, 0,
-                              FALSE, 0) == FALSE) {
+                              FALSE, DUPLICATE_SAME_ACCESS) == FALSE) {
             duplicate = nullptr;
         }
     }
@@ -641,8 +647,10 @@ bool payload_get_status(PayloadStatusPod& pod) {
         ::AcquireSRWLockShared(&g_status_lock);
         pod.started = g_status_started;
         if (g_status_producer != nullptr) {
+            // 同一口径：这份快照句柄也要够权限（`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`），
+            // 否则下面三个查询全失败，POD 会假报生产者已退出。
             ::DuplicateHandle(::GetCurrentProcess(), g_status_producer, ::GetCurrentProcess(),
-                              &producer, 0, FALSE, 0);
+                              &producer, 0, FALSE, DUPLICATE_SAME_ACCESS);
         }
         // scope 与 identity 在**同一把锁**里读走，保证它们属于同一代。
         for (std::size_t index = 0; index < kPayloadScopeCapacity; ++index) {

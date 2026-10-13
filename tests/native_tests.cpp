@@ -1747,6 +1747,28 @@ int child_hook_events_released() {
 //     的 own 窗口，再照上面装一次钩子 ⇒ Stop 仍必须是 1（回退那条路会选成真实托盘 ⇒ 0）。
 //
 // 这一个子用例返回 Stop 的返回值；-1 表示前置步骤没走到（调用方据此判红）。
+// 从本进程的显示邮箱帧头里取生产者身份（PID + 进程创建时间）。这两个字段在 `create` 之后不再改写，
+// 所以稳定读取即可；这里只读打开，不碰负载的状态 ABI，也不解析帧体。
+bool read_mailbox_producer_identity(std::wstring const& scope, std::uint64_t& pid,
+                                    std::uint64_t& created) {
+    HANDLE const mapping =
+        ::OpenFileMappingW(FILE_MAP_READ, FALSE, deskfeed::display_frame_map_name(scope).c_str());
+    if (mapping == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    auto const* header = static_cast<deskfeed::FrameSharedHeader const*>(
+        ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(deskfeed::FrameSharedHeader)));
+    if (header != nullptr) {
+        pid = header->producer_pid;
+        created = header->producer_start_time;
+        ok = pid != 0 && created != 0;
+        ::UnmapViewOfFile(header);
+    }
+    ::CloseHandle(mapping);
+    return ok;
+}
+
 DWORD probe_target_round(SyntheticUiThread& ui, deskfeed::DisplayFrameProducer& producer, HWND island,
                          bool destroy_island, HWND live_ack, std::wstring const& scope,
                          std::string const& tag) {
@@ -1819,6 +1841,28 @@ DWORD probe_target_round(SyntheticUiThread& ui, deskfeed::DisplayFrameProducer& 
         }
         check(attached, (tag + ": the payload attached the display mailbox").c_str());
         ok = attached;
+    }
+    if (ok) {
+        // 生产者身份回归（真进程句柄路径，不手工填 POD、不猜 PID）：生产者就是本进程自己持有的
+        // `DisplayFrameProducer`；负载打开它时用的是 `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`，
+        // 再把那份句柄 dup 进状态快照。dup 若不给 `DUPLICATE_SAME_ACCESS`，快照句柄就是零权限的：
+        // `WaitForSingleObject`/`GetProcessId`/`GetProcessTimes` 全部失败，POD 于是假报
+        // `producer_alive=0`、pid=0、创建时间=0（注入器 `--status` 据此把活着的负载判成 inactive）。
+        // 期望值取自邮箱帧头与真实进程，所以这条断言在零权限 mutation 下必然咬。
+        std::uint64_t header_pid = 0;
+        std::uint64_t header_created = 0;
+        bool const have_header = read_mailbox_producer_identity(scope, header_pid, header_created);
+        check(have_header, (tag + ": the mailbox header carries the producer identity").c_str());
+        deskfeed::payload::PayloadStatusPod pod{};
+        check(query_status(api.get, pod), (tag + ": GetStatus answers while the producer is alive").c_str());
+        std::uint64_t const pod_pid =
+            (static_cast<std::uint64_t>(pod.producer_pid_high) << 32) | pod.producer_pid_low;
+        check(pod.producer_alive == 1,
+              (tag + ": the status POD sees the live producer through a real process handle").c_str());
+        check(pod_pid == header_pid && pod_pid == ::GetCurrentProcessId(),
+              (tag + ": the status POD producer pid matches the mailbox header and this process").c_str());
+        check(header_created != 0 && pod.producer_start_time == header_created,
+              (tag + ": the status POD producer creation time matches the mailbox header").c_str());
     }
 
     DWORD stop_code = static_cast<DWORD>(-1);

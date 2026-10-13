@@ -126,6 +126,15 @@ site 记的引用已经由负载在解析阶段还清。数到 0 说明多还了
 
 ## 已知前提与未验证项
 
+- `--feed` 的树判定除了文字与颜色，还读读数块自己的**垂直落位**：`DeskFeedBlock`（Border）与
+  `DeskFeedReading`（TextBlock）的 `VerticalAlignment` 必须是 `Center`，任何"块在树上"的帧都查这一条；
+  已知短内容（`waiting-first` / `latest` 的短帧，见 `FeedStep::strict_center`）还要求块比托盘那一行
+  矮、按内容高度居中之后两侧都还剩得下正的留白。**隐藏窗口里的 XAML 岛不提交 `Arrange`**：岛的内容
+  已经 `Loaded`、`Measure` 也真的算出了内容高度，但 `Arrange` 之后 `ActualHeight` 仍是 0（岛只在
+  自己的渲染/布局回合里落位，而隐藏窗口没有那个回合，宿主又不许露可见窗口）。所以"实际排出来的
+  上下留白"在这个宿主里读不到，落位这一条只在真的排过时（`BlockGeometry::arranged`）才按实际
+  `ActualOffset`/`ActualHeight` 判定；真机上的落位由部署后的真实任务栏验收。
+
 - common ABI（`src/payload/probe_api.h` 的 28/40 字节 POD 与 `src/payload/status_pod.h` 的
   144 字节状态 POD）**只有一个出处**：探针侧只做转发包含 + 别名 + `static_assert`，缺头即编译失败。
 - 缺必需导出时不是"退化为不跑那一条"，而是 **BLOCKED（exit 2）**：一条也不跑，逐条打印缺哪个符号

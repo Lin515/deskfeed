@@ -100,9 +100,8 @@ struct State {
     // 所以它是运行期唯一能碰的任务栏 XAML 入口（补插、验证都用它）。只在任务栏线程上被碰。
     wux::FrameworkElement tray_element{nullptr};
 
-    // 悬停命中模型：每个条目在块内的矩形与它的 tip，以及"块内但不属于任何条目"时的整份详情。
+    // 悬停命中模型：每个条目在块内的矩形与它**自己**的 tip（为空表示这一条没有可显示的提示）。
     std::vector<HoverCell> hover_cells;
-    std::wstring hover_detail;
     int hover_last_hit = -2;
     double hover_width = 0.0;
     double hover_height = 0.0;
@@ -407,21 +406,14 @@ void rebuild_hover_model(deskfeed::ReadingContent const& content, ReadingPlan co
     g_state.hover_last_hit = -2;
 
     std::vector<deskfeed::ReadingLine> const lines = deskfeed::reading_pack(content, plan.per_line);
-    std::wstring detail;
-    for (deskfeed::ReadingRow const& row : content.rows) {
-        if (!row.detail.empty()) {
-            if (!detail.empty()) {
-                detail += L"\n";
-            }
-            detail += to_wide(row.label.empty() ? row.value : row.label + " " + row.value);
-            detail += L"\n  " + to_wide(row.detail);
-        }
-    }
-    g_state.hover_detail = detail;
+    // 行高必须**按同一次测量的实际高度**算：`plan.height` 是这整块文字量出来的总高度，除以行数
+    // 就是每行占的高度。拿一段文字的**宽度**（`segment_width` 量的是 `DesiredSize().Width`）当
+    // 行高会让纵向命中落到别的行上。
+    double const line_height =
+        plan.lines > 0 ? plan.height / static_cast<double>(plan.lines) : 0.0;
 
     double top = 0.0;
     for (deskfeed::ReadingLine const& line : lines) {
-        double const line_height = segment_width(L"Xg", plan.font);
         double left = 0.0;
         for (size_t index = 0; index < line.segments.size(); ++index) {
             deskfeed::ReadingRow const& row = line.segments[index];
@@ -429,8 +421,8 @@ void rebuild_hover_model(deskfeed::ReadingContent const& content, ReadingPlan co
             double const row_width =
                 segment_width(prefix + to_wide(row.value), plan.font);
             HoverCell cell;
-            cell.tip = row.tip.empty() ? deskfeed::wide_from_utf8(deskfeed::reading_line_tip(line))
-                                       : to_wide(row.tip);
+            // 每个格子只带**它自己那个条目**的提示：为空就是空，不借同一行其它条目的提示。
+            cell.tip = to_wide(row.tip);
             cell.left = left;
             cell.right = left + row_width;
             cell.top = top;
@@ -704,9 +696,16 @@ void on_pointer_moved(wuxc::Border const& block, wuxi::PointerRoutedEventArgs co
         }
         g_state.hover_last_hit = hit;
 
-        std::wstring const& text = hit >= 0 ? g_state.hover_cells[static_cast<size_t>(hit)].tip
-                                            : g_state.hover_detail;
-        if (text.empty() || g_tooltip == nullptr) {
+        // 只有**命中具体条目**才显示提示。指针在节点之外（条目之间的分隔符、行长之后的空白、
+        // 块的边缘）时什么都不显示：这里绝不退回"整块详情"，那会让指针在节点之间移动时忽然
+        // 抽出一大块内容并来回闪。
+        if (hit < 0) {
+            hide_tip();
+            return;
+        }
+        // 条目自己没有 detail 就是没有可显示的东西：不借同一行别的条目的提示，直接隐藏。
+        std::wstring const& text = g_state.hover_cells[static_cast<size_t>(hit)].tip;
+        if (text.empty()) {
             hide_tip();
             return;
         }
@@ -758,12 +757,15 @@ bool insert_into(wux::FrameworkElement const& tray_element, deskfeed::ReadingCon
                  Colors const& colors, ReadingPlan const& plan, double max_width, std::wstring& error) {
     g_state.block = wuxc::Border();
     g_state.block.Name(kBlockName);
+    // 托盘那一行比读数高，块必须自己在行里居中：默认的 Stretch 会把它拉满整行、文字顶到上沿。
+    g_state.block.VerticalAlignment(wux::VerticalAlignment::Center);
     g_state.label = wuxc::TextBlock();
     g_state.label.Name(kReadingName);
     g_state.label.FontSize(plan.font);
     // 常规字重：前缀与数值只用取色区分。
     g_state.label.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
     g_state.label.TextTrimming(wux::TextTrimming::CharacterEllipsis);
+    g_state.label.VerticalAlignment(wux::VerticalAlignment::Center);
     g_state.label.MaxWidth(max_width);
 
     std::vector<Segment> const segments = reading_segments(content, colors, plan.per_line);
@@ -847,7 +849,6 @@ void remove_block() {
     g_state.runs.clear();
     g_state.applied.clear();
     g_state.hover_cells.clear();
-    g_state.hover_detail.clear();
     g_state.hover_last_hit = -2;
     g_block_present.store(false);
     hide_tip();

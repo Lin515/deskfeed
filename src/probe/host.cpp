@@ -32,6 +32,7 @@
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <atomic>
+#include <cmath>
 #include <vector>
 
 namespace deskfeed::probe {
@@ -637,6 +638,10 @@ struct FeedStep {
     bool owner_death = false;    // 这一批帧由**辅助生产者进程**持有邮箱（探针自己不建 producer）
     bool kill_owner = false;     // 判定前真的结束辅助生产者进程（不是发一个 closed 帧冒充）
     bool expect_block = true;
+    // 已知是**短内容**（一两行，块比托盘那一行矮）的帧：除了要求两条 `VerticalAlignment` 是
+    // `Center`，还要求真的排出**正的**上下留白。没标这一条的帧不做绝对高度断言——合法内容
+    // 恰好占满整行时上下留白都是 0，"居中"与"顶对齐"在几何上无从区分。
+    bool strict_center = false;
     wchar_t const* expect_contains = L"";
     wchar_t const* expect_absent = L"";
     std::vector<std::wstring> absent_values;  // 这些子串全部不得出现（排队/复活/残留检查）
@@ -700,6 +705,7 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         first.expect_contains = L"54C";
         first.tone = 1;
         first.tone_subject = L"54C";
+        first.strict_center = true;  // 一个条目 = 一行短内容，块必须真的居中留白
         // **真实有界突发**：一次发 8 帧再判定。邮箱只保留最新一帧 ⇒ 树上只能是 burst-8；若通道
         // 排队积压，前面任何一帧都会被抓到。这就是"不排队"的机械证据，不是把期望调绿的措辞。
         FeedStep& burst = step(L"latest/bounded-burst");
@@ -708,6 +714,7 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
                                              "burst detail " + std::to_string(index)));
         }
         burst.expect_contains = L"burst-8";
+        burst.strict_center = true;  // 一个条目 = 一行短内容
         for (int index = 1; index < kBurstFrames; ++index) {
             burst.absent_values.push_back(L"burst-" + std::to_wstring(index));
         }
@@ -720,6 +727,7 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         reorder.expect_contains = L"61%";
         reorder.order_first = L"61%";
         reorder.order_second = L"54C";
+        reorder.strict_center = true;  // 两个条目在自动折行下仍是同一行短内容
         reorder.absent_values.push_back(L"burst-8");
 
         // 未出现的旧条目立即消失（完整替换，不是增量补丁）。
@@ -833,10 +841,12 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         first.expect_contains = L"WF-1";
         first.tone = 1;  // 第一次看到正常档：记录基准，后续必须回到同一个色
         first.tone_subject = L"WF-1";
+        first.strict_center = true;  // 一个条目 = 一行短内容
 
         FeedStep& second = step(L"waiting-first/second-content");
         second.frames.push_back(cpu_frame("WF-2", "waiting-first detail 2"));
         second.expect_contains = L"WF-2";
+        second.strict_center = true;  // 一个条目 = 一行短内容
         second.absent_values.push_back(L"WF-1");  // 第二次变化必须整份替换，不是把旧值留着
 
         FeedStep& cleared = step(L"waiting-first/clear-empty");
@@ -846,6 +856,7 @@ void build_feed_steps(std::wstring const& script, std::vector<FeedStep>& out) {
         FeedStep& fresh = step(L"waiting-first/fresh-after-clear");
         fresh.frames.push_back(cpu_frame("WF-3", "waiting-first detail 3"));
         fresh.expect_contains = L"WF-3";
+        fresh.strict_center = true;  // 一个条目 = 一行短内容
         fresh.tone = 1;  // 清空后的新快照必须真的恢复，且回到已记录的正常档
         fresh.tone_subject = L"WF-3";
     } else if (script == L"ownerdeath") {
@@ -940,15 +951,138 @@ void log_hook_status(wchar_t const* when) {
                          stage.sequence, stage.complete);
 }
 
+// 读数块在托盘那一行里的**实际落位**。"属性写了 Center"与"真的居中"是两件事，所以两类都要读：
+// 读数块在托盘那一行里的**实际落位**。"属性写了 Center"与"真的居中"是两件事，所以两类都要读。
+//
+// 隐藏窗口里的 XAML 岛**不提交 Arrange**：`ActualHeight` / `ActualOffset` 恒为 0（实测：岛的内容
+// 已 Loaded、`Measure` 也真的算出了内容高度，但 `Arrange` 之后 `ActualHeight` 还是 0；岛只在
+// 自己那条渲染/布局回合里落位，而隐藏窗口没有那个回合，宿主又不许露可见窗口）。所以这里分开记：
+// `arranged` 为真时 `block_top` / `block_height` 是**真的排出来的**落位；为假时 `block_height` 是
+// 同一条测量路径（`DesiredSize`）量出来的**真实内容高度**，而落位本身读不到。
+struct BlockGeometry {
+    bool have = false;
+    bool block_center = false;
+    bool label_center = false;
+    bool arranged = false;
+    double row_height = 0.0;   // 托盘那一行的高度（DIP）；隐藏宿主里用岛的客户区
+    double block_top = 0.0;    // 仅 `arranged` 时有意义
+    double block_height = 0.0;
+};
+
+// 居中容差（DIP）：布局把 DIP 算成浮点，上下留白允许有亚像素级差异。
+constexpr double kCenterTolerance = 1.5;
+
+// 真实居中判据。分三层，尺度由弱到强：
+//   1) 两条 `VerticalAlignment` 必须是 `Center` —— 与内容高低无关，任何"块在树上"的帧都必须成立；
+//   2) 块真的比整行矮（无论这个"矮"是排出来的还是量出来的）时，上下留白必须相等 —— 块占满整行时
+//      两个留白本来都是 0，那不是"没居中"，所以这一条只在块确实比行矮时才检查；
+//   3) 已知短内容的帧还要求两侧留白**都是正的**：这样被证明的是"真的挪到了中间"，而不是
+//      "上下都恰好是 0"。落位读不到时（隐藏宿主），这一条退化成"内容高度居中之后两侧还剩得下
+//      正的留白"，用的是同一条测量路径量出来的高度。
+bool block_centered(BlockGeometry const& geometry, bool expect_positive_gap, std::wstring& why) {
+    if (!geometry.have) {
+        why = L"the reading block is in the tree but its geometry could not be read";
+        return false;
+    }
+    if (!geometry.block_center || !geometry.label_center) {
+        why = geometry.block_center ? L"the reading label is not vertically centered"
+                                    : L"the reading block is not vertically centered";
+        return false;
+    }
+    if (!(geometry.block_height > 0.0) || !(geometry.row_height > 0.0)) {
+        why = L"the reading block or the tray row has no measurable height";
+        return false;
+    }
+    if (geometry.arranged) {
+        bool const shorter = geometry.block_height < geometry.row_height - kCenterTolerance;
+        if (shorter || expect_positive_gap) {
+            double const below = geometry.row_height - (geometry.block_top + geometry.block_height);
+            double const floor = expect_positive_gap ? kCenterTolerance : -kCenterTolerance;
+            if (geometry.block_top < floor || below < floor ||
+                std::abs(geometry.block_top - below) > kCenterTolerance) {
+                why = expect_positive_gap
+                          ? L"the reading block does not sit centered with a gap above and below"
+                          : L"the reading block's top and bottom gaps in the tray row are not equal";
+                return false;
+            }
+        }
+        return true;
+    }
+    // 落位读不到：只能证明"按内容高度居中时两侧都还剩得下正的留白"。块比整行还高时居中根本
+    // 无从谈起，这一条因此真的会咬（而它与"块是不是被拉伸"无关，所以在任何内容高低上都成立）。
+    if (expect_positive_gap && geometry.block_height + 2.0 * kCenterTolerance > geometry.row_height) {
+        why = L"the reading block leaves no room to sit centered in the tray row";
+        return false;
+    }
+    return true;
+}
+
+// 布局这条路只在状态变化时打一行，免得每个轮询周期都刷屏。
+void note_host_layout(std::wstring const& text) {
+    static std::wstring logged;
+    if (logged != text) {
+        deskfeed::log_format(L"host layout: %s", text.c_str());
+        logged = text;
+    }
+}
+
+// 隐藏窗口不会自己走到渲染，XAML 因此不会给宿主自己的树提交布局。这里在**宿主自己的树**上催一次
+// 真实测量：`InvalidateMeasure` + `Measure`（约束 = 岛的客户区）。`DesiredSize` 是 XAML 自己算出来
+// 的内容高度，不是探针重算的公式；`Arrange` 也照样发出去，但隐藏岛里它不落位（见上面的说明）。
+bool force_host_layout() {
+    if (g_tray_grid == nullptr || g_window == nullptr) {
+        note_host_layout(L"no tree or no host window");
+        return false;
+    }
+    try {
+        g_tray_grid.UpdateLayout();
+        if (g_tray_grid.ActualHeight() > 0.0) {
+            note_host_layout(L"the framework laid the tree out itself");
+            return true;
+        }
+        RECT client{};
+        if (::GetClientRect(g_window, &client) == FALSE || client.right <= 0 || client.bottom <= 0) {
+            note_host_layout(L"the host window has no client area");
+            return false;
+        }
+        // 客户区像素直接当 DIP 用：这只是给布局一个比读数块宽的约束，判据（两个留白相等 / 留白为正）
+        // 与缩放无关。
+        auto const width = static_cast<float>(client.right);
+        auto const height = static_cast<float>(client.bottom);
+        // 从岛的内容根（托盘格的父级）往下量：托盘格因此是被真实布局代码量出来的，而不是由一个
+        // "看起来量过"的中间状态出来的。先失效，否则框架会认为它已经量好而直接跳过。
+        auto root = g_tray_grid.Parent().try_as<wux::FrameworkElement>();
+        wux::FrameworkElement target = root != nullptr ? root : g_tray_grid;
+        target.InvalidateMeasure();
+        target.InvalidateArrange();
+        target.Measure(winrt::Windows::Foundation::Size{width, height});
+        target.Arrange(winrt::Windows::Foundation::Rect{0.0f, 0.0f, width, height});
+        note_host_layout(L"measured with a " + std::to_wstring(static_cast<int>(width)) + L"x" +
+                         std::to_wstring(static_cast<int>(height)) +
+                         L" constraint -> tray desired " +
+                         std::to_wstring(static_cast<int>(g_tray_grid.DesiredSize().Height)) +
+                         L", arranged height " +
+                         std::to_wstring(static_cast<int>(g_tray_grid.ActualHeight())) + L" (loaded " +
+                         std::to_wstring(g_tray_grid.IsLoaded() ? 1 : 0) + L")");
+        return true;
+    } catch (winrt::hresult_error const& failure) {
+        note_host_layout(L"layout threw " + deskfeed::hresult_text(failure.code()));
+        return false;
+    }
+}
+
 // UI 线程：读宿主自己的树。返回 false 表示这棵树根本读不到（宿主自己的对象，那是内部错误）。
 bool read_own_tree(bool& present, std::wstring& text,
-                   std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>>& runs) {
+                   std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>>& runs,
+                   BlockGeometry& geometry) {
     present = false;
     text.clear();
     runs.clear();
+    geometry = BlockGeometry{};
     if (g_tray_grid == nullptr) {
         return false;
     }
+    force_host_layout();
     auto children = g_tray_grid.Children();
     for (std::uint32_t index = 0; index < children.Size(); ++index) {
         auto element = children.GetAt(index).try_as<wux::FrameworkElement>();
@@ -963,6 +1097,25 @@ bool read_own_tree(bool& present, std::wstring& text,
         auto label = border.Child().try_as<wuxc::TextBlock>();
         if (label == nullptr) {
             continue;
+        }
+        try {
+            geometry.have = true;
+            geometry.block_center = border.VerticalAlignment() == wux::VerticalAlignment::Center;
+            geometry.label_center = label.VerticalAlignment() == wux::VerticalAlignment::Center;
+            // 岛的客户区就是这一行拿得到的高度；量不到就退回托盘格自己的高度。
+            RECT client{};
+            if (g_window != nullptr && ::GetClientRect(g_window, &client) != FALSE && client.bottom > 0) {
+                geometry.row_height = static_cast<double>(client.bottom);  // 像素当 DIP：判据是比例关系
+            } else {
+                geometry.row_height = g_tray_grid.ActualHeight();
+            }
+            geometry.arranged = border.ActualHeight() > 0.0;
+            // `ActualOffset` 是 C++/WinRT 投影里的 `float3`，字段名是小写的 x/y/z。
+            geometry.block_top = geometry.arranged ? border.ActualOffset().y : 0.0;
+            geometry.block_height =
+                geometry.arranged ? border.ActualHeight() : border.DesiredSize().Height;
+        } catch (winrt::hresult_error const&) {
+            geometry = BlockGeometry{};
         }
         auto inlines = label.Inlines();
         for (std::uint32_t at = 0; at < inlines.Size(); ++at) {
@@ -1003,13 +1156,37 @@ bool evaluate_step(FeedStep const& step, std::wstring& why) {
     bool present = false;
     std::wstring text;
     std::vector<std::pair<std::wstring, winrt::Windows::UI::Color>> runs;
-    if (!read_own_tree(present, text, runs)) {
+    BlockGeometry geometry;
+    if (!read_own_tree(present, text, runs, geometry)) {
         why = L"the host's own XAML tree is not reachable";
         return false;
     }
     if (present != step.expect_block) {
         why = present ? L"a block is still in the host's tree" : L"no block was inserted into the host's tree";
         return false;
+    }
+    if (present) {
+        // 块在树上就必须**真的**垂直居中（不只是属性写了 Center）。这一条在每一步都查：居中是被
+        // 反复重建的布局事实，只在第一步查会漏掉后续刷新里被写回去的情况。落位变化时打一行，
+        // 好让日志里留下"真排出来多少"的证据，而不是只留一句结论。
+        static double logged_tray = -1.0;
+        static double logged_top = -1.0;
+        static double logged_height = -1.0;
+        auto moved = [](double left, double right) { return std::abs(left - right) > 0.05; };
+        if (moved(logged_tray, geometry.row_height) || moved(logged_top, geometry.block_top) ||
+            moved(logged_height, geometry.block_height)) {
+            deskfeed::log_format(L"reading geometry: row=%.1f arranged=%u block_top=%.1f "
+                                 L"block_height=%.1f block_center=%u label_center=%u",
+                                 geometry.row_height, geometry.arranged ? 1u : 0u, geometry.block_top,
+                                 geometry.block_height, geometry.block_center ? 1u : 0u,
+                                 geometry.label_center ? 1u : 0u);
+            logged_tray = geometry.row_height;
+            logged_top = geometry.block_top;
+            logged_height = geometry.block_height;
+        }
+        if (!block_centered(geometry, step.strict_center, why)) {
+            return false;
+        }
     }
     if (!step.expect_block) {
         // 树上确实没有块 ⇒ 读回来的文字就是空的，`expect_absent` 在这里天然空集（不是被忽略）。

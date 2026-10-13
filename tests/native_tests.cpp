@@ -2222,6 +2222,92 @@ void test_guard_recovery_table() {
           "guard: an unknown snapshot stays uncertain");
 }
 
+// ---------------------------------------------------------- 悬停的"对应节点"约束
+//
+// 悬停提示的命中路径只在**真任务栏**上跑得到：`PointerRoutedEventArgs` 造不出来，探针又不许移动
+// 真实光标。所以这里不做"把命中逻辑抄一份到用例里"的假用例——镜像一份逻辑等于两边可以各错各的；
+// 改做**源码反例**判定：两条回归（指针不在任何条目上也显示整块详情；没有 detail 的条目借用同一行
+// 其它条目的提示）在源码里各只有一种写法，改回去就一定被这里咬住。行为本身由真机肉眼验收，
+// 这条只保证回归不会被悄悄写回来。
+bool find_production_source(std::wstring& path) {
+    wchar_t buffer[MAX_PATH]{};
+    DWORD const length = ::GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) {
+        return false;
+    }
+    std::wstring directory(buffer, length);
+    for (int level = 0; level < 6; ++level) {
+        std::size_t const separator = directory.find_last_of(L"\\/");
+        if (separator == std::wstring::npos) {
+            return false;
+        }
+        directory = directory.substr(0, separator);
+        std::wstring const candidate = directory + L"\\src\\payload\\taskbar_xaml.cpp";
+        if (::GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            path = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string slice_between(std::string const& text, char const* begin, char const* end) {
+    std::size_t const from = text.find(begin);
+    if (from == std::string::npos) {
+        return std::string();
+    }
+    std::size_t const to = text.find(end, from);
+    return to == std::string::npos ? std::string() : text.substr(from, to - from);
+}
+
+std::size_t count_occurrences(std::string const& text, char const* needle) {
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+        ++count;
+    }
+    return count;
+}
+
+void test_hover_regressions() {
+    if (!name_matches("hover")) {
+        return;
+    }
+    std::wstring path;
+    bool const found = find_production_source(path);
+    check(found, "hover: the production source is reachable for the counterexample check");
+    if (!found) {
+        return;
+    }
+    std::vector<unsigned char> bytes;
+    check(read_file(path, bytes), "hover: the production source can be read");
+    if (bytes.empty()) {
+        return;
+    }
+    std::string const source(bytes.begin(), bytes.end());
+
+    std::string const moved =
+        slice_between(source, "void on_pointer_moved(", "\nvoid attach_interaction(");
+    check(!moved.empty(), "hover: the pointer-moved handler is present");
+    check(moved.find("hover_detail") == std::string::npos,
+          "hover: a pointer that is not on any entry must not show the whole detail");
+    check(moved.find("hide_tip()") != std::string::npos,
+          "hover: a miss, or an entry without a tip, hides the tooltip");
+    check(count_occurrences(moved, "show_tip(") == 1,
+          "hover: the handler shows a tooltip in exactly one place (the entry that was hit)");
+
+    std::string const model =
+        slice_between(source, "void rebuild_hover_model(", "\n// ---------- 悬停提示");
+    check(!model.empty(), "hover: the hover model builder is present");
+    check(model.find("reading_line_tip") == std::string::npos,
+          "hover: an entry without a tip must not borrow another entry's tip from the same line");
+    check(model.find("cell.tip = to_wide(row.tip)") != std::string::npos,
+          "hover: every cell carries its own entry's tip");
+    check(model.find("segment_width(L\"Xg\"") == std::string::npos,
+          "hover: the row height must not be a measured width");
+    check(model.find("plan.height / static_cast<double>(plan.lines)") != std::string::npos,
+          "hover: the row height comes from the same measurement's actual height");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2257,6 +2343,7 @@ int main(int argc, char** argv) {
         test_guard_record_contract();
         test_guard_recovery_table();
         test_guard_child_scenarios();
+        test_hover_regressions();
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failures);

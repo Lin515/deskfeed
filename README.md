@@ -86,6 +86,9 @@ deskfeed-check.exe --file snapshot.json --report json
 deskfeed-check.exe --url "https://example.com/snapshot" --report json
 ```
 
+推送版本 tag（如 `v1.2.3`）后，GitHub Actions 会自动完成 x64 Release 构建、全量测试与 Release
+发布；tag 规则、资产与本地打包方式见 [docs/building.md](<docs/building.md>)。
+
 ## 默认行为与验证现状
 
 - **默认启动就会建立两个显示面**：桌面悬浮窗，以及任务栏组件。`[taskbar] component` 默认为

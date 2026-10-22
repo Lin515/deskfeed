@@ -3,6 +3,7 @@ build/
 build-*/
 .agent/
 out/
+dist/
 *.user
 CMakeUserPresets.json
 .vs/

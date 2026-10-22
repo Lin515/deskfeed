@@ -20,7 +20,9 @@
 - `README.md` — 面向用户的说明：运行前提、快速开始、默认行为与验证现状、安全边界、许可。
 - `AGENTS.md` — 本文件。
 - `LICENSE` — MIT，版权署名 Lin515。
-- `.gitignore` — 忽略 `build*/`、`.agent/`、编辑器与调试产物。
+- `.gitignore` — 忽略 `build*/`、`.agent/`、`dist/`、编辑器与调试产物。
+- `.github/` — 发布自动化：`workflows/release.yml` 在版本 tag 上构建并发布 x64 Release，
+  `scripts/package-release.ps1` 负责打包与 AMD64 校验；两个子目录各有一份 `README.md`。
 - `docs/` — 长期有效的协议、生命周期、配置、测试、构建与架构文档，入口见 `docs/README.md`。
 - `schema/` — 协议的 JSON Schema。
 - `examples/` — 不依赖任何私有生产端的最小生产端示例。

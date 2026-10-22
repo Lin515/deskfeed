@@ -9,7 +9,7 @@
 | [http.md](http.md) | 取数实现：墙钟预算、手工有界重定向、禁降级、200 才接纳、正文上限、错误分类 |
 | [configuration.md](configuration.md) | 设置文件位置与键（含 `[window]` 与 `[taskbar]`）、默认值、原子且不丢其它键的写入、脱敏、隔离开关 |
 | [testing.md](testing.md) | 构建与测试、CTest 用例、离线检查器、mock 生产端、**安全验收流程**，以及各检查点的验证证据 |
-| [building.md](building.md) | 工具链要求、配置/构建/测试命令、产物与交付边界 |
+| [building.md](building.md) | 工具链要求、配置/构建/测试命令、产物与交付边界、tag 发布流程 |
 | [architecture.md](architecture.md) | 四条 seam、模块划分、阶段路线与验证现状 |
 | [taskbar-injection.md](taskbar-injection.md) | 任务栏真嵌入与显示邮箱：实现状态、默认行为、硬性安全约束、已知风险 |
 | [native-safety.md](native-safety.md) | 原生侧安全约束：任务栏线程编组与收尾门禁、进程守卫（租约/入口记录/粘性事件）、`DeskFeedStop` 返回值、导入表改写的已接受残余、范围限定 |

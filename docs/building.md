@@ -57,6 +57,35 @@ ctest --test-dir .agent/build/debug --output-on-failure
 .\.agent\build\debug\bin\deskfeed-tests.exe --filter health
 ```
 
+## 发布（tag）
+
+发布由 [`.github/workflows/release.yml`](../.github/workflows/release.yml) 负责，只对版本 tag 运行：
+
+- tag 形式：`v<major>.<minor>.<patch>`，可带预发布后缀（如 `v1.2.3-rc.1`）；不带前缀 `v` 也接受。
+- 推送 tag 后，工作流在 `windows-2022` 上做一次干净的 x64 Release 构建，跑完整 CTest，再发布
+  GitHub Release。预发布 tag 生成的 Release 会标记为 pre-release。
+
+发布资产：
+
+| 资产 | 内容 |
+| --- | --- |
+| `deskfeed-<tag>-x64.zip` | `deskfeed.exe`、`deskfeed-payload.dll`、`deskfeed-inject.exe`、`README.md`、`LICENSE` |
+| `SHA256SUMS.txt` | zip 的 SHA-256 |
+
+打包脚本 [`.github/scripts/package-release.ps1`](../.github/scripts/package-release.ps1) 会拒绝任何
+不是 AMD64 的交付二进制，zip 只包含上表列出的文件。已有 Release 时重跑工作流会覆盖资产并同步
+标题与预发布标记，不会因为 Release 已存在而失败；也可以在 Actions 页面用 `workflow_dispatch` 填一个
+已有 tag 重新发布。
+
+本地复现打包（先做一份 Release 构建）：
+
+```powershell
+pwsh -NoProfile -File .github/scripts/package-release.ps1 -Tag v1.2.3 -BuildDir .agent/build/release -DistDir .agent/temp/dist
+```
+
+**不发布 x86**：任务栏负载必须与 64 位 `explorer.exe` 同位数，x86 构建没有可注入的目标；注入器与
+PE 解析也按 AMD64 校验。发布包只允许 x64。
+
 ## 注意
 
 - 构建目录里如果还有 `deskfeed.exe` 在跑（例如验收实例），重新链接会报

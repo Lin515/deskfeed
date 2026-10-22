@@ -1,5 +1,7 @@
 # DeskFeed
 
+![image-20261022175451383](docs/demo.png)
+
 DeskFeed 是一个通用的 Windows 桌面信息显示工具：它从**一个**只读 HTTP/HTTPS 端点轮询 JSON 快照，
 把其中的条目按生产端给定的顺序与状态显示出来。桌面悬浮窗与任务栏真嵌入组件是它的两个显示面。
 

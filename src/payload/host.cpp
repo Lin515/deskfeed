@@ -346,6 +346,17 @@ bool retire_gates(unsigned timeout_ms, bool mark_thread_done, std::wstring& deta
 
 // 负载线程真正做的事。收尾（清理事件、卸载门、日志收尾）由外层 `payload_run` 在边界之外负责，
 // 所以这里可以**提前返回**，任何一条路径都不会漏掉收尾。
+// 把显示帧里的托盘屏幕配置交给渲染层。配置是主进程的持久意图：`configured=false` 时渲染层
+// 按“仅主屏”的向后兼容缺省处理；空表则是用户明确选择不在任何任务栏显示。
+void apply_frame_screen_config(Frame const& frame) {
+    std::vector<std::wstring> screens;
+    screens.reserve(frame.screens.size());
+    for (std::string const& screen : frame.screens) {
+        screens.push_back(deskfeed::wide_from_utf8(screen));
+    }
+    taskbar_xaml_set_screen_config(frame.screens_configured, screens);
+}
+
 void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
     (void)module_instance;
 
@@ -376,8 +387,10 @@ void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
     // 第一份读数：主进程启动时就会发一帧，所以任务栏块一出现就是真实内容，不是占位。
     Frame first;
     if (consumer.read(first)) {
+        apply_frame_screen_config(first);
         taskbar_xaml_set_reading(reading_from_frame(first));
     } else {
+        apply_frame_screen_config(Frame{});
         taskbar_xaml_set_reading(reading_from_frame(Frame{}));
     }
 
@@ -395,6 +408,9 @@ void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
 
     unsigned failures = 0;
     bool have_last = consumer.read(first);
+    if (have_last) {
+        apply_frame_screen_config(first);
+    }
     while (!g_stop_requested.load()) {
         run_message_loop(consumer);
         if (g_stop_requested.load()) {
@@ -419,6 +435,7 @@ void payload_run_core(HINSTANCE module_instance, std::wstring const& scope) {
             have_last = true;
             failures = 0;
             g_feed_failures.store(0);
+            apply_frame_screen_config(frame);
             taskbar_xaml_request_update(reading_from_frame(frame));
         } else if (decision == FeedOutcome::Keep) {
             ++failures;

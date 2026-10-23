@@ -105,6 +105,7 @@ add_library(deskfeed_platform STATIC
     src/platform/console.cpp
     src/platform/log.cpp
     src/platform/paths.cpp
+    src/platform/screens.cpp
     src/platform/user_scope.cpp
     src/platform/win32_util.cpp
 )
@@ -154,6 +155,7 @@ add_library(deskfeed_display STATIC
     src/display/frame.cpp
     src/display/mailbox.cpp
     src/display/reading.cpp
+    src/display/taskbar_layout.cpp
 )
 target_link_libraries(deskfeed_display PUBLIC deskfeed_core deskfeed_platform)
 

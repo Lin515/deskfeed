@@ -40,6 +40,11 @@ enum class ControlOp : std::uint32_t {
     // 收到了 200。窗口过程在这里绝不做网络或磁盘工作，也不等待。
     Refresh = 3,     // args 为空：立刻对**当前**地址取一次数（不追加任何参数、不改调度）
     ShowWidget = 4,  // args 为空：把桌面悬浮窗叫出来（主进程负责取消隐藏意图并落盘）
+    // 托盘屏幕配置：args 是完整的启用屏幕标识表（0..kMaxTaskbarScreens 项）。
+    // 0 项表示用户明确选择“不在任何任务栏显示”；配置落盘后主进程会重发显示帧，
+    // 负载据此增删各屏幕上的块。**退化（某屏幕不可用而落到主屏）不会发这个动作**，
+    // 所以它永远不会改写配置。
+    SetScreens = 5,
 };
 
 enum class ControlReply : std::intptr_t {

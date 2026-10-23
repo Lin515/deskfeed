@@ -27,6 +27,7 @@
 #include "core/utf8.h"
 #include "display/frame.h"
 #include "display/mailbox.h"
+#include "display/taskbar_layout.h"
 #include "ipc/binding.h"
 #include "ipc/command.h"
 #include "ipc/control_channel.h"
@@ -597,6 +598,16 @@ TEST(control_roundtrip) {
     CHECK_EQ(decoded.sender_pid, 4321U);
     CHECK_EQ(decoded.args.size(), static_cast<std::size_t>(4));
     CHECK_EQ(decoded.args[2], std::wstring(L"--pid"));
+
+    ControlRequest screens;
+    screens.op = ControlOp::SetScreens;
+    screens.sender_pid = 77;
+    screens.args = {L"\\\\?\\DISPLAY#A#1", L"\\\\?\\DISPLAY#B#2"};
+    std::string screens_error;
+    CHECK(control_decode(control_encode(screens), decoded, screens_error));
+    CHECK(decoded.op == ControlOp::SetScreens);
+    CHECK_EQ(decoded.args.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(decoded.args[1], std::wstring(L"\\\\?\\DISPLAY#B#2"));
 }
 
 TEST(control_rejects_corrupt_payloads) {
@@ -945,8 +956,105 @@ Frame sample_frame() {
 
 }  // namespace
 
+TEST(taskbar_screen_list_parse_and_format) {
+    bool malformed = true;
+    std::vector<std::wstring> ids =
+        parse_taskbar_screen_list(L"  \\\\?\\DISPLAY#A#1  ;\\\\?\\DISPLAY#B#2; ;", &malformed);
+    CHECK(!malformed);
+    CHECK_EQ(ids.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(ids[0], std::wstring(L"\\\\?\\DISPLAY#A#1"));
+    CHECK_EQ(ids[1], std::wstring(L"\\\\?\\DISPLAY#B#2"));
+
+    // 大小写不敏感去重，保留第一次出现的那一份。
+    ids = parse_taskbar_screen_list(L"\\\\?\\DISPLAY#A#1;\\\\?\\DISPLAY#a#1");
+    CHECK_EQ(ids.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(ids[0], std::wstring(L"\\\\?\\DISPLAY#A#1"));
+
+    // 空文本 = 显式空表（不在任何任务栏显示），不是写坏。
+    malformed = true;
+    ids = parse_taskbar_screen_list(L"   ", &malformed);
+    CHECK(ids.empty());
+    CHECK(!malformed);
+
+    // 非法段被丢弃并标 malformed；合法的照常保留。
+    malformed = false;
+    ids = parse_taskbar_screen_list(L"good;bad\nvalue;another", &malformed);
+    CHECK(malformed);
+    CHECK_EQ(ids.size(), static_cast<std::size_t>(2));
+
+    std::wstring text;
+    CHECK(format_taskbar_screen_list({L"a", L"b"}, text));
+    CHECK_EQ(text, std::wstring(L"a;b"));
+    CHECK(format_taskbar_screen_list({}, text));
+    CHECK(text.empty());
+    CHECK(!format_taskbar_screen_list({L"a", L"A"}, text));  // 大小写重复
+    CHECK(!format_taskbar_screen_list({L"a;b"}, text));     // 分隔符
+    CHECK(!format_taskbar_screen_list({std::wstring(kMaxTaskbarScreenIdChars + 1, L'x')}, text));
+
+    CHECK(taskbar_screen_id_valid(L"\\\\?\\DISPLAY#A#1"));
+    CHECK(!taskbar_screen_id_valid(L""));
+    CHECK(!taskbar_screen_id_valid(L"a;b"));
+    CHECK(!taskbar_screen_id_valid(L"a\nb"));
+}
+
+TEST(taskbar_screen_selection_defaults_and_degradation) {
+    // 没有配置：只在主屏显示（向后兼容）。
+    TaskbarScreenSelection selected = select_taskbar_screens(
+        TaskbarScreenSelectionInput{false, {}, L"primary", {L"primary", L"secondary"}});
+    CHECK_EQ(selected.selected.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(selected.selected[0], std::wstring(L"primary"));
+    CHECK(!selected.degraded);
+    CHECK(selected.requested_any);
+
+    // 明确配置为空：不在任何任务栏显示；配置本身没有要求，所以绝不退化到主屏。
+    selected = select_taskbar_screens(
+        TaskbarScreenSelectionInput{true, {}, L"primary", {L"primary", L"secondary"}});
+    CHECK(selected.selected.empty());
+    CHECK(!selected.degraded);
+    CHECK(!selected.requested_any);
+
+    // 只配置了一块已经不可用的副屏：退化到主屏，配置本身仍非空。
+    selected = select_taskbar_screens(
+        TaskbarScreenSelectionInput{true, {L"gone"}, L"primary", {L"primary"}});
+    CHECK_EQ(selected.selected.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(selected.selected[0], std::wstring(L"primary"));
+    CHECK(selected.degraded);
+    CHECK(selected.requested_any);
+
+    // 配置了多块，只有部分不可用：可用的那一块照常显示，不退化。
+    selected = select_taskbar_screens(TaskbarScreenSelectionInput{
+        true, {L"primary", L"gone"}, L"primary", {L"primary"}});
+    CHECK_EQ(selected.selected.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(selected.selected[0], std::wstring(L"primary"));
+    CHECK(!selected.degraded);
+
+    // 配置了两块副屏，一块可用：只显示可用的那块，不把主屏加进来。
+    selected = select_taskbar_screens(TaskbarScreenSelectionInput{
+        true, {L"secondary-a", L"secondary-b"}, L"primary",
+        {L"primary", L"secondary-a"}});
+    CHECK_EQ(selected.selected.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(selected.selected[0], std::wstring(L"secondary-a"));
+    CHECK(!selected.degraded);
+
+    // 配置的主屏自己也不可用：没有可退化的目标，selected 为空。
+    selected = select_taskbar_screens(
+        TaskbarScreenSelectionInput{true, {L"gone"}, L"primary", {L"other"}});
+    CHECK(selected.selected.empty());
+    CHECK(!selected.degraded);
+
+    // 多块可用时按 available 的顺序输出（物理顺序），不是配置顺序。
+    selected = select_taskbar_screens(TaskbarScreenSelectionInput{
+        true, {L"b", L"a"}, L"primary", {L"a", L"b", L"c"}});
+    CHECK_EQ(selected.selected.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(selected.selected[0], std::wstring(L"a"));
+    CHECK_EQ(selected.selected[1], std::wstring(L"b"));
+    CHECK(!selected.degraded);
+}
+
 TEST(frame_roundtrip_preserves_every_field) {
-    Frame const frame = sample_frame();
+    Frame frame = sample_frame();
+    frame.screens_configured = true;
+    frame.screens = {"\\\\?\\DISPLAY#AAA#1#{guid}", "\\\\?\\DISPLAY#BBB#2#{guid}"};
     std::vector<unsigned char> payload;
     CHECK(frame_encode(frame, payload));
     CHECK(payload.size() <= kFramePayloadCapacity);
@@ -957,6 +1065,10 @@ TEST(frame_roundtrip_preserves_every_field) {
     CHECK(decoded.alarm);
     CHECK(decoded.failure == FailureKind::Timeout);
     CHECK_EQ(decoded.reason, frame.reason);
+    CHECK(decoded.screens_configured);
+    CHECK_EQ(decoded.screens.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(decoded.screens[0], frame.screens[0]);
+    CHECK_EQ(decoded.screens[1], frame.screens[1]);
     CHECK_EQ(decoded.items.size(), static_cast<std::size_t>(2));
     CHECK_EQ(decoded.items[0].id, std::string("cpu"));
     CHECK_EQ(decoded.items[0].label, std::string("CPU"));
@@ -989,6 +1101,8 @@ TEST(frame_decode_rejects_inconsistent_payloads) {
     put_u32_le(lying, 0);
     put_u32_le(lying, 0);
     put_u32_le(lying, 0);
+    put_u32_le(lying, 0);
+    put_u32_le(lying, 0);
     CHECK(!frame_decode(lying.data(), lying.size(), out));
 
     // 失败原因长度超过上限。
@@ -1009,6 +1123,7 @@ TEST(frame_decode_rejects_inconsistent_payloads) {
     put_u32_le(long_id, 0);
     put_u32_le(long_id, 0);
     put_u32_le(long_id, 0);
+    put_u32_le(long_id, 0);
     put_u32_le(long_id, static_cast<std::uint32_t>(kMaxIdBytes + 1));
     put_u32_le(long_id, 0);
     put_u32_le(long_id, 0);
@@ -1022,7 +1137,53 @@ TEST(frame_decode_rejects_inconsistent_payloads) {
     put_u32_le(bad_kind, 0);
     put_u32_le(bad_kind, 0);
     put_u32_le(bad_kind, 0);
+    put_u32_le(bad_kind, 0);
+    put_u32_le(bad_kind, 0);
     CHECK(!frame_decode(bad_kind.data(), bad_kind.size(), out));
+
+    // 屏幕配置：configured 只允许 0/1；未配置时不许夹带屏幕；数量与标识都要有界。
+    std::vector<unsigned char> bad_screens;
+    put_u32_le(bad_screens, 0);  // items
+    put_u32_le(bad_screens, 1);  // kind
+    put_u32_le(bad_screens, 0);  // alarm
+    put_u32_le(bad_screens, 0);  // failure
+    put_u32_le(bad_screens, 0);  // reason bytes
+    put_u32_le(bad_screens, 2);  // configured: only 0/1
+    put_u32_le(bad_screens, 0);
+    CHECK(!frame_decode(bad_screens.data(), bad_screens.size(), out));
+
+    bad_screens.clear();
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);  // configured=false
+    put_u32_le(bad_screens, 1);  // but one screen
+    put_u32_le(bad_screens, 0);
+    CHECK(!frame_decode(bad_screens.data(), bad_screens.size(), out));
+
+    bad_screens.clear();
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, static_cast<std::uint32_t>(kMaxTaskbarScreens + 1));
+    CHECK(!frame_decode(bad_screens.data(), bad_screens.size(), out));
+
+    bad_screens.clear();
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 0);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, 1);
+    put_u32_le(bad_screens, 1);
+    bad_screens.push_back(';');  // 配置分隔符不能出现在标识里
+    CHECK(!frame_decode(bad_screens.data(), bad_screens.size(), out));
 
     // 空载荷是合法的一帧（waiting、没有条目）。
     std::vector<unsigned char> empty_frame;
@@ -2649,6 +2810,101 @@ long long wait_for_content(DisplayFrameConsumer const& consumer, long long timeo
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+}
+
+TEST(master_publishes_taskbar_screen_config_and_persists_changes) {
+    // v2 显示帧里的托盘屏幕配置：设置文件 → 帧；控制通道 SetScreens → 落盘 → 重发帧。
+    LoopbackServer server;
+    std::string error;
+    CHECK(server.start(error));
+
+    std::wstring const scope = L"screens-" + std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                               std::to_wstring(++g_temp_file_counter);
+    TempDirectory state_dir;
+    CHECK(state_dir.create(error));
+
+    std::wstring const settings_path = state_dir.path() + L"\\settings.ini";
+    std::string const settings_bytes =
+        "[taskbar]\r\ncomponent=true\r\nscreens=\\\\?\\DISPLAY#TESTA#1#{guid}\r\n";
+    {
+        HANDLE const file = ::CreateFileW(settings_path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(file != INVALID_HANDLE_VALUE);
+        DWORD written = 0;
+        CHECK(::WriteFile(file, settings_bytes.data(),
+                          static_cast<DWORD>(settings_bytes.size()), &written, nullptr) != FALSE);
+        CHECK_EQ(written, static_cast<DWORD>(settings_bytes.size()));
+        ::CloseHandle(file);
+    }
+
+    std::wstring const exe = master_executable_path();
+    ChildProcess master;
+    CHECK(master.start(exe,
+                       {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
+                        L"--frame-mailbox", L"--url", server.url(L"/ok"), L"--poll-ms", L"1000"},
+                       error));
+
+    DisplayFrameConsumer consumer;
+    bool attached = false;
+    for (int attempt = 0; attempt < 300 && !attached; ++attempt) {
+        if (consumer.attach(scope, error)) {
+            attached = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(attached);
+
+    Frame frame;
+    bool got = false;
+    for (int attempt = 0; attempt < 300 && !got; ++attempt) {
+        if (consumer.read(frame) && frame.kind == ViewKind::Content) {
+            got = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(got);
+    CHECK(frame.screens_configured);
+    CHECK_EQ(frame.screens.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(frame.screens[0], std::string("\\\\?\\DISPLAY#TESTA#1#{guid}"));
+
+    // 控制通道改成另一块屏幕：主进程必须落盘，并重发一帧（health revision 没变）。
+    std::wstring const class_name = scoped_name(kControlWindowClassBase, scope);
+    HWND const window = control_find_window(class_name);
+    CHECK(window != nullptr);
+    ControlRequest request;
+    request.op = ControlOp::SetScreens;
+    request.sender_pid = ::GetCurrentProcessId();
+    request.args = {L"\\\\?\\DISPLAY#TESTB#2#{guid}"};
+    ControlReply reply = ControlReply::BadRequest;
+    CHECK(control_send_window(window, request, 3000, reply, error));
+    CHECK(reply == ControlReply::Accepted);
+
+    bool updated = false;
+    for (int attempt = 0; attempt < 300 && !updated; ++attempt) {
+        if (consumer.read(frame) && frame.screens_configured && frame.screens.size() == 1 &&
+            frame.screens[0] == "\\\\?\\DISPLAY#TESTB#2#{guid}") {
+            updated = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(updated);
+
+    SettingsFile disk(settings_path);
+    std::wstring load_error;
+    CHECK(disk.load(load_error));
+    std::wstring value;
+    CHECK(disk.get(L"taskbar", L"screens", value));
+    CHECK_EQ(value, std::wstring(L"\\\\?\\DISPLAY#TESTB#2#{guid}"));
+
+    ChildProcess quit;
+    CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
+    CHECK(quit.wait(15000));
+    CHECK(master.wait(15000));
+    consumer.detach();
+    cleanup_isolated_instance(scope, state_dir.path());
 }
 
 TEST(master_publishes_expiry_into_the_mailbox_before_the_next_poll) {

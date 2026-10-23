@@ -4,6 +4,7 @@
 
 #include <winrt/Windows.Foundation.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -47,21 +48,23 @@ std::vector<XamlTapSite> xaml_tap_sites();
 // 引用归属。没连接时调用安全，返回 0。
 size_t xaml_tap_wait_for_sites(size_t deadline_ms);
 
-// 走查一个核心的树一次，记下叫这个名字的元素的句柄（如果树里有）。此时还没有解析任何东西，
-// 上报过的句柄也还没有还回去。
+// 走查一个核心的树一次，记下所有叫这个名字的元素的句柄。此时还没有解析任何东西，
+// 上报过的句柄也还没有还回去。多个副屏任务栏可能各自有一棵树：同一核心会报出多个同名元素，
+// 不同核心则要各自走查一次（每次注入每个核心只走查一次）。
 //
 // 必须在**不是核心自己线程**的地方调用：走查会被编组到核心线程并等它执行完，在核心线程上调用
 // 就是死锁。
 //
-// **一次注入只调用一次。** 诊断会为走查在进程里另外起一套 composition 走查器
+// **一个核心一次注入只调用一次。** 诊断会为走查在进程里另外起一套 composition 走查器
 // （CreateCompVisualDiag），在任务栏那条线程上反复走查是本项目认定的最高风险操作；所以元素
 // 解析出来之后运行期再也不走查（taskbar_xaml.cpp 在解析阶段就把连接关掉，之后这里连站点都
 // 找不到）。
-bool xaml_tap_watch(size_t index, std::wstring const& element_name, std::wstring& error);
+bool xaml_tap_watch(size_t index, std::wstring const& element_name,
+                    std::vector<std::uint64_t>& matches, std::wstring& error);
 
-// 解析 xaml_tap_watch 找到的东西。必须在核心自己的线程上调用——它返回的对象属于那条线程。
-bool xaml_tap_resolve(size_t index, winrt::Windows::Foundation::IInspectable& element,
-                      std::wstring& error);
+// 解析 xaml_tap_watch 找到的其中一个句柄。必须在核心自己的线程上调用——返回的对象属于那条线程。
+bool xaml_tap_resolve(size_t index, std::uint64_t handle,
+                      winrt::Windows::Foundation::IInspectable& element, std::wstring& error);
 
 // 把走查上报过的每一个句柄还回去。在它跑之前，诊断一直持有每个上报元素的一份引用。
 void xaml_tap_release_walk(size_t index);

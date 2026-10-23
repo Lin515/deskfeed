@@ -5,8 +5,9 @@
 #include <string>
 #include <vector>
 
-#include "core/health.h"      // ViewKind / FailureKind（只用枚举，不拉进状态机的实现）
-#include "core/snapshot.h"    // ItemState / 容量常量（协议边界只有这一处出处）
+#include "core/health.h"          // ViewKind / FailureKind（只用枚举，不拉进状态机的实现）
+#include "core/snapshot.h"        // ItemState / 容量常量（协议边界只有这一处出处）
+#include "display/taskbar_layout.h"  // 屏幕配置的容量上限（屏幕数量的唯一出处）
 
 // 显示帧：主进程算出显示模型（View）之后，把它序列化成一块**有界的紧凑二进制载荷**，
 // 放进共享内存交给任务栏负载 DLL。这是“主进程 → 显示邮箱”这条 seam 的唯一线格式。
@@ -21,7 +22,8 @@
 namespace deskfeed {
 
 inline constexpr std::uint32_t kFrameMagic = 0x32464644;  // 'D','F','F','2'
-inline constexpr std::uint32_t kFrameVersion = 1;
+// v2：在读数之前增加“任务栏屏幕配置”一节（是否显式配置 + 启用的屏幕标识表）。
+inline constexpr std::uint32_t kFrameVersion = 2;
 
 // 整体失败原因的长度上限（实现选择）。失败原因是主进程自己写的一行说明，
 // 不是生产端文本，所以单独给一个上限而不是套用 detail 的。
@@ -29,10 +31,17 @@ inline constexpr std::size_t kFrameMaxReasonBytes = 1024;
 
 // 载荷上限：64 条各自的 id/label/value/detail 加上每条几个长度字段与状态，外加失败原因。
 inline constexpr std::size_t kFramePerItemOverhead = 5 * sizeof(std::uint32_t);
+// 单个屏幕标识在线上格式里的字节上限。显示器接口路径是 ASCII，正常约 100 字节；给到 1024
+// 是为了让手写的异常配置也能被完整带到读端，再由长度/字符合法性整帧拒绝。
+inline constexpr std::size_t kMaxTaskbarScreenIdBytes = 1024;
+inline constexpr std::size_t kFrameScreensOverhead = 2 * sizeof(std::uint32_t);
+inline constexpr std::size_t kFrameScreensCapacity =
+    kMaxTaskbarScreens * (kMaxTaskbarScreenIdBytes + sizeof(std::uint32_t)) +
+    kFrameScreensOverhead;
 inline constexpr std::size_t kFramePayloadCapacity =
     kMaxItems * (kMaxIdBytes + kMaxLabelBytes + kMaxValueBytes + kMaxDetailBytes +
                  kFramePerItemOverhead) +
-    kFrameMaxReasonBytes + 8 * sizeof(std::uint32_t);
+    kFrameMaxReasonBytes + kFrameScreensCapacity + 8 * sizeof(std::uint32_t);
 
 // 显示帧里的一条。字段与 core/health.h 的 ViewItem 一一对应。
 struct FrameItem {
@@ -52,6 +61,11 @@ struct Frame {
     bool alarm = false;
     FailureKind failure = FailureKind::None;
     std::string reason;
+    // 任务栏屏幕配置（v2）。`screens_configured=false` 表示设置文件里没有 `[taskbar] screens`，
+    // 读端按“只在主屏显示”的向后兼容缺省处理；为真时 `screens` 是**启用集合**，空表表示
+    // 用户明确配置为不在任何任务栏显示（这种配置不触发主屏退化）。
+    bool screens_configured = false;
+    std::vector<std::string> screens;
     std::vector<FrameItem> items;
 };
 

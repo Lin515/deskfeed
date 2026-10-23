@@ -52,7 +52,8 @@ bool control_decode(std::string_view bytes, ControlRequest& out, std::string& er
     if (op != static_cast<std::uint32_t>(ControlOp::Command) &&
         op != static_cast<std::uint32_t>(ControlOp::Inspect) &&
         op != static_cast<std::uint32_t>(ControlOp::Refresh) &&
-        op != static_cast<std::uint32_t>(ControlOp::ShowWidget)) {
+        op != static_cast<std::uint32_t>(ControlOp::ShowWidget) &&
+        op != static_cast<std::uint32_t>(ControlOp::SetScreens)) {
         error = "control op unknown";
         return false;
     }

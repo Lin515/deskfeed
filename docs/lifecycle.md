@@ -140,6 +140,7 @@ deskfeed.exe                             无参数：已有实例不接管；否
  "boundPid":null,"sourceGeneration":2,"bindingGeneration":1,
  "schedule":{"pollMs":30000,"retryMs":5000,"timeoutMs":8000},
  "nextFetchInMs":12500,
+ "taskbarScreens":{"configured":true,"enabled":["\\\\?\\DISPLAY#PHLC226#5&81de98e&0&UID8451#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"]},
  "view":{"kind":"content","alarm":false,"failure":"none","reason":"",
          "items":[{"id":"cpu","label":"CPU","value":"54℃","state":"ok","detail":""}]},
  "hasSnapshot":true,"expired":false,"receivedAtMs":1791825410342,"expiresAtMs":1791825470339}
@@ -158,6 +159,8 @@ deskfeed.exe                             无参数：已有实例不接管；否
   `empty` → `validation`；`aborted` → `none`（主动取消不算失败）；
   校验类原因 `encoding` / `parse` / `too-large` 原样保留，其余归到 `validation`。
 - `boundPid`、`receivedAtMs`、`expiresAtMs` 不适用时为 `null`。
+- `taskbarScreens` 是 `[taskbar] screens` 的**持久配置**：`configured=false` 表示键不存在
+  （运行期按仅主屏处理），`enabled` 是显式启用的屏幕标识表；它不包含本次退化后的实际落点。
 - **地址一律脱敏**：去掉 userinfo、查询串与片段；`runtimeUrlRedacted` 记录是否删过东西。
   实际保存与请求的地址保持原样。
 - `--inspect` 的退出码：0 收到应答；2 用法错误；5 IPC 超时/没有实例；6 请求被拒绝；7 内部错误。

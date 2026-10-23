@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 #include "display/reading.h"
 #include "payload/payload_flavor.h"
@@ -11,25 +12,31 @@
 //
 // 四条硬事实决定了这个模块的形状：
 //  * XAML 元素有线程亲和性。碰元素的一切都必须在拥有任务栏 XAML 的那条线程上，也就是
-//    Shell_TrayWnd 的线程；所以工作经线程级 WH_GETMESSAGE 钩子编组过去（`payload/hook_post.*`），
-//    调用方只投递并等待。
-//  * 树来自公开的 XAML 诊断接口（`payload/xaml_tap.h`），不是 shell 的内部对象。找托盘元素的那次
-//    走查**在一次注入的生命周期里只做一次**；解析出元素之后立刻关掉诊断连接，运行期只换字。
-//  * 显示内容来自 `display/reading.h` 的纯格式化器，输入只有主进程发布的最新显示帧。
+//    Shell_TrayWnd / Shell_SecondaryTrayWnd 的线程；所以工作经线程级 WH_GETMESSAGE 钩子编组过去
+//    （`payload/hook_post.*`），调用方只投递并等待。
+//  * 树来自公开的 XAML 诊断接口（`payload/xaml_tap.h`），不是 shell 的内部对象。每个 XAML 核心
+//    在**一次注入的生命周期里最多走查一次**；多屏时逐核心走查到所有托盘元素都拿到为止，随后立刻
+//    关掉诊断连接，运行期只换字、增删块。
+//  * 显示内容与“在哪些屏幕显示”都来自主进程发布的最新显示帧。
 //  * 读数只在进程内缓存（本文件的 mutex 保护的那份拷贝）：负载线程写、任务栏线程读。
 namespace deskfeed::payload {
 
-// 唯一的一次走查：在调用方自己的线程上跑（诊断会把工作编组到核心线程并等它，在任务栏线程上
-// 调用会死锁）。它挑一个 XAML 核心走查一次，记下托盘元素被上报的位置；**不重试**。
+// 自测宿主的走查入口：在调用方自己的线程上跑（诊断会把工作编组到核心线程并等它，在任务栏线程上
+// 调用会死锁）。它挑与目标同线程的一个 XAML 核心走查一次，记下所有同名元素的句柄；**不重试**。
 bool taskbar_xaml_watch(std::wstring& error);
 
-// 负载线程调用：装好 composition 诊断规避的钩子、连接本进程的 XAML 核心、走查一次、把元素解析
-// 出来并插入第一份读数（都在任务栏线程上投递完成），最后**立刻**关掉诊断连接并恢复导入表——
-// 规避钩子只需要覆盖走查这一段，不覆盖整个常驻生命。
+// 负载线程调用：装好 composition 诊断规避的钩子、连接本进程的 XAML 核心、按核心逐个走查，
+// 把元素解析并映射到屏幕（解析在任务栏线程上完成），再按配置插入第一份读数；最后**立刻**关掉
+// 诊断连接并恢复导入表——规避钩子只需要覆盖走查这一段，不覆盖整个常驻生命。
 bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error);
 
 // 显示内容变了：从负载线程调用。只投递一次"就地换字"，绝不再走查、不再连诊断。
 bool taskbar_xaml_request_update(deskfeed::ReadingContent const& content);
+
+// 主进程发布的托盘屏幕配置（显示帧 v2）。`configured=false` 表示按“仅主屏”的缺省处理；
+// configured 为真且 screens 为空表示明确不在任何任务栏显示。它只更新配置并触发一次目标
+// 协调（增删各屏的块），绝不重新连接 XAML 诊断、也绝不重新走查。
+void taskbar_xaml_set_screen_config(bool configured, std::vector<std::wstring> const& screens);
 
 // 拆除：摘块 → 收悬停与菜单 → 退休钩子（等静止证明）。返回 false 表示**有一条证明没拿到**，
 // 调用方必须保留模块、不得报告可卸载；detail 写明原因。

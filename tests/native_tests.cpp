@@ -2358,11 +2358,11 @@ void test_hover_regressions() {
           "hover: the text-only refresh must not reposition or reactivate the tooltip");
 
     // 全文件的调用计数：重定位与激活各只有一个出处（`show_tip`，也就是"命中条目变了"那条路）。
-    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_TRACKPOSITION") == 1,
+    check(count_occurrences(source, "::SendMessageW(g_state.tooltip, TTM_TRACKPOSITION") == 1,
           "hover: repositioning happens in exactly one place (a new hit target)");
-    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_TRACKACTIVATE") == 2,
+    check(count_occurrences(source, "::SendMessageW(g_state.tooltip, TTM_TRACKACTIVATE") == 2,
           "hover: activation happens once on show and once on hide");
-    check(count_occurrences(source, "::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW") == 2,
+    check(count_occurrences(source, "::SendMessageW(g_state.tooltip, TTM_UPDATETIPTEXTW") == 2,
           "hover: the text is written on show and on the text-only refresh");
 }
 

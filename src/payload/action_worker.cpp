@@ -10,6 +10,8 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace deskfeed::payload {
 namespace {
@@ -23,6 +25,9 @@ DWORD g_thread_id = 0;
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_pending_refresh{false};
 std::atomic<bool> g_pending_show{false};
+std::atomic<bool> g_pending_screens_ready{false};
+// 与 g_scope 同一把锁：post_screens 写、工作线程取走。
+std::vector<std::wstring> g_pending_screens;
 std::atomic<bool> g_running{false};
 #ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 // 见头文件：只让**自测**构建能确定性地制造"线程在期限内没退出"这个真实场景。
@@ -54,6 +59,18 @@ void send_show_widget(std::wstring const& scope) {
     }
 }
 
+void send_screens(std::wstring const& scope, std::vector<std::wstring> const& screens) {
+    try {
+        std::string error;
+        if (control_request_set_screens(scope, screens, 1500, error)) {
+            log_format(L"tray screen configuration sent (%zu screen(s))", screens.size());
+        } else {
+            log_format(L"tray screen configuration was not delivered: %S", error.c_str());
+        }
+    } catch (...) {
+    }
+}
+
 DWORD WINAPI worker_entry(LPVOID) {
     g_running.store(true);
     // 整条线程入口都在 C++ 边界里：作用域字符串的拷贝、发送里的任何分配都可能抛，异常穿出
@@ -73,9 +90,16 @@ DWORD WINAPI worker_entry(LPVOID) {
 #endif
             // 作用域在锁里拷一份：发送期间 start/stop 可能改写 g_scope。
             std::wstring scope;
+            std::vector<std::wstring> screens;
+            bool send_screens_now = false;
             {
                 std::lock_guard<std::mutex> guard(g_mutex);
                 scope = g_scope;
+                if (g_pending_screens_ready.exchange(false)) {
+                    screens = g_pending_screens;
+                    g_pending_screens.clear();
+                    send_screens_now = true;
+                }
             }
             // 合并后的两类请求各发一次；发送期间的重复请求会落在标志位上，下一轮再发。
             if (g_pending_refresh.exchange(false)) {
@@ -83,6 +107,9 @@ DWORD WINAPI worker_entry(LPVOID) {
             }
             if (g_pending_show.exchange(false)) {
                 send_show_widget(scope);
+            }
+            if (send_screens_now) {
+                send_screens(scope, screens);
             }
         }
     } catch (...) {
@@ -115,6 +142,8 @@ bool action_worker_start(std::wstring const& scope, std::wstring& error) {
     g_quit.store(false);
     g_pending_refresh.store(false);
     g_pending_show.store(false);
+    g_pending_screens_ready.store(false);
+    g_pending_screens.clear();
     g_thread = ::CreateThread(nullptr, 0, worker_entry, nullptr, 0, &g_thread_id);
     if (g_thread == nullptr) {
         error = L"建立动作工作线程失败";
@@ -142,6 +171,16 @@ void action_worker_post_show_widget() {
         return;
     }
     g_pending_show.store(true);  // 合并
+    ::SetEvent(g_wake);
+}
+
+void action_worker_post_screens(std::vector<std::wstring> screens) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    if (g_thread == nullptr || g_quit.load()) {
+        return;
+    }
+    g_pending_screens = std::move(screens);
+    g_pending_screens_ready.store(true);
     ::SetEvent(g_wake);
 }
 
@@ -176,6 +215,8 @@ bool action_worker_stop(unsigned timeout_ms) {
             g_wake = nullptr;
         }
         g_scope.clear();
+        g_pending_screens.clear();
+        g_pending_screens_ready.store(false);
     }
     log_line(L"action worker stopped");
     return true;

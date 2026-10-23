@@ -5,6 +5,7 @@
 #include <commctrl.h>
 
 #include <string>
+#include <vector>
 
 #include "display/frame.h"
 
@@ -13,7 +14,7 @@
 // 责任边界（见 src/widget/README.md 与 docs/architecture.md）：
 //   * 取数、解析、严格校验、缓存、到期与整体失效判断全在主进程，窗口一行都不做；
 //   * 窗口不联网、不读设置文件、不绑定进程、不碰控制通道与显示邮箱、没有自己的守护线程；
-//   * 窗口只把四个动作交回主进程：刷新一次、退出、切换任务栏组件、落盘界面偏好；
+//   * 窗口只把动作交回主进程：刷新一次、退出、切换任务栏组件、列出/切换托盘屏幕、落盘界面偏好；
 //   * 窗口的 HWND 建在主进程现有线程上，主进程那条 MsgWaitForMultipleObjects + PeekMessage
 //     循环已经会泵它的消息，所以这里不需要新的线程或消息循环。
 namespace deskfeed::widget {
@@ -31,7 +32,16 @@ struct WindowPreferences {
     bool taskbar_component = true;
 };
 
-// 窗口要往外做的四件事。窗口只管把动作交出去，节奏与持久化都不属于窗口。
+// 悬浮窗右键菜单里的一个“托盘屏幕”条目。列表在每次弹出菜单前由主进程现查：显示器与任务栏
+// 会随拔插变化，缓存在窗口里就会给出过期选项。
+struct WidgetScreenEntry {
+    std::wstring id;     // 稳定屏幕标识（与显示帧里的配置项同一口径）
+    std::wstring label;  // 面向用户的标签，例如 `屏幕 1（主）`
+    bool checked = false;
+    bool available = false;  // 当前有可用的任务栏目标；不可用但已勾选的条目仍可取消
+};
+
+// 窗口要往外做的这组动作。窗口只管把动作交出去，节奏与持久化都不属于窗口。
 //
 // **重入与生命周期契约（硬约束）**：这些回调都是**同步**调用的，而且窗口在回调返回之后还会
 // 继续用自己那份状态。所以回调实现里：
@@ -62,6 +72,12 @@ struct WidgetCallbacks {
     // 无副作用的落盘动作，不能在里面做会改变窗口状态的事。
     bool (*save_preferences)(void* context, WindowPreferences const& preferences,
                              std::wstring* error) = nullptr;
+    // 菜单「托盘屏幕」子菜单：每次弹出前现查一次。返回 false 或空表表示当前没有可控制的屏幕
+    // （子菜单会显示一条灰色说明，不伪造条目）。实现只做枚举与读配置，不落盘、不改状态。
+    bool (*list_screens)(void* context, std::vector<WidgetScreenEntry>& screens) = nullptr;
+    // 勾选/取消一块屏幕。返回切换之后该项是否处于启用状态；主进程在这里落盘并让显示帧重发。
+    // 与 set_taskbar_component 一样，实现不得销毁窗口或重入 apply。
+    bool (*set_screen_enabled)(void* context, std::wstring const& screen_id, bool enabled) = nullptr;
     void* context = nullptr;
 };
 

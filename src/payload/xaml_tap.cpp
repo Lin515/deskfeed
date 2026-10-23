@@ -53,7 +53,7 @@ struct IXamlDiagnosticsTestHooks : IUnknown {
 // 一次走查找到的东西。走查跨两条线程——它从工作线程发起（核心把它编组到自己的线程并等待），
 // 而它指名的元素属于核心线程——所以句柄在两次调用之间保存，而不是在回调里解析。
 struct Watch {
-    InstanceHandle element = 0;
+    std::vector<InstanceHandle> elements;
     std::vector<InstanceHandle> reported;
 };
 
@@ -303,8 +303,8 @@ public:
 
         if (watch_ != nullptr) {
             watch_->reported.push_back(element.Handle);
-            if (watch_->element == 0 && name == name_) {
-                watch_->element = element.Handle;
+            if (name == name_) {
+                watch_->elements.push_back(element.Handle);
                 log_format(L"  found %s as %s#%s", name_.c_str(), type.c_str(), name.c_str());
             }
         }
@@ -543,7 +543,9 @@ bool site_object(size_t index, IXamlDiagnostics** diagnostics, std::shared_ptr<S
 
 }  // namespace
 
-bool xaml_tap_watch(size_t index, std::wstring const& element_name, std::wstring& error) {
+bool xaml_tap_watch(size_t index, std::wstring const& element_name,
+                    std::vector<std::uint64_t>& matches, std::wstring& error) {
+    matches.clear();
     std::shared_ptr<Site> site;
     IXamlDiagnostics* diagnostics = nullptr;
     Watch* watch = nullptr;
@@ -565,7 +567,7 @@ bool xaml_tap_watch(size_t index, std::wstring const& element_name, std::wstring
     }
 
     // 上一次走查的句柄现在都失效了，即将跑的这次会记自己的。
-    watch->element = 0;
+    watch->elements.clear();
     watch->reported.clear();
     walk->set_watch(watch);
 
@@ -574,7 +576,7 @@ bool xaml_tap_watch(size_t index, std::wstring const& element_name, std::wstring
     HRESULT unadvised = service->UnadviseVisualTreeChange(walk);
     unsigned seen = walk->seen();
     walk->set_watch(nullptr);
-    if (watch->element == 0) {
+    if (watch->elements.empty()) {
         // 树清单只在没找到目标时写：它是"任务栏的树长什么样"的证据，成功时不值得占日志。
         walk->dump_types();
     }
@@ -589,31 +591,34 @@ bool xaml_tap_watch(size_t index, std::wstring const& element_name, std::wstring
         return false;
     }
 
-    log_format(L"  walk reported %u element(s), %s", seen,
-               watch->element == 0 ? L"the wanted element was not among them"
-                                   : L"the wanted element was found");
-    if (watch->element == 0) {
+    log_format(L"  walk reported %u element(s), %zu matching %s", seen, watch->elements.size(),
+               element_name.c_str());
+    if (watch->elements.empty()) {
         error = element_name + L" is not in the tree of this core";
         return false;
+    }
+    for (InstanceHandle const handle : watch->elements) {
+        matches.push_back(static_cast<std::uint64_t>(handle));
     }
     return true;
 }
 
-bool xaml_tap_resolve(size_t index, winrt::Windows::Foundation::IInspectable& element,
-                      std::wstring& error) {
+bool xaml_tap_resolve(size_t index, std::uint64_t handle,
+                      winrt::Windows::Foundation::IInspectable& element, std::wstring& error) {
     std::shared_ptr<Site> site;
     IXamlDiagnostics* diagnostics = nullptr;
     Watch* watch = nullptr;
     if (!site_object(index, &diagnostics, &site, &watch, error)) {
         return false;
     }
-    if (watch->element == 0) {
+    if (handle == 0) {
         error = L"no element was watched yet";
         return false;
     }
 
     HRESULT resolved = diagnostics->GetIInspectableFromHandle(
-        watch->element, reinterpret_cast<::IInspectable**>(winrt::put_abi(element)));
+        static_cast<InstanceHandle>(handle),
+        reinterpret_cast<::IInspectable**>(winrt::put_abi(element)));
     if (FAILED(resolved) || element == nullptr) {
         error = L"GetIInspectableFromHandle -> " + hresult_text(resolved);
         return false;
@@ -645,7 +650,7 @@ void xaml_tap_release_walk(size_t index) {
     }
     log_format(L"released %zu handle(s) from the walk", watch->reported.size());
 
-    watch->element = 0;
+    watch->elements.clear();
     watch->reported.clear();
 }
 

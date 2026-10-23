@@ -16,6 +16,7 @@
 #include "core/utf8.h"
 #include "display/frame.h"
 #include "display/mailbox.h"
+#include "display/taskbar_layout.h"
 #include "ipc/binding.h"
 #include "ipc/command.h"
 #include "ipc/control_channel.h"
@@ -26,6 +27,7 @@
 #include "platform/console.h"
 #include "platform/log.h"
 #include "platform/paths.h"
+#include "platform/screens.h"
 #include "platform/user_scope.h"
 #include "platform/win32_util.h"
 #include "widget/preferences.h"
@@ -146,6 +148,49 @@ bool read_taskbar_component_intent(SettingsFile const* settings) {
         return false;
     }
     return true;
+}
+
+// `[taskbar] screens` 的读取。`configured=false` 表示键不存在（按“仅主屏”的向后兼容缺省）；
+// `configured=true` 且 ids 为空表示用户明确关闭了所有任务栏显示。
+// 非空但整行都解析不出合法标识时按缺省处理，不让一行坏值把显示意外关掉。
+struct TaskbarScreensConfig {
+    bool configured = false;
+    std::vector<std::wstring> ids;
+};
+
+TaskbarScreensConfig read_taskbar_screens_config(SettingsFile const* settings) {
+    TaskbarScreensConfig config;
+    if (settings == nullptr) {
+        return config;
+    }
+    std::wstring text;
+    if (!settings->get(L"taskbar", L"screens", text)) {
+        return config;
+    }
+    bool malformed = false;
+    config.ids = parse_taskbar_screen_list(text, &malformed);
+    if (config.ids.empty() && malformed && !text.empty()) {
+        // 整行都解析不出来：按缺省（仅主屏）处理，不让一行坏值把显示意外关掉。
+        // 这里不写日志：本函数每轮 pump 都会被调用，坏配置不能让日志每秒刷一行。
+        return TaskbarScreensConfig{};
+    }
+    config.configured = true;
+    return config;
+}
+
+// 配置的“生效集合”：没有 `[taskbar] screens` 键时是当前主屏（与旧行为一致），
+// 而不是“所有屏幕”。明确写成空表则返回空表（用户选择不在任何任务栏显示）。
+std::vector<std::wstring> effective_taskbar_screens(SettingsFile const* settings, bool& configured) {
+    TaskbarScreensConfig const config = read_taskbar_screens_config(settings);
+    configured = config.configured;
+    if (config.configured) {
+        return config.ids;
+    }
+    std::wstring const primary = primary_screen_id();
+    if (primary.empty()) {
+        return {};
+    }
+    return {primary};
 }
 
 struct FetchOutcome {
@@ -440,21 +485,31 @@ private:
     // （启动时、任务栏组件被重新打开/重新注入时）。
     void publish_display_outputs(bool force);
 
-    // 悬浮窗交回来的四个动作（见 widget/window.h 的重入与生命周期契约）：它们都是同步调用的，
+    // 悬浮窗交回来的动作（见 widget/window.h 的重入与生命周期契约）：它们都是同步调用的，
     // 实现里绝不销毁窗口、绝不重入 apply / show_from_request，也绝不让 SettingsFile 失效。
     void on_widget_refresh();
     void on_widget_quit();
     bool on_widget_set_taskbar_component(bool enabled);
+    // 悬浮窗「托盘屏幕」子菜单：只读枚举/读配置，以及一次落盘的勾选切换。两项都复用负载
+    // 那条统一的屏幕标识（platform/screens.h），不另造一套命名。
+    bool on_widget_list_screens(std::vector<widget::WidgetScreenEntry>& screens);
+    bool on_widget_set_screen(std::wstring const& screen_id, bool enabled);
     bool on_widget_save_preferences(widget::WindowPreferences const& preferences,
                                     std::wstring* error);
     // 组件开关的落盘：候选克隆 → 原子替换 → 成功才接过来（与 apply_command 同一套语义）。
     // 返回 false 时正在用的那一份一个字节都没被碰过。
     bool persist_component_intent(bool enabled);
+    // 托盘屏幕配置的落盘：与组件开关同一套候选克隆语义。ids 是完整的启用集合；
+    // 空表写成显式空值（表示不在任何任务栏显示）。
+    bool persist_taskbar_screens(std::vector<std::wstring> const& ids);
 
     // 交给 WidgetCallbacks 的普通函数指针（context 就是 this）。
     static void widget_refresh_entry(void* context);
     static void widget_quit_entry(void* context);
     static bool widget_set_taskbar_component_entry(void* context, bool enabled);
+    static bool widget_list_screens_entry(void* context,
+                                          std::vector<widget::WidgetScreenEntry>& screens);
+    static bool widget_set_screen_entry(void* context, std::wstring const& screen_id, bool enabled);
     static bool widget_save_preferences_entry(void* context,
                                               widget::WindowPreferences const& preferences,
                                               std::wstring* error);
@@ -549,6 +604,10 @@ private:
     DisplayFrameProducer frame_producer_;
     bool mailbox_ok_ = false;
     std::uint64_t published_revision_ = 0;
+    // 已发布到显示帧里的屏幕配置。它不属于 health 的 revision，但配置变化也必须让邮箱重发，
+    // 否则负载会一直按旧屏幕表显示。发布失败时这两个值不推进。
+    bool published_screens_configured_ = false;
+    std::vector<std::string> published_screens_;
 
     // 取数结果队列（工作线程入队、主进程出队）。主进程持一份所有权，每个工作线程也持一份：
     // 主进程收尾时只停止接受并丢掉自己那一份，队列本身活到最后一个线程 return。
@@ -730,6 +789,8 @@ bool Master::start_display_face() {
         callbacks.refresh = &Master::widget_refresh_entry;
         callbacks.quit = &Master::widget_quit_entry;
         callbacks.set_taskbar_component = &Master::widget_set_taskbar_component_entry;
+        callbacks.list_screens = &Master::widget_list_screens_entry;
+        callbacks.set_screen_enabled = &Master::widget_set_screen_entry;
         callbacks.save_preferences = &Master::widget_save_preferences_entry;
 
         std::wstring error;
@@ -750,17 +811,31 @@ bool Master::start_display_face() {
 
 void Master::publish_display_outputs(bool force) {
     std::uint64_t const revision = health_.revision();
+
+    // 屏幕配置不属于 health 的 revision：用户改一次勾选不会让快照变代，但读端必须收到新表。
+    TaskbarScreensConfig const screens = read_taskbar_screens_config(settings_.get());
+    std::vector<std::string> screen_bytes;
+    screen_bytes.reserve(screens.ids.size());
+    for (std::wstring const& id : screens.ids) {
+        screen_bytes.push_back(utf8_from_wide(id));
+    }
+    bool const screens_due = screens.configured != published_screens_configured_ ||
+                             screen_bytes != published_screens_;
     bool const mailbox_due =
-        frame_producer_.created() && (force || revision != published_revision_);
+        frame_producer_.created() && (force || revision != published_revision_ || screens_due);
     bool const widget_due = widget_created_ && (force || revision != widget_revision_);
     if (!mailbox_due && !widget_due) {
-        return;  // 模型没变：不往跨进程 seqlock 里白写一帧，也不白刷一次窗口
+        return;  // 模型与屏幕配置都没变：不往跨进程 seqlock 里白写一帧，也不白刷一次窗口
     }
     // 两个显示面吃**同一份** Frame：各算一遍是显示分叉的源头，也是“一面正常、一面失效”的来源。
-    Frame const frame = frame_from_view(health_.view());
+    Frame frame = frame_from_view(health_.view());
+    frame.screens_configured = screens.configured;
+    frame.screens = screen_bytes;
     if (mailbox_due) {
         if (frame_producer_.publish(frame, wall_ms())) {
             published_revision_ = revision;
+            published_screens_configured_ = frame.screens_configured;
+            published_screens_ = frame.screens;
         } else {
             // 失败**不推进**代次：下一轮还会重发，不会把一次失败的发布当成已经发出去了。
             log_line(L"display: 发布显示帧失败（不影响取数）");
@@ -772,7 +847,7 @@ void Master::publish_display_outputs(bool force) {
     }
 }
 
-// ---------- 悬浮窗交回来的四个动作 ----------
+// ---------- 悬浮窗交回来的动作 ----------
 //
 // 它们都在主进程这条线程上被窗口**同步**调用（见 widget/window.h 的契约），所以：
 //   * 绝不在这里销毁窗口、也绝不重入 apply / show_from_request；
@@ -849,6 +924,138 @@ bool Master::persist_component_intent(bool enabled) {
     return true;
 }
 
+bool Master::widget_list_screens_entry(void* context,
+                                       std::vector<widget::WidgetScreenEntry>& screens) {
+    auto* self = static_cast<Master*>(context);
+    return self != nullptr && self->on_widget_list_screens(screens);
+}
+
+bool Master::on_widget_list_screens(std::vector<widget::WidgetScreenEntry>& screens) {
+    screens.clear();
+    if (!component_capability_) {
+        return false;
+    }
+    bool configured = false;
+    std::vector<std::wstring> const enabled = effective_taskbar_screens(settings_.get(), configured);
+    std::vector<TaskbarWindowInfo> const windows = enumerate_taskbar_windows();
+
+    auto enabled_contains = [&enabled](std::wstring const& id) {
+        for (std::wstring const& existing : enabled) {
+            if (taskbar_screen_ids_equal(existing, id)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // 有任务栏的屏幕按物理顺序列出。勾按**配置**画，不按当前生效的退化结果画：退化不修改配置。
+    for (TaskbarWindowInfo const& window : windows) {
+        bool duplicate = false;
+        for (widget::WidgetScreenEntry const& entry : screens) {
+            if (taskbar_screen_ids_equal(entry.id, window.screen_id)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        widget::WidgetScreenEntry entry;
+        entry.id = window.screen_id;
+        entry.label = window.label.empty() ? std::wstring(L"屏幕") : window.label;
+        entry.checked = enabled_contains(window.screen_id);
+        entry.available = true;
+        screens.push_back(std::move(entry));
+    }
+
+    // 配置里启用、但当前没有任务栏的屏幕也要出现：否则用户无法把一块已经拔掉的屏幕从配置里
+    // 取消，退化状态就会一直跟着他。这类条目只允许“取消”，不允许“启用”。
+    for (std::wstring const& id : enabled) {
+        bool known = false;
+        for (widget::WidgetScreenEntry const& entry : screens) {
+            if (taskbar_screen_ids_equal(entry.id, id)) {
+                known = true;
+                break;
+            }
+        }
+        if (known) {
+            continue;
+        }
+        widget::WidgetScreenEntry entry;
+        entry.id = id;
+        entry.label = L"已断开的屏幕";
+        entry.checked = true;
+        entry.available = false;
+        screens.push_back(std::move(entry));
+    }
+    return true;
+}
+
+bool Master::widget_set_screen_entry(void* context, std::wstring const& screen_id, bool enabled) {
+    auto* self = static_cast<Master*>(context);
+    return self != nullptr && self->on_widget_set_screen(screen_id, enabled);
+}
+
+bool Master::on_widget_set_screen(std::wstring const& screen_id, bool enabled) {
+    if (!component_capability_ || !taskbar_screen_id_valid(screen_id)) {
+        return false;
+    }
+    bool configured = false;
+    std::vector<std::wstring> screens = effective_taskbar_screens(settings_.get(), configured);
+    bool present = false;
+    std::size_t present_at = 0;
+    for (std::size_t index = 0; index < screens.size(); ++index) {
+        if (taskbar_screen_ids_equal(screens[index], screen_id)) {
+            present = true;
+            present_at = index;
+            break;
+        }
+    }
+    if (enabled) {
+        if (!present) {
+            if (screens.size() >= kMaxTaskbarScreens) {
+                log_line(L"taskbar: 托盘屏幕数量已达上限，未勾选新屏幕");
+                return false;
+            }
+            screens.push_back(screen_id);
+        }
+    } else if (present) {
+        screens.erase(screens.begin() + static_cast<std::ptrdiff_t>(present_at));
+    }
+    bool const reached = enabled;
+    if ((enabled && present) || (!enabled && !present)) {
+        return reached;  // 目标状态已经成立，不产生一次多余的写盘
+    }
+    if (!persist_taskbar_screens(screens)) {
+        // 没落盘：实际状态没有变，菜单的勾不能骗人。
+        return !enabled;
+    }
+    log_format(L"taskbar: screen %s -> %s (persisted)", screen_id.c_str(),
+               reached ? L"on" : L"off");
+    return reached;
+}
+
+bool Master::persist_taskbar_screens(std::vector<std::wstring> const& ids) {
+    if (settings_ == nullptr || !settings_usable_) {
+        log_line(L"taskbar: 设置文件不可用，托盘屏幕配置不落盘");
+        return false;
+    }
+    std::wstring text;
+    if (!format_taskbar_screen_list(ids, text)) {
+        log_line(L"taskbar: 托盘屏幕配置不合法，拒绝落盘");
+        return false;
+    }
+    SettingsFile candidate = *settings_;
+    std::wstring error;
+    candidate.set(L"taskbar", L"screens", text, nullptr, error);
+    if (!candidate.save_as(settings_->path(), error)) {
+        log_line(L"taskbar: 保存托盘屏幕配置失败：" + error + L"；实际状态不变");
+        return false;
+    }
+    settings_->adopt(candidate);
+    return true;
+}
+
 bool Master::widget_save_preferences_entry(void* context,
                                            widget::WindowPreferences const& preferences,
                                            std::wstring* error) {
@@ -910,6 +1117,42 @@ ControlReply Master::on_control(ControlRequest const& request) {
         }
         log_format(L"control: 任务栏动作请求已排队（%s，来自 pid %lu）",
                    refresh ? L"刷新读数" : L"打开悬浮窗", request.sender_pid);
+        return ControlReply::Accepted;
+    }
+
+    // 托盘屏幕配置：args 是完整启用集合。它必须**同步**落盘再应答，因为负载的菜单勾选语义
+    // 是“主进程接受并保存了才算数”；写入只是一行 INI，不涉及网络或注入。
+    if (request.op == ControlOp::SetScreens) {
+        if (request.args.size() > kMaxTaskbarScreens) {
+            log_line(L"control: 托盘屏幕数量超过上限，拒绝");
+            return ControlReply::BadRequest;
+        }
+        std::vector<std::wstring> screens;
+        screens.reserve(request.args.size());
+        for (std::wstring const& id : request.args) {
+            if (!taskbar_screen_id_valid(id)) {
+                log_line(L"control: 托盘屏幕标识不合法，拒绝");
+                return ControlReply::BadRequest;
+            }
+            bool duplicate = false;
+            for (std::wstring const& existing : screens) {
+                if (taskbar_screen_ids_equal(existing, id)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                screens.push_back(id);
+            }
+        }
+        if (!persist_taskbar_screens(screens)) {
+            log_line(L"control: 托盘屏幕配置落盘失败，拒绝");
+            return ControlReply::Rejected;
+        }
+        log_format(L"control: 托盘屏幕配置已落盘（%zu 项，来自 pid %lu）", screens.size(),
+                   request.sender_pid);
+        // 配置变化会在随后的 pump 里被 publish_display_outputs 看见并重发显示帧；不在这里
+        // 直接发布，避免在控制窗口过程里碰共享内存与悬浮窗。
         return ControlReply::Accepted;
     }
 
@@ -1639,6 +1882,20 @@ std::string Master::inspect_json() const {
            ",\"retryMs\":" + std::to_string(schedule_.retry_ms) +
            ",\"timeoutMs\":" + std::to_string(schedule_.timeout_ms) + "}";
     out += ",\"nextFetchInMs\":" + std::to_string(next_fetch);
+
+    // 托盘屏幕的持久配置（不是本次退化后的实际落点）。键不存在时 enabled 为空表，
+    // configured=false 表示运行期按“仅主屏”的缺省处理；退化不修改它。
+    TaskbarScreensConfig const screens = read_taskbar_screens_config(settings_.get());
+    out += ",\"taskbarScreens\":{\"configured\":";
+    out += screens.configured ? "true" : "false";
+    out += ",\"enabled\":[";
+    for (std::size_t index = 0; index < screens.ids.size(); ++index) {
+        if (index > 0) {
+            out += ",";
+        }
+        out += json_wstring(screens.ids[index]);
+    }
+    out += "]}";
 
     char const* kind = "waiting";
     if (view.kind == ViewKind::Content) {

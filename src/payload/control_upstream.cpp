@@ -13,7 +13,8 @@ namespace {
 // 有界：这是任务栏线程派出来的工作线程在等，主进程再忙也不能把它挂住太久。
 constexpr unsigned kControlSendTimeoutMs = 1500;
 
-bool send_op(std::wstring const& scope, ControlOp op, unsigned timeout_ms, std::string& error) {
+bool send_op(std::wstring const& scope, ControlOp op, std::vector<std::wstring> const& args,
+             unsigned timeout_ms, std::string& error) {
     std::wstring const class_name = scoped_name(kControlWindowClassBase, scope);
     HWND const window = ::FindWindowW(class_name.c_str(), nullptr);
     if (window == nullptr) {
@@ -24,6 +25,7 @@ bool send_op(std::wstring const& scope, ControlOp op, unsigned timeout_ms, std::
     ControlRequest request;
     request.op = op;
     request.sender_pid = ::GetCurrentProcessId();
+    request.args = args;
     std::string const payload = control_encode(request);
     if (payload.size() > kControlMaxPayloadBytes) {
         error = "控制载荷过大";
@@ -58,11 +60,17 @@ bool send_op(std::wstring const& scope, ControlOp op, unsigned timeout_ms, std::
 }  // namespace
 
 bool control_request_refresh(std::wstring const& scope, unsigned timeout_ms, std::string& error) {
-    return send_op(scope, ControlOp::Refresh, timeout_ms, error);
+    return send_op(scope, ControlOp::Refresh, {}, timeout_ms, error);
 }
 
 bool control_request_show_widget(std::wstring const& scope, unsigned timeout_ms, std::string& error) {
-    return send_op(scope, ControlOp::ShowWidget, timeout_ms, error);
+    return send_op(scope, ControlOp::ShowWidget, {}, timeout_ms, error);
+}
+
+bool control_request_set_screens(std::wstring const& scope,
+                                 std::vector<std::wstring> const& screen_ids, unsigned timeout_ms,
+                                 std::string& error) {
+    return send_op(scope, ControlOp::SetScreens, screen_ids, timeout_ms, error);
 }
 
 }  // namespace deskfeed::payload

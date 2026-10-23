@@ -51,6 +51,12 @@ namespace deskfeed::payload {
 enum class HookAction {
     Apply,
     Remove,
+    // 只摘掉读数块与悬停提示，保留已经解析出来的托盘元素：屏幕配置切换时会先关掉一块，
+    // 之后同一屏幕可能被重新勾选，不能为了这次隐藏把唯一的 XAML 入口放掉。
+    RemoveBlock,
+    // 把走查上报的句柄在任务栏线程上解析成 XAML 对象并映射到屏幕。元素解析只能发生在
+    // 拥有那棵树的线程上；走查本身仍由负载线程发起。
+    Resolve,
 };
 
 // 真正在任务栏线程上跑的那件事。返回 false 表示动作失败，原因写进 error。

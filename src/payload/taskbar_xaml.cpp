@@ -1,11 +1,13 @@
 #include "payload/taskbar_xaml.h"
 
 #include "core/utf8.h"
+#include "display/taskbar_layout.h"
 #include "payload/action_worker.h"
 #include "payload/hook_post.h"
 #include "payload/reg_hook.h"
 #include "payload/xaml_tap.h"
 #include "platform/log.h"
+#include "platform/screens.h"
 #include "platform/win32_util.h"
 
 #include <windows.h>
@@ -18,13 +20,16 @@
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Automation.Peers.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Documents.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <atomic>
+#include <cmath>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -37,6 +42,7 @@ namespace wuxc = winrt::Windows::UI::Xaml::Controls;
 namespace wuxd = winrt::Windows::UI::Xaml::Documents;
 namespace wuxi = winrt::Windows::UI::Xaml::Input;
 namespace wuxm = winrt::Windows::UI::Xaml::Media;
+namespace wuxap = winrt::Windows::UI::Xaml::Automation::Peers;
 
 // 任务栏托盘面板里那个容器的名字。读数是插进它的布局，不是叠在它上面。
 constexpr wchar_t kTrayElementName[] = L"SystemTrayFrameGrid";
@@ -87,9 +93,17 @@ struct State {
     HWND host_window = nullptr;
     size_t site_index = 0;
 
+    // 这一块状态对应的屏幕与任务栏线程。同一块任务栏上的所有操作都必须回到 thread_id。
+    std::wstring screen_id;
+    std::wstring label;
+    DWORD thread_id = 0;
+    bool primary = false;
+    bool available = false;  // 托盘元素已经解析出来（此后才允许插入）
+    bool enabled = false;    // 本次实际要显示（配置命中或退化命中）
+
     // 插进去的 XAML 对象。只在任务栏线程上被碰，放在这里是为了活过插入调用。
     wuxc::Border block{nullptr};
-    wuxc::TextBlock label{nullptr};
+    wuxc::TextBlock label_element{nullptr};
     wuxc::Grid column_owner{nullptr};
     wuxc::ColumnDefinition column{nullptr};
     std::vector<wux::FrameworkElement> shifted;
@@ -99,6 +113,10 @@ struct State {
     // 解析出来的托盘面板，**长期持有**：句柄只来自那唯一一次走查，解析一次之后诊断连接就关掉了，
     // 所以它是运行期唯一能碰的任务栏 XAML 入口（补插、验证都用它）。只在任务栏线程上被碰。
     wux::FrameworkElement tray_element{nullptr};
+    bool tray_element_held = false;
+
+    // 悬停提示属于具体那一块任务栏（两个屏幕同时显示时各弹各的，互不覆盖）。只在任务栏线程上碰。
+    HWND tooltip = nullptr;
 
     // 悬停命中模型：每个条目在块内的矩形与它**自己**的 tip（为空表示这一条没有可显示的提示）。
     std::vector<HoverCell> hover_cells;
@@ -117,23 +135,70 @@ struct State {
     unsigned slow_apply_ms = 0;
     bool probe_placeholder = false;
     bool probe_inline = false;
+    // 自测宿主：DeskFeedProbeWatch 走查到的句柄（还没有解析成对象）。
+    std::vector<std::uint64_t> watched_handles;
+
+    // 状态查询线程只能读原子量，绝不碰 XAML 对象。
+    std::atomic<bool> block_present{false};
 };
 
-State g_state;
+// 目标表只由负载线程（或自测宿主的 UI 线程）改写；状态查询用全局聚合量，不遍历它。
+std::vector<std::unique_ptr<State>> g_targets;
+
+// 当前正在被操作的那一块。负载线程把动作投递到任务栏线程后，执行体在 T 上按 context 设置它；
+// 任务栏自己的悬停/右键回调也会在进入时把它设成自己的那一块。用 thread_local 保证两条线程
+// 各自看到自己的目标，不靠一个跨线程共享的裸指针。
+thread_local State* g_current = nullptr;
+
+State& current_state() { return *g_current; }
+// 下面的绘制/悬停/菜单辅助函数都通过 `g_state` 访问“当前这一块”；它是 thread_local 的引用，
+// 不是跨线程共享的全局对象。进入任务栏回调或一次投递时由 CurrentTargetGuard 设置。
+#define g_state current_state()
 
 // 显示内容的进程内拷贝：负载线程写、任务栏线程读。
 std::mutex g_content_mutex;
 deskfeed::ReadingContent g_content;
 bool g_have_content = false;
 
-std::atomic<bool> g_block_present{false};
-std::atomic<bool> g_tray_element_held{false};
+// 屏幕配置：与显示帧里的 `screens_configured` / `screens` 一一对应。负载线程写，菜单线程在
+// 打开菜单时读一份快照，任务栏线程不碰它。
+std::mutex g_screen_config_mutex;
+bool g_screens_configured = false;
+std::vector<std::wstring> g_enabled_screens;
+
+std::atomic<bool> g_any_block_present{false};
 std::atomic<bool> g_diagnostics_closed{false};
 std::atomic<bool> g_attached{false};
-std::atomic<bool> g_probe_ack_window_used{false};
 
-HWND g_tooltip = nullptr;
+// 负载线程上保存的“上一次真正应用成功的读数”。每 250 ms 的一轮空转不应该再走一次钩子投递。
+ReadingContent g_last_applied_content;
+bool g_have_applied_content = false;
+bool g_last_degraded = false;
+
+// 自测宿主的进程内开关（探针在 UI 线程直接调用，不经过任务栏线程）。
+HWND g_probe_host_window = nullptr;
+unsigned g_probe_slow_apply_ms = 0;
+bool g_probe_inline_mode = false;
+bool g_probe_placeholder = false;
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+bool g_probe_override_mode = false;
+#endif
+
+// 走查得到的句柄：按站点索引存放。解析必须在任务栏线程上做（元素有线程亲和性），所以这里只
+// 先记下句柄，随后由 HookAction::Resolve 在 T 上解析。
+std::vector<std::vector<std::uint64_t>> g_watched_handles;
+
 HWND g_ack_window_override = nullptr;
+
+// 托盘右键菜单里的屏幕条目。菜单在**另一条线程**上弹出，所以这里保存一份快照；真正的目标表
+// 只由负载线程改写。
+struct MenuScreenEntry {
+    std::wstring id;
+    std::wstring label;
+    bool checked = false;
+};
+std::mutex g_menu_model_mutex;
+std::vector<MenuScreenEntry> g_menu_model;
 
 #ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 // 自测宿主登记的本进程托盘目标（见 taskbar_xaml.h 的 `taskbar_xaml_probe_set_tray_override`）。
@@ -227,8 +292,18 @@ UINT window_dpi(HWND window) {
 }
 
 double block_max_width() {
-    int const screen_width = ::GetSystemMetrics(SM_CXSCREEN);
+    int screen_width = ::GetSystemMetrics(SM_CXSCREEN);
     HWND const window = g_state.tray != nullptr ? g_state.tray : ::GetDesktopWindow();
+    // 每块任务栏用自己的显示器宽度：副屏分辨率/缩放与主屏不同时，拿主屏宽度会把块量错。
+    if (g_state.tray != nullptr) {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        HMONITOR const monitor =
+            ::MonitorFromWindow(g_state.tray, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr && ::GetMonitorInfoW(monitor, &info) != FALSE) {
+            screen_width = info.rcMonitor.right - info.rcMonitor.left;
+        }
+    }
     return kMaxWidthRatio * screen_width * 96.0 / static_cast<double>(window_dpi(window));
 }
 
@@ -256,6 +331,17 @@ std::vector<Segment> reading_segments(deskfeed::ReadingContent const& content, C
         }
     }
     return segments;
+}
+
+void refresh_any_block_present() {
+    bool any = false;
+    for (auto const& target : g_targets) {
+        if (target->block_present.load()) {
+            any = true;
+            break;
+        }
+    }
+    g_any_block_present.store(any);
 }
 
 void apply_segments(wuxc::TextBlock const& label, std::vector<Segment> const& segments) {
@@ -466,27 +552,27 @@ void rebuild_hover_model(deskfeed::ReadingContent const& content, ReadingPlan co
 // ---------- 悬停提示 ----------
 
 void destroy_tooltip() {
-    if (g_tooltip != nullptr) {
-        ::DestroyWindow(g_tooltip);
-        g_tooltip = nullptr;
+    if (g_state.tooltip != nullptr) {
+        ::DestroyWindow(g_state.tooltip);
+        g_state.tooltip = nullptr;
     }
 }
 
 // TOOLINFOW::cbSize 要按**本进程里实际生效的** comctl32 版本填：旧版本只认较小的结构，填大了
 // TTM_ADDTOOL 会失败，悬停就永远不出现。所以按候选值从大到小各试一次。
 bool create_tooltip(HWND owner) {
-    if (g_tooltip != nullptr) {
+    if (g_state.tooltip != nullptr) {
         return true;
     }
-    g_tooltip = ::CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+    g_state.tooltip = ::CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                   WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT,
                                   CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, owner, nullptr,
                                   ::GetModuleHandleW(nullptr), nullptr);
-    if (g_tooltip == nullptr) {
+    if (g_state.tooltip == nullptr) {
         log_format(L"cannot create the hover tooltip: %s", last_error_text().c_str());
         return false;
     }
-    ::SendMessageW(g_tooltip, TTM_SETMAXTIPWIDTH, 0, kHoverMaxTipWidth);
+    ::SendMessageW(g_state.tooltip, TTM_SETMAXTIPWIDTH, 0, kHoverMaxTipWidth);
 
     TOOLINFOW tool{};
     HINSTANCE const instance = ::GetModuleHandleW(nullptr);
@@ -503,7 +589,7 @@ bool create_tooltip(HWND owner) {
         tool.hinst = instance;
         tool.lpszText = const_cast<LPWSTR>(L"");
         tool.rect = RECT{0, 0, 0, 0};
-        if (::SendMessageW(g_tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool)) != FALSE) {
+        if (::SendMessageW(g_state.tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool)) != FALSE) {
             added = true;
             log_format(L"hover tooltip ready (TOOLINFOW::cbSize=%zu)", size);
             break;
@@ -520,7 +606,7 @@ bool create_tooltip(HWND owner) {
 // 命中条目变了（或刚从隐藏状态回到这一条）才走这里：换文字 + 定位 + 激活。这是**唯一**给提示框定
 // 位置的地方，并把"现在显示的是哪一条、哪份文字"记进状态。
 void show_tip(int hit, std::wstring const& text, POINT screen_at) {
-    if (g_tooltip == nullptr || text.empty()) {
+    if (g_state.tooltip == nullptr || text.empty()) {
         return;
     }
     TOOLINFOW tool{};
@@ -528,9 +614,9 @@ void show_tip(int hit, std::wstring const& text, POINT screen_at) {
     tool.hwnd = g_state.tray;
     tool.uId = 1;
     tool.lpszText = const_cast<LPWSTR>(text.c_str());
-    ::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
-    ::SendMessageW(g_tooltip, TTM_TRACKPOSITION, 0, MAKELPARAM(screen_at.x, screen_at.y));
-    ::SendMessageW(g_tooltip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    ::SendMessageW(g_state.tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+    ::SendMessageW(g_state.tooltip, TTM_TRACKPOSITION, 0, MAKELPARAM(screen_at.x, screen_at.y));
+    ::SendMessageW(g_state.tooltip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
     g_state.hover_shown_hit = hit;
     g_state.hover_shown_tip = text;
 }
@@ -538,7 +624,7 @@ void show_tip(int hit, std::wstring const& text, POINT screen_at) {
 // 还是同一条目，只是它自己的显示内容变了：只换文字，**绝不**重新定位、绝不重新激活。位置只在命中
 // 条目变化时给一次，提示框弹出来之后就不再跟着光标走。
 void update_tip_text(std::wstring const& text) {
-    if (g_tooltip == nullptr || g_state.hover_shown_hit < 0 || text.empty()) {
+    if (g_state.tooltip == nullptr || g_state.hover_shown_hit < 0 || text.empty()) {
         return;
     }
     TOOLINFOW tool{};
@@ -546,7 +632,7 @@ void update_tip_text(std::wstring const& text) {
     tool.hwnd = g_state.tray;
     tool.uId = 1;
     tool.lpszText = const_cast<LPWSTR>(text.c_str());
-    ::SendMessageW(g_tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+    ::SendMessageW(g_state.tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
     g_state.hover_shown_tip = text;
 }
 
@@ -555,14 +641,14 @@ void hide_tip() {
     // 目时会被那条早就不成立的缓存挡掉。
     g_state.hover_shown_hit = -1;
     g_state.hover_shown_tip.clear();
-    if (g_tooltip == nullptr) {
+    if (g_state.tooltip == nullptr) {
         return;
     }
     TOOLINFOW tool{};
     tool.cbSize = sizeof(TOOLINFOW);
     tool.hwnd = g_state.tray;
     tool.uId = 1;
-    ::SendMessageW(g_tooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+    ::SendMessageW(g_state.tooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
 }
 
 // ---------- 菜单（自己一条线程：TrackPopupMenu 内部是模态消息循环） ----------
@@ -576,21 +662,33 @@ bool g_menu_running = false;
 constexpr wchar_t kMenuOwnerClass[] = L"DeskFeedReadingMenuOwner";
 constexpr unsigned kMenuRefreshId = 1;
 constexpr unsigned kMenuShowWidgetId = 2;
+constexpr unsigned kMenuScreenBase = 100;
+
+// 当前这次弹出用的屏幕快照（由 start_menu 从 g_menu_model 复制）。菜单线程与收菜单都只通过
+// g_menu_mutex 访问它。
+std::vector<MenuScreenEntry> g_active_menu_entries;
 
 DWORD WINAPI menu_thread_entry(LPVOID parameter);
 
 void start_menu(int x, int y) {
+    std::vector<MenuScreenEntry> entries;
+    {
+        std::lock_guard<std::mutex> guard(g_menu_model_mutex);
+        entries = g_menu_model;
+    }
     std::lock_guard<std::mutex> guard(g_menu_mutex);
     if (g_menu_running || g_menu_thread != nullptr) {
         return;  // 合并：菜单已经开着就不再开第二个
     }
     g_menu_running = true;
+    g_active_menu_entries = std::move(entries);
     g_menu_thread = ::CreateThread(nullptr, 0, menu_thread_entry,
                                    reinterpret_cast<LPVOID>(static_cast<INT_PTR>(
                                        (static_cast<long long>(y) << 32) | static_cast<unsigned>(x))),
                                    0, &g_menu_thread_id);
     if (g_menu_thread == nullptr) {
         g_menu_running = false;
+        g_active_menu_entries.clear();
         log_format(L"cannot start the menu thread: %s", last_error_text().c_str());
     }
 }
@@ -620,6 +718,17 @@ DWORD WINAPI menu_thread_entry(LPVOID parameter) {
         HMENU const menu = ::CreatePopupMenu();
         ::AppendMenuW(menu, MF_STRING, kMenuRefreshId, L"立即刷新读数");
         ::AppendMenuW(menu, MF_STRING, kMenuShowWidgetId, L"打开桌面悬浮窗");
+        std::vector<MenuScreenEntry> const entries = g_active_menu_entries;
+        if (!entries.empty()) {
+            ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+                MenuScreenEntry const& entry = entries[index];
+                UINT const flags =
+                    MF_STRING | (entry.checked ? static_cast<UINT>(MF_CHECKED) : 0u);
+                ::AppendMenuW(menu, flags, kMenuScreenBase + static_cast<unsigned>(index),
+                              entry.label.c_str());
+            }
+        }
         ::SetForegroundWindow(owner);
         UINT const chosen = ::TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, owner,
                                              nullptr);
@@ -631,6 +740,22 @@ DWORD WINAPI menu_thread_entry(LPVOID parameter) {
             action_worker_post_refresh();
         } else if (chosen == kMenuShowWidgetId) {
             action_worker_post_show_widget();
+        } else if (chosen >= kMenuScreenBase &&
+                   chosen - kMenuScreenBase < entries.size()) {
+            // 菜单只改**启用集合**：把所有条目的当前勾复制一份，翻转被点的那一项，整份发给主进程。
+            // 不可用但仍勾着的条目会因此被取消；不可用且未勾的条目本来就不在快照里。
+            std::size_t const selected = chosen - kMenuScreenBase;
+            std::vector<std::wstring> screens;
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+                bool checked = entries[index].checked;
+                if (index == selected) {
+                    checked = !checked;
+                }
+                if (checked) {
+                    screens.push_back(entries[index].id);
+                }
+            }
+            action_worker_post_screens(std::move(screens));
         }
         ::DestroyWindow(owner);
     } else {
@@ -641,6 +766,7 @@ DWORD WINAPI menu_thread_entry(LPVOID parameter) {
         std::lock_guard<std::mutex> guard(g_menu_mutex);
         g_menu_owner = nullptr;
         g_menu_running = false;
+        g_active_menu_entries.clear();
     }
     return 0;
 }
@@ -713,7 +839,7 @@ bool close_menu(unsigned timeout_ms) {
 // ---------- 交互 ----------
 
 void on_pointer_moved(wuxc::Border const& block, wuxi::PointerRoutedEventArgs const& args) {
-    if (g_tooltip == nullptr || g_state.hover_cells.empty()) {
+    if (g_state.tooltip == nullptr || g_state.hover_cells.empty()) {
         return;
     }
     try {
@@ -779,17 +905,32 @@ void on_pointer_moved(wuxc::Border const& block, wuxi::PointerRoutedEventArgs co
     }
 }
 
+// 进入任务栏自己的回调时，把 thread_local 的“当前目标”设回这块 XAML 所属的那一个。回调可能在
+// 负载线程正在做别的目标时被派发，不能靠调用顺序保证。
+struct CurrentTargetGuard {
+    State* previous = nullptr;
+    explicit CurrentTargetGuard(State* target) : previous(g_current) { g_current = target; }
+    ~CurrentTargetGuard() { g_current = previous; }
+    CurrentTargetGuard(CurrentTargetGuard const&) = delete;
+    CurrentTargetGuard& operator=(CurrentTargetGuard const&) = delete;
+};
+
 void attach_interaction(wuxc::Border const& block) {
+    State* const target = g_current;
     try {
         // 背景必须是**透明但非 null** 的刷子：XAML 的命中测试要求非 null 背景，否则只有字形像素
         // 才吃指针，双击与右键大部分时候收不到。
         block.Background(wuxm::SolidColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(0, 0, 0, 0)));
-        block.PointerMoved([block](winrt::Windows::Foundation::IInspectable const&,
-                                   wuxi::PointerRoutedEventArgs const& args) {
+        block.PointerMoved([block, target](winrt::Windows::Foundation::IInspectable const&,
+                                           wuxi::PointerRoutedEventArgs const& args) {
+            CurrentTargetGuard guard(target);
             on_pointer_moved(block, args);
         });
-        block.PointerExited([block](winrt::Windows::Foundation::IInspectable const&,
-                                    wuxi::PointerRoutedEventArgs const&) { hide_tip(); });
+        block.PointerExited([target](winrt::Windows::Foundation::IInspectable const&,
+                                     wuxi::PointerRoutedEventArgs const&) {
+            CurrentTargetGuard guard(target);
+            hide_tip();
+        });
         // 双击 = 把桌面悬浮窗叫出来（与旧交互一致）。
         block.DoubleTapped([](winrt::Windows::Foundation::IInspectable const&,
                               wuxi::DoubleTappedRoutedEventArgs const&) {
@@ -817,18 +958,18 @@ bool insert_into(wux::FrameworkElement const& tray_element, deskfeed::ReadingCon
     g_state.block.Name(kBlockName);
     // 托盘那一行比读数高，块必须自己在行里居中：默认的 Stretch 会把它拉满整行、文字顶到上沿。
     g_state.block.VerticalAlignment(wux::VerticalAlignment::Center);
-    g_state.label = wuxc::TextBlock();
-    g_state.label.Name(kReadingName);
-    g_state.label.FontSize(plan.font);
+    g_state.label_element = wuxc::TextBlock();
+    g_state.label_element.Name(kReadingName);
+    g_state.label_element.FontSize(plan.font);
     // 常规字重：前缀与数值只用取色区分。
-    g_state.label.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
-    g_state.label.TextTrimming(wux::TextTrimming::CharacterEllipsis);
-    g_state.label.VerticalAlignment(wux::VerticalAlignment::Center);
-    g_state.label.MaxWidth(max_width);
+    g_state.label_element.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
+    g_state.label_element.TextTrimming(wux::TextTrimming::CharacterEllipsis);
+    g_state.label_element.VerticalAlignment(wux::VerticalAlignment::Center);
+    g_state.label_element.MaxWidth(max_width);
 
     std::vector<Segment> const segments = reading_segments(content, colors, plan.per_line);
-    apply_segments(g_state.label, segments);
-    g_state.block.Child(g_state.label);
+    apply_segments(g_state.label_element, segments);
+    g_state.block.Child(g_state.label_element);
     attach_interaction(g_state.block);
     // 悬停提示的属主窗口：任务栏窗口，自测宿主里是宿主自己的窗口（没有 Shell_TrayWnd）。
     create_tooltip(g_state.tray != nullptr ? g_state.tray : g_state.host_window);
@@ -860,7 +1001,7 @@ bool insert_into(wux::FrameworkElement const& tray_element, deskfeed::ReadingCon
     } else {
         error = L"托盘元素既不是 Grid 也不是 StackPanel";
         g_state.block = nullptr;
-        g_state.label = nullptr;
+        g_state.label_element = nullptr;
         return false;
     }
 
@@ -871,7 +1012,8 @@ bool insert_into(wux::FrameworkElement const& tray_element, deskfeed::ReadingCon
     } catch (winrt::hresult_error const&) {
     }
     rebuild_hover_model(content, plan, plan.width, plan.height);
-    g_block_present.store(true);
+    g_state.block_present.store(true);
+    g_any_block_present.store(true);
     return true;
 }
 
@@ -900,20 +1042,21 @@ void remove_block() {
         }
     }
     g_state.block = nullptr;
-    g_state.label = nullptr;
+    g_state.label_element = nullptr;
     g_state.column_owner = nullptr;
     g_state.column = nullptr;
     g_state.shifted.clear();
     g_state.runs.clear();
     g_state.applied.clear();
     g_state.hover_cells.clear();
-    g_block_present.store(false);
+    g_state.block_present.store(false);
+    refresh_any_block_present();
     hide_tip();
 }
 
 bool update_block(deskfeed::ReadingContent const& content, Colors const& colors, double max_width,
                   std::wstring& error) {
-    if (g_state.block == nullptr || g_state.label == nullptr) {
+    if (g_state.block == nullptr || g_state.label_element == nullptr) {
         error = L"块不在树里";
         return false;
     }
@@ -933,13 +1076,13 @@ bool update_block(deskfeed::ReadingContent const& content, Colors const& colors,
             g_state.runs[run_index].Foreground(wuxm::SolidColorBrush(segments[index].color));
             ++run_index;
         }
-        if (g_state.label.FontSize() != plan.font) {
-            g_state.label.FontSize(plan.font);
+        if (g_state.label_element.FontSize() != plan.font) {
+            g_state.label_element.FontSize(plan.font);
         }
     } else {
-        apply_segments(g_state.label, segments);
-        g_state.label.FontSize(plan.font);
-        g_state.label.MaxWidth(max_width);
+        apply_segments(g_state.label_element, segments);
+        g_state.label_element.FontSize(plan.font);
+        g_state.label_element.MaxWidth(max_width);
     }
     rebuild_hover_model(content, plan, plan.width, plan.height);
     log_format(L"reading block updated (rows=%zu per_line=%zu lines=%zu font=%.1f)",
@@ -956,9 +1099,267 @@ bool current_content(deskfeed::ReadingContent& out) {
     return true;
 }
 
-bool resolve_tray_element(winrt::Windows::Foundation::IInspectable& element, std::wstring& error) {
+// ---------- 屏幕 → 任务栏目标 ----------
+
+// 从托盘元素反查它所在显示器的稳定标识。元素本身不暴露 HWND/屏幕坐标，但 UIA 的边界矩形是
+// **屏幕坐标**，而每个任务栏岛都有可用的 automation peer（Grid 没有就沿父链找一个）。拿不到
+// 时返回空串，调用方退回“按走查顺序配对”的有界降级——绝不猜测某一块屏幕。
+std::wstring screen_id_for_element(wux::FrameworkElement const& element) {
+    wux::FrameworkElement current = element;
+    for (int depth = 0; depth < 12 && current != nullptr; ++depth) {
+        try {
+            auto const peer = wuxap::FrameworkElementAutomationPeer::CreatePeerForElement(current);
+            if (peer != nullptr) {
+                winrt::Windows::Foundation::Rect const bounds = peer.GetBoundingRectangle();
+                if (bounds.Width > 0.0 && bounds.Height > 0.0) {
+                    RECT rect{};
+                    rect.left = static_cast<LONG>(std::floor(bounds.X));
+                    rect.top = static_cast<LONG>(std::floor(bounds.Y));
+                    rect.right = static_cast<LONG>(std::ceil(bounds.X + bounds.Width));
+                    rect.bottom = static_cast<LONG>(std::ceil(bounds.Y + bounds.Height));
+                    std::wstring const id = screen_id_for_rect(rect);
+                    if (!id.empty()) {
+                        return id;
+                    }
+                }
+            }
+        } catch (winrt::hresult_error const&) {
+            // 某些元素没有 automation peer，或者取边界时窗口正在销毁：沿父链再试。
+        } catch (...) {
+        }
+        auto const parent = current.Parent();
+        current = parent != nullptr ? parent.try_as<wux::FrameworkElement>() : nullptr;
+    }
+    return std::wstring();
+}
+
+bool screen_config_contains(std::vector<std::wstring> const& ids, std::wstring const& id) {
+    for (std::wstring const& existing : ids) {
+        if (taskbar_screen_ids_equal(existing, id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct ScreenConfigSnapshot {
+    bool configured = false;
+    std::vector<std::wstring> enabled;
+};
+
+ScreenConfigSnapshot snapshot_screen_config() {
+    std::lock_guard<std::mutex> guard(g_screen_config_mutex);
+    ScreenConfigSnapshot snapshot;
+    snapshot.configured = g_screens_configured;
+    snapshot.enabled = g_enabled_screens;
+    return snapshot;
+}
+
+bool same_reading(deskfeed::ReadingContent const& left, deskfeed::ReadingContent const& right) {
+    if (left.failure != right.failure || left.alarm != right.alarm || left.reason != right.reason ||
+        left.rows.size() != right.rows.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.rows.size(); ++index) {
+        deskfeed::ReadingRow const& a = left.rows[index];
+        deskfeed::ReadingRow const& b = right.rows[index];
+        if (a.label != b.label || a.value != b.value || a.tone != b.tone || a.state != b.state ||
+            a.tip != b.tip || a.detail != b.detail) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+bool create_probe_target(std::wstring& error) {
+    if (!hook_post_probe_armed()) {
+        return false;
+    }
+    HWND const window = g_probe_tray_override.load(std::memory_order_acquire);
+    if (window == nullptr) {
+        error = L"自测宿主已经登记过托盘目标，当前没有可用的覆盖窗口";
+        return false;
+    }
+    if (::IsWindow(window) == FALSE) {
+        error = L"自测宿主指定的托盘窗口已经不在了";
+        return false;
+    }
+    DWORD owner_pid = 0;
+    DWORD const owner_thread = ::GetWindowThreadProcessId(window, &owner_pid);
+    if (owner_pid != ::GetCurrentProcessId() || owner_thread == 0) {
+        error = L"自测宿主指定的托盘窗口不属于本进程";
+        return false;
+    }
+    auto target = std::make_unique<State>();
+    target->tray = window;
+    target->thread_id = owner_thread;
+    target->screen_id = primary_screen_id();
+    if (target->screen_id.empty()) {
+        target->screen_id = L"probe-screen";
+    }
+    target->label = L"屏幕 1（主）";
+    target->primary = true;
+    target->host_window = g_probe_host_window;
+    target->slow_apply_ms = g_probe_slow_apply_ms;
+    target->probe_placeholder = g_probe_placeholder;
+    target->probe_inline = g_probe_inline_mode;
+    g_probe_override_mode = true;
+    g_targets.push_back(std::move(target));
+    return true;
+}
+#endif
+
+bool create_targets(std::wstring& error) {
+    g_targets.clear();
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+    if (hook_post_probe_armed()) {
+        return create_probe_target(error);
+    }
+#endif
+    std::vector<TaskbarWindowInfo> const windows = enumerate_taskbar_windows();
+    if (windows.empty()) {
+        error = L"找不到任务栏窗口（Shell_TrayWnd / Shell_SecondaryTrayWnd）";
+        return false;
+    }
+    // 所有任务栏窗口必须属于同一条 UI 线程：本模块的钩子收尾证明（完成事件 + 对 T 的 ack ping）
+    // 是一条线程一份的，跨线程目标会让“最后一条已退休”冒充所有线程都退休。Windows 11 的任务栏
+    // 由同一条 shell UI 线程创建；遇到别的形状就保守地只认第一条线程上的窗口。
+    DWORD const taskbar_thread = windows.front().thread_id;
+    for (TaskbarWindowInfo const& window : windows) {
+        DWORD owner_pid = 0;
+        DWORD const owner_thread = ::GetWindowThreadProcessId(window.window, &owner_pid);
+        if (owner_pid != ::GetCurrentProcessId()) {
+            continue;
+        }
+        if (owner_thread != taskbar_thread) {
+            log_format(L"taskbar screen %s is on thread %lu, not the taskbar thread %lu; skipped",
+                       window.screen_id.c_str(), owner_thread, taskbar_thread);
+            continue;
+        }
+        auto target = std::make_unique<State>();
+        target->tray = window.window;
+        target->thread_id = owner_thread;
+        target->screen_id = window.screen_id;
+        target->label = window.label;
+        target->primary = window.primary;
+        target->host_window = g_probe_host_window;
+        g_targets.push_back(std::move(target));
+    }
+    if (g_targets.empty()) {
+        error = L"任务栏窗口不属于本进程或没有共同的 UI 线程";
+        return false;
+    }
+    return true;
+}
+
+bool execute_hook_action(void* context, HookAction action, std::wstring& error);
+
+// 在任务栏线程上执行：把已经走查到的句柄解析成对象，并映射到屏幕。`xaml_tap_resolve` 返回的
+// 元素属于这条线程；UIA 的屏幕边界也必须在同一条线程上取（XAML 元素有线程亲和性）。
+bool resolve_watched_elements(std::wstring& error) {
+    std::vector<XamlTapSite> const sites = xaml_tap_sites();
+    if (sites.empty()) {
+        error = L"没有 XAML 核心交出诊断站点";
+        return false;
+    }
+
+    struct Pending {
+        wux::FrameworkElement element{nullptr};
+        DWORD thread_id = 0;
+    };
+    std::vector<Pending> pending;
+
+    for (std::size_t index = 0; index < sites.size() && index < g_watched_handles.size(); ++index) {
+        for (std::uint64_t const handle : g_watched_handles[index]) {
+            winrt::Windows::Foundation::IInspectable element{nullptr};
+            std::wstring resolve_error;
+            if (!xaml_tap_resolve(index, handle, element, resolve_error)) {
+                log_format(L"taskbar xaml: core %zu handle %llu: %s", index, handle,
+                           resolve_error.c_str());
+                continue;
+            }
+            auto const framework = element.try_as<wux::FrameworkElement>();
+            if (framework == nullptr) {
+                continue;
+            }
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+            if (g_probe_override_mode) {
+                for (auto& target : g_targets) {
+                    if (target->tray_element == nullptr) {
+                        target->tray_element = framework;
+                        target->tray_element_held = true;
+                        target->available = true;
+                        target->site_index = index;
+                        break;
+                    }
+                }
+                continue;
+            }
+#endif
+            std::wstring const screen_id = screen_id_for_element(framework);
+            State* chosen = nullptr;
+            for (auto& target : g_targets) {
+                if (target->tray_element == nullptr && target->thread_id == sites[index].thread_id &&
+                    !screen_id.empty() && taskbar_screen_ids_equal(target->screen_id, screen_id)) {
+                    chosen = target.get();
+                    break;
+                }
+            }
+            if (chosen == nullptr) {
+                pending.push_back(Pending{framework, sites[index].thread_id});
+                continue;
+            }
+            chosen->tray_element = framework;
+            chosen->tray_element_held = true;
+            chosen->available = true;
+            chosen->site_index = index;
+            log_format(L"taskbar xaml: mapped tray element of core %zu to %s (%s)", index,
+                       chosen->label.c_str(), chosen->screen_id.c_str());
+        }
+    }
+
+    // UIA 边界矩形拿不到（或 peer 尚未结算）时的有界降级：只把剩余元素按走查顺序配给同一条
+    // 任务栏线程上尚未配对的屏幕，并明确记日志。绝不跨线程配对，也绝不据此改写配置。
+    for (Pending const& item : pending) {
+        for (auto& target : g_targets) {
+            if (target->tray_element == nullptr && target->thread_id == item.thread_id) {
+                target->tray_element = item.element;
+                target->tray_element_held = true;
+                target->available = true;
+                log_format(L"taskbar xaml: %s mapped by walk order (the screen could not be identified)",
+                           target->label.c_str());
+                break;
+            }
+        }
+    }
+
+    bool any = false;
+    for (auto const& target : g_targets) {
+        if (target->available && target->tray_element != nullptr) {
+            any = true;
+            log_format(L"taskbar target: %s (%s) on thread %lu", target->label.c_str(),
+                       target->screen_id.c_str(), target->thread_id);
+        } else {
+            log_format(L"taskbar target unavailable: %s (%s)", target->label.c_str(),
+                       target->screen_id.c_str());
+        }
+    }
+    if (!any) {
+        error = L"没有解析出任何托盘元素";
+    }
+    return any;
+}
+
+// 负载线程：对每个诊断核心走查一次，把句柄交给任务栏线程解析。走查与解析必须分开——
+// 走查不能在该核心自己的线程上调用，而解析必须在它自己的线程上。
+bool watch_and_resolve_target_elements(std::wstring& error) {
     if (g_diagnostics_closed.load()) {
         error = L"诊断连接已经关掉，无法再解析元素";
+        return false;
+    }
+    if (g_targets.empty()) {
+        error = L"没有任务栏目标";
         return false;
     }
     std::vector<XamlTapSite> const sites = xaml_tap_sites();
@@ -966,25 +1367,112 @@ bool resolve_tray_element(winrt::Windows::Foundation::IInspectable& element, std
         error = L"没有 XAML 核心交出诊断站点";
         return false;
     }
-    size_t chosen = 0;
-    for (size_t index = 0; index < sites.size(); ++index) {
-        if (g_state.tray != nullptr && sites[index].thread_id == ::GetWindowThreadProcessId(g_state.tray, nullptr)) {
-            chosen = index;
+
+    // 只走查与任务栏窗口同一条线程的核心：XAML 岛由任务栏 UI 线程承载，别的核心（开始菜单等）
+    // 不可能有这次要的那棵树。少走一个核心就少一次最高风险的操作。
+    DWORD const taskbar_thread = g_targets.front()->thread_id;
+    std::vector<std::size_t> candidates;
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        if (sites[index].thread_id == taskbar_thread) {
+            candidates.push_back(index);
+        }
+    }
+    if (candidates.empty()) {
+        error = L"没有与任务栏线程同线程的 XAML 核心";
+        return false;
+    }
+
+    g_watched_handles.assign(sites.size(), {});
+    for (std::size_t const index : candidates) {
+        std::vector<std::uint64_t> matches;
+        std::wstring watch_error;
+        if (!xaml_tap_watch(index, kTrayElementName, matches, watch_error)) {
+            log_format(L"taskbar xaml: core %zu: %s", index, watch_error.c_str());
+            xaml_tap_release_walk(index);
+            continue;
+        }
+        g_watched_handles[index] = std::move(matches);
+
+        hook_post_set_executor(&execute_hook_action, nullptr);
+        HookPostResult const posted =
+            hook_post_run(g_targets.front()->thread_id, HookAction::Resolve, kPostTimeoutMs);
+        // 解析返回的对象各自持有一份引用；这个站点上报过的句柄现在可以整体还回去了。
+        g_watched_handles[index].clear();
+        xaml_tap_release_walk(index);
+        if (!posted.ok) {
+            error = posted.error.empty() ? L"任务栏线程没有解析托盘元素" : posted.error;
+            continue;
+        }
+
+        bool all_assigned = true;
+        for (auto const& target : g_targets) {
+            if (target->tray_element == nullptr) {
+                all_assigned = false;
+                break;
+            }
+        }
+        if (all_assigned) {
             break;
         }
     }
-    g_state.site_index = chosen;
-    if (!xaml_tap_resolve(chosen, element, error)) {
-        return false;
+    g_watched_handles.clear();
+
+    bool any = false;
+    for (auto const& target : g_targets) {
+        if (target->available && target->tray_element != nullptr) {
+            any = true;
+            break;
+        }
     }
-    return true;
+    if (!any) {
+        error = L"没有解析出任何托盘元素";
+    }
+    return any;
 }
 
-// 任务栏线程上的动作体：解析（首次）/ 应用 / 摘除。它由 hook_post 在 T 上调用，异常边界在
-// hook_post 里；这里只做工作。
+void update_menu_model(ScreenConfigSnapshot const& config) {
+    std::vector<MenuScreenEntry> entries;
+    for (auto const& target : g_targets) {
+        if (!target->available || target->tray_element == nullptr) {
+            continue;
+        }
+        MenuScreenEntry entry;
+        entry.id = target->screen_id;
+        entry.label = target->label.empty() ? std::wstring(L"屏幕") : target->label;
+        entry.checked = config.configured ? screen_config_contains(config.enabled, target->screen_id)
+                                          : target->primary;
+        entries.push_back(std::move(entry));
+    }
+    // 配置里启用但当前不可用的屏幕也要能在菜单里取消，否则一块拔掉的屏幕会让退化状态永远跟着
+    // 用户；它们显示成“已断开的屏幕”，勾仍然是按配置来的。
+    for (std::wstring const& id : config.enabled) {
+        bool known = false;
+        for (MenuScreenEntry const& entry : entries) {
+            if (taskbar_screen_ids_equal(entry.id, id)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            MenuScreenEntry entry;
+            entry.id = id;
+            entry.label = L"已断开的屏幕";
+            entry.checked = true;
+            entries.push_back(std::move(entry));
+        }
+    }
+    std::lock_guard<std::mutex> guard(g_menu_model_mutex);
+    g_menu_model = std::move(entries);
+}
+
+// 任务栏线程上的动作体：应用当前读数。元素在 attach 阶段已经解析并持有；运行期绝不重连诊断。
 bool apply_task(bool allow_placeholder, bool& visible, std::wstring& error) {
     if (g_state.slow_apply_ms != 0) {
         ::Sleep(g_state.slow_apply_ms);
+    }
+    if (g_state.tray_element == nullptr) {
+        error = L"这块屏幕没有可用的托盘元素";
+        return false;
     }
 
     deskfeed::ReadingContent content;
@@ -1003,28 +1491,11 @@ bool apply_task(bool allow_placeholder, bool& visible, std::wstring& error) {
     Colors const colors = colors_for(light_taskbar(g_state.tray_element));
     double const max_width = block_max_width();
 
-    // 首次解析并持有托盘元素必须在"条目为空就摘块"这个判断**之前**：诊断连接只走查一次、随后立刻
-    // 关闭，而合法的 Waiting/[]（刚开始取数、还没有条目）同样是有效读数。这一次不把元素拿住，
-    // 之后的正常快照就再也插不进去——`request_update` 只能用已持有的元素补插，绝不重连、绝不重走查。
-    if (g_state.tray_element == nullptr) {
-        winrt::Windows::Foundation::IInspectable element{nullptr};
-        if (!resolve_tray_element(element, error)) {
-            return false;
-        }
-        g_state.tray_element = element.try_as<wux::FrameworkElement>();
-        if (g_state.tray_element == nullptr) {
-            error = L"解析出来的元素不是 FrameworkElement";
-            return false;
-        }
-        g_tray_element_held.store(true);
-        log_format(L"resolved %s (held for the whole run; the diagnostics are closed right after this)",
-                   winrt::get_class_name(g_state.tray_element).c_str());
-    }
-
     if (content.rows.empty()) {
         // 没有可显示的条目：把块摘掉（整块隐藏），元素照旧持有；读数回来时由 `request_update` 补插。
         if (g_state.block != nullptr) {
             remove_block();
+            destroy_tooltip();
         }
         visible = false;
         return true;
@@ -1047,94 +1518,244 @@ bool apply_task(bool allow_placeholder, bool& visible, std::wstring& error) {
     return true;
 }
 
-bool remove_task(bool& faulted) {
-    (void)faulted;
+// 只摘块与悬停提示，保留托盘元素（屏幕配置切换后可能还要插回去）。
+bool remove_block_only() {
     remove_block();
     destroy_tooltip();
+    return true;
+}
+
+bool remove_task(bool& faulted) {
+    (void)faulted;
+    remove_block_only();
     // 摘除是收尾动作，之后不会再插回去：把持有的托盘元素引用也在这里放掉（元素属于任务栏自己的
     // 树，任务栏自己还持有它，这里放的只是本模块那一份）。
     g_state.tray_element = nullptr;
-    g_tray_element_held.store(false);
+    g_state.tray_element_held = false;
+    g_state.available = false;
+    g_state.enabled = false;
     return true;
 }
 
 // hook_post 的执行体：**没有异常可以穿出去**（hook_post 里有 SEH + C++ 双边界）。
 bool execute_hook_action(void* context, HookAction action, std::wstring& error) {
-    (void)context;
+    if (action == HookAction::Resolve) {
+        return resolve_watched_elements(error);
+    }
+    State* target = static_cast<State*>(context);
+    if (target == nullptr && g_targets.size() == 1) {
+        // 自测宿主的 DeskFeedProbePostApply 直接调 hook_post_run，没有传 context：只有一块目标时
+        // 它没有歧义。
+        target = g_targets.front().get();
+    }
+    if (target == nullptr) {
+        error = L"没有可操作的任务栏目标";
+        return false;
+    }
+    CurrentTargetGuard guard(target);
     bool visible = false;
     if (action == HookAction::Apply) {
-        return apply_task(g_state.probe_placeholder, visible, error);
+        return apply_task(target->probe_placeholder, visible, error);
+    }
+    if (action == HookAction::RemoveBlock) {
+        return remove_block_only();
     }
     bool faulted = false;
     return remove_task(faulted);
 }
 
+bool post_action(State& target, HookAction action, unsigned timeout_ms, std::wstring& error) {
+    if (target.tray == nullptr || ::IsWindow(target.tray) == FALSE) {
+        error = L"任务栏窗口已经不在了";
+        return false;
+    }
+    hook_post_set_executor(&execute_hook_action, &target);
+    HookPostResult const posted = hook_post_run(target.thread_id, action, timeout_ms);
+    if (!posted.ok) {
+        error = posted.error.empty() ? L"任务栏线程没有完成动作" : posted.error;
+        return false;
+    }
+    return true;
+}
+
+// 把“配置 → 实际显示在哪几块屏”算出来并落到每块任务栏。它是唯一会增删块的入口：
+// attach 第一轮、每一帧读数、以及配置变化带来的下一帧都会走这里。
+void reconcile_targets(bool force_apply) {
+    if (g_targets.empty()) {
+        return;
+    }
+
+    ScreenConfigSnapshot const config = snapshot_screen_config();
+
+    for (auto& target : g_targets) {
+        if (!target->available) {
+            continue;
+        }
+        if (target->tray == nullptr || ::IsWindow(target->tray) == FALSE) {
+            log_format(L"taskbar screen %s disappeared; its target is no longer available",
+                       target->screen_id.c_str());
+            target->available = false;
+            target->enabled = false;
+            target->block_present.store(false);
+            target->tooltip = nullptr;  // 窗口已经没了，不在负载线程碰它的 XAML/子窗口
+            refresh_any_block_present();
+        }
+    }
+
+    std::vector<std::wstring> available;
+    for (auto const& target : g_targets) {
+        if (target->available && target->tray_element != nullptr) {
+            available.push_back(target->screen_id);
+        }
+    }
+
+    deskfeed::TaskbarScreenSelectionInput input;
+    input.configured = config.configured;
+    input.enabled = config.enabled;
+    input.primary = primary_screen_id();
+    input.available = available;
+    deskfeed::TaskbarScreenSelection const selection = deskfeed::select_taskbar_screens(input);
+    if (selection.degraded != g_last_degraded) {
+        g_last_degraded = selection.degraded;
+        if (selection.degraded) {
+            log_line(L"taskbar: none of the configured screens is available; degrading to the primary "
+                     L"screen for this run (the configuration is unchanged)");
+        } else {
+            log_line(L"taskbar: the configured screen set is available again; degradation is over");
+        }
+    }
+
+    update_menu_model(config);
+
+    deskfeed::ReadingContent content;
+    bool const have_content = current_content(content);
+    bool const content_changed =
+        force_apply || !g_have_applied_content || !have_content ||
+        !same_reading(content, g_last_applied_content);
+    bool all_ok = true;
+
+    for (auto& target : g_targets) {
+        State& state = *target;
+        if (!state.available || state.tray_element == nullptr) {
+            state.enabled = false;
+            continue;
+        }
+        bool const wanted = screen_config_contains(selection.selected, state.screen_id);
+        // 读数合法但没有条目时，块本就该隐藏；元素继续持有，等下一帧再插回去。
+        bool const should_show = wanted && have_content && !content.rows.empty();
+
+        if (!should_show) {
+            if (state.block_present.load() || state.tooltip != nullptr) {
+                std::wstring error;
+                bool ok = true;
+                if (state.probe_inline) {
+                    CurrentTargetGuard guard(&state);
+                    ok = remove_block_only();
+                } else {
+                    ok = post_action(state, HookAction::RemoveBlock, kPostTimeoutMs, error);
+                }
+                if (!ok) {
+                    all_ok = false;
+                    log_format(L"taskbar: cannot hide the block on %s: %s", state.label.c_str(),
+                               error.c_str());
+                }
+            }
+            state.enabled = wanted;
+            continue;
+        }
+
+        if (!state.enabled || force_apply || content_changed || !state.block_present.load()) {
+            std::wstring error;
+            bool ok = true;
+            if (state.probe_inline) {
+                CurrentTargetGuard guard(&state);
+                bool visible = false;
+                ok = apply_task(state.probe_placeholder, visible, error);
+            } else {
+                ok = post_action(state, HookAction::Apply, kPostTimeoutMs, error);
+            }
+            if (ok) {
+                state.enabled = true;
+            } else {
+                all_ok = false;
+                state.enabled = false;
+                log_format(L"taskbar: cannot apply the block on %s: %s", state.label.c_str(),
+                           error.c_str());
+            }
+        }
+    }
+
+    if (all_ok) {
+        g_last_applied_content = content;
+        g_have_applied_content = true;
+    }
+}
+
 }  // namespace
+
 
 bool taskbar_xaml_watch(std::wstring& error) {
     if (xaml_tap_sites().empty()) {
         error = L"没有 XAML 核心交出诊断站点";
         return false;
     }
-    // 走查只挑一个站点（任务栏那条线程上的核心优先），**不重试**：重试就是又一次走查。
-    size_t chosen = 0;
+
     std::vector<XamlTapSite> const sites = xaml_tap_sites();
-    if (g_state.tray != nullptr) {
-        DWORD const tray_thread = ::GetWindowThreadProcessId(g_state.tray, nullptr);
-        for (size_t index = 0; index < sites.size(); ++index) {
-            if (sites[index].thread_id == tray_thread) {
-                chosen = index;
-                break;
+
+    // 自测宿主的结构模式没有真实任务栏窗口：先走查 0 号核心，再用它报出的线程建一个合成目标。
+    // 这不会回退到真实 Shell_TrayWnd——探针的树由宿主自己的 XAML 岛提供。
+    if (g_targets.empty()) {
+#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
+        if (hook_post_probe_armed()) {
+            if (!create_targets(error)) {
+                return false;
             }
+        } else
+#endif
+        {
+            std::vector<std::uint64_t> matches;
+            if (!xaml_tap_watch(0, kTrayElementName, matches, error)) {
+                return false;
+            }
+            auto target = std::make_unique<State>();
+            target->thread_id = sites[0].thread_id;
+            target->screen_id = primary_screen_id();
+            if (target->screen_id.empty()) {
+                target->screen_id = L"probe-screen";
+            }
+            target->label = L"屏幕 1（主）";
+            target->primary = true;
+            target->probe_inline = true;
+            target->host_window = g_probe_host_window;
+            target->site_index = 0;
+            target->watched_handles = std::move(matches);
+            g_targets.push_back(std::move(target));
+            return true;
         }
     }
-    g_state.site_index = chosen;
-    return xaml_tap_watch(chosen, kTrayElementName, error);
+
+    // 自测宿主：只挑与目标任务栏同一条线程的核心。额外核心的树用不同的名字（见 probe 的
+    // --cores），所以这里不会把别的东西当成托盘。**不重试**：重试就是又一次走查。
+    DWORD const target_thread = g_targets.front()->thread_id;
+    std::size_t chosen = 0;
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        if (sites[index].thread_id == target_thread) {
+            chosen = index;
+            break;
+        }
+    }
+    std::vector<std::uint64_t> matches;
+    if (!xaml_tap_watch(chosen, kTrayElementName, matches, error)) {
+        return false;
+    }
+    g_targets.front()->site_index = chosen;
+    g_targets.front()->watched_handles = std::move(matches);
+    return true;
 }
 
 bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
     (void)scope;
     hook_post_set_executor(&execute_hook_action, nullptr);
-#ifdef DESKFEED_PAYLOAD_PROBE_BUILD
-    // 自测宿主登记过托盘目标（`DeskFeedProbeSetTrayWindow`，`--feed` 那条路）时**只认**它：
-    //   * 登记过但窗口已经不在 / 不属于本进程 / 线程号为零 ⇒ 直接失败，**绝不**回退 FindWindow；
-    //   * `armed` 为真而覆盖窗口是空的（例如只有 armed 没有窗口这种坏状态）⇒ 同样直接失败，
-    //     绝不让这条回退把帧投到真实的 Shell_TrayWnd 上去。
-    // 生产构建里整段不编译：`attach` 还是那条 `FindWindowW(Shell_TrayWnd/Shell_SecondaryTrayWnd)` 链。
-    if (hook_post_probe_armed()) {
-        HWND const override_window = g_probe_tray_override.load(std::memory_order_acquire);
-        if (override_window == nullptr) {
-            error = L"自测宿主已经登记过托盘目标，当前没有可用的覆盖窗口";
-            return false;
-        }
-        if (::IsWindow(override_window) == FALSE) {
-            error = L"自测宿主指定的托盘窗口已经不在了";
-            return false;
-        }
-        DWORD owner_pid = 0;
-        DWORD const owner_thread = ::GetWindowThreadProcessId(override_window, &owner_pid);
-        if (owner_pid != ::GetCurrentProcessId() || owner_thread == 0) {
-            error = L"自测宿主指定的托盘窗口不属于本进程";
-            return false;
-        }
-        g_state.tray = override_window;
-    } else
-#endif
-    {
-        g_state.tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (g_state.tray == nullptr) {
-            g_state.tray = ::FindWindowW(L"Shell_SecondaryTrayWnd", nullptr);
-        }
-        if (g_state.tray == nullptr) {
-            error = L"找不到 Shell_TrayWnd";
-            return false;
-        }
-    }
-    DWORD const tray_thread = ::GetWindowThreadProcessId(g_state.tray, nullptr);
-    if (tray_thread == 0) {
-        error = L"找不到任务栏线程";
-        return false;
-    }
 
     // composition 规避必须在真正连接诊断之前装好：XAML 读完之后会缓存那个结论，装晚了就没用。
     // 失败只记日志——退化成不做规避的旧行为，而不是不插块。
@@ -1148,12 +1769,21 @@ bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
                    hook_error.c_str());
     }
 
-    if (!xaml_tap_start(error)) {
-        // 连接失败也要把导入表恢复回去：规避钩子没有用了，不能留在进程里。
+    auto restore_iat = [] {
         std::wstring restore_error;
         if (!reg_hook_restore(restore_error)) {
             log_format(L"reg hook: restore failed: %s", restore_error.c_str());
         }
+    };
+
+    if (!create_targets(error)) {
+        restore_iat();
+        return false;
+    }
+
+    if (!xaml_tap_start(error)) {
+        // 连接失败也要把导入表恢复回去：规避钩子没有用了，不能留在进程里。
+        restore_iat();
         return false;
     }
 
@@ -1161,40 +1791,41 @@ bool taskbar_xaml_attach(std::wstring const& scope, std::wstring& error) {
     // SetSite 常常还在路上；走查一开始、诊断关闭一跑，它们就会在关闭标志之后到达并被拒收，
     // 端口取走的那份模块引用就留在 loader 账上（回到注入器手里就是"引用不是 1"）。
     // 期限仍是原来的 kSiteAttempts * kSiteDelayMs；到限就用现有站点如实继续，不按端口数补引用。
-    size_t const sites_ready = xaml_tap_wait_for_sites(kSiteAttempts * kSiteDelayMs);
+    std::size_t const sites_ready = xaml_tap_wait_for_sites(kSiteAttempts * kSiteDelayMs);
     log_format(L"diagnostics ready: %zu site(s) attached before the walk", sites_ready);
     // 连接过程里 XAML 可能又载入了模块，补扫一次导入表。
     reg_hook_rescan();
 
-    bool const watched = taskbar_xaml_watch(error);
-
-    // 解析 + 插入都在任务栏线程上做（元素有线程亲和性）。
-    if (watched) {
-        HookPostResult const posted = hook_post_run(tray_thread, HookAction::Apply, kPostTimeoutMs);
-        if (!posted.ok) {
-            error = posted.error.empty() ? L"任务栏线程没有应用读数" : posted.error;
-        }
-    }
+    bool const resolved = watch_and_resolve_target_elements(error);
 
     // 解析阶段到此结束：诊断这条线整条关掉（成功、失败、没走成都关），并且**立刻**恢复导入表——
     // 那层规避只需要覆盖走查这一段。
-    xaml_tap_release_walk(g_state.site_index);
     std::wstring tap_detail;
     if (!xaml_tap_stop(2000, tap_detail)) {
         log_format(L"diagnostics teardown is incomplete: %s", tap_detail.c_str());
     }
     g_diagnostics_closed.store(true);
+    restore_iat();
 
-    std::wstring restore_error;
-    if (!reg_hook_restore(restore_error)) {
-        log_format(L"reg hook: restore failed: %s", restore_error.c_str());
+    if (!resolved) {
+        return false;
     }
 
-    // 成功的判据是"走查成功 + 真的持有了托盘元素"，**不是**"此刻树上有一个块"：首次读数是合法的
+    // 第一轮：按配置/缺省把块插到命中的屏幕上；退化只影响本轮落点，不改配置。
+    reconcile_targets(true);
+
+    // 成功的判据是"走查成功 + 至少持有一个托盘元素"，**不是**"此刻树上有块"：首次读数是合法的
     // Waiting/[] 时块本来就不该在（`xaml_block_present` 独立表达这件事），把"当前没有块"当成 attach
     // 失败会让负载随后丢掉每一个正常快照。
-    g_attached.store(watched && g_tray_element_held.load());
-    return watched && g_tray_element_held.load();
+    bool any = false;
+    for (auto const& target : g_targets) {
+        if (target->available && target->tray_element != nullptr) {
+            any = true;
+            break;
+        }
+    }
+    g_attached.store(any);
+    return any;
 }
 
 bool taskbar_xaml_request_update(deskfeed::ReadingContent const& content) {
@@ -1203,23 +1834,26 @@ bool taskbar_xaml_request_update(deskfeed::ReadingContent const& content) {
         g_content = content;
         g_have_content = true;
     }
-    if (g_state.tray == nullptr) {
+    if (g_targets.empty()) {
         return false;
     }
-    // 运行期绝不走查，也绝不重连诊断：诊断连接在解析阶段就已经关掉。块还不在树里时只能用已经
-    // 持有的托盘元素补插；连元素都没有（attach 没成功）就什么都不做。
-    if (!g_block_present.load() && !g_tray_element_held.load()) {
-        log_line(L"reading: update dropped (no tray element is held and the diagnostics are closed)");
-        return false;
+    // 运行期绝不走查，也绝不重连诊断：诊断连接在解析阶段就已经关掉。这里只根据已持有的元素
+    // 增删块、就地换字。
+    reconcile_targets(false);
+    bool any = false;
+    for (auto const& target : g_targets) {
+        if (target->available && target->enabled) {
+            any = true;
+            break;
+        }
     }
+    return any;
+}
 
-    DWORD const tray_thread = ::GetWindowThreadProcessId(g_state.tray, nullptr);
-    HookPostResult const posted = hook_post_run(tray_thread, HookAction::Apply, kPostTimeoutMs);
-    if (!posted.ok) {
-        log_format(L"reading: update failed: %s", posted.error.c_str());
-        return false;
-    }
-    return true;
+void taskbar_xaml_set_screen_config(bool configured, std::vector<std::wstring> const& screens) {
+    std::lock_guard<std::mutex> guard(g_screen_config_mutex);
+    g_screens_configured = configured;
+    g_enabled_screens = screens;
 }
 
 bool taskbar_xaml_detach(unsigned timeout_ms, std::wstring& detail) {
@@ -1232,32 +1866,55 @@ bool taskbar_xaml_detach(unsigned timeout_ms, std::wstring& detail) {
         detail = L"菜单线程没有在期限内退出";
     }
 
-    // 第三步：摘块并销毁悬停窗口（都在任务栏线程上）。
-    bool const need_remove = g_block_present.load() || g_tooltip != nullptr;
-    if (need_remove && g_state.tray != nullptr && !g_state.probe_inline) {
-        DWORD const tray_thread = ::GetWindowThreadProcessId(g_state.tray, nullptr);
-        HookPostResult const posted = hook_post_run(tray_thread, HookAction::Remove, timeout_ms);
-        if (!posted.ok && (g_block_present.load() || g_tooltip != nullptr)) {
-            safe = false;
-            if (!detail.empty()) {
+    // 第二步：每块任务栏上摘块并销毁悬停窗口。所有目标共享同一条任务栏线程（create_targets 已经
+    // 拒绝跨线程的形状），所以这里按顺序投递，最后只做一次钩子静止证明。
+    for (auto& target : g_targets) {
+        State& state = *target;
+        bool const need_remove = state.block_present.load() || state.tooltip != nullptr;
+        if (!need_remove) {
+            continue;
+        }
+        bool ok = true;
+        if (state.probe_inline) {
+            // 自测宿主：调用线程就是树所属的那条线程，直接做（它可能没有任务栏窗口）。
+            CurrentTargetGuard guard(&state);
+            bool faulted = false;
+            ok = remove_task(faulted);
+        } else if (state.tray == nullptr || ::IsWindow(state.tray) == FALSE) {
+            // 窗口已经没了：XAML 树随窗口消失，不能再投递。它的块不可能还可见。
+            state.block_present.store(false);
+            state.tooltip = nullptr;
+            refresh_any_block_present();
+            continue;
+        } else {
+            std::wstring error;
+            ok = post_action(state, HookAction::Remove, timeout_ms, error);
+            if (!ok && !detail.empty()) {
                 detail += L"; ";
             }
-            detail += L"任务栏线程没有摘掉读数块";
+            if (!ok) {
+                detail += L"任务栏线程没有摘掉 " + state.label + L" 的读数块";
+            }
         }
-    } else if (need_remove) {
-        // 自测宿主：调用线程就是树所属的那条线程，直接做。
-        bool faulted = false;
-        remove_task(faulted);
+        if (!ok) {
+            safe = false;
+        }
     }
 
     // 钩子的静止证明（完成事件 + 对 T 的窗口做一次非排队 ping），拿到才归还自引用。
+    DWORD ack_thread = 0;
+    HWND ack_window = g_ack_window_override;
+    for (auto const& target : g_targets) {
+        if (target->tray != nullptr && ::IsWindow(target->tray) != FALSE) {
+            ack_thread = target->thread_id;
+            if (ack_window == nullptr) {
+                ack_window = target->tray;
+            }
+            break;
+        }
+    }
     std::wstring hook_detail;
-    bool const hook_proven =
-        hook_post_retire(g_ack_window_override,
-                         g_state.tray != nullptr
-                             ? ::GetWindowThreadProcessId(g_state.tray, nullptr)
-                             : 0,
-                         timeout_ms, hook_detail);
+    bool const hook_proven = hook_post_retire(ack_window, ack_thread, timeout_ms, hook_detail);
     if (!hook_proven) {
         safe = false;
         if (!detail.empty()) {
@@ -1266,18 +1923,22 @@ bool taskbar_xaml_detach(unsigned timeout_ms, std::wstring& detail) {
         detail += hook_detail;
     }
 
-    // 只有 ping 证明拿到之后才允许丢掉"确认窗口属于哪条 T"这份身份：失败时保留它，下一次重试才
-    // 能对同一条 T 再发一次 ack。这里只是把指针放下，绝不从工作线程去动 XAML 结构。
-    if (hook_proven) {
-        g_state.tray = nullptr;
+    if (hook_proven && safe) {
+        g_targets.clear();
+        g_any_block_present.store(false);
     }
     g_attached.store(false);
     return safe;
 }
 
-bool taskbar_xaml_block_visible() { return g_block_present.load(); }
+bool taskbar_xaml_block_visible() { return g_any_block_present.load(); }
 
-void taskbar_xaml_probe_set_slow_apply(unsigned ms) { g_state.slow_apply_ms = ms; }
+void taskbar_xaml_probe_set_slow_apply(unsigned ms) {
+    g_probe_slow_apply_ms = ms;
+    for (auto& target : g_targets) {
+        target->slow_apply_ms = ms;
+    }
+}
 
 // 生产与自测共用的入口：只把读数写进内容槽（加锁），不碰 XAML 结构。生产路径由负载线程在读到
 // 第一帧之后调用它，所以它**不是**"自测宿主专用"，也不许被整段 guard 掉。
@@ -1291,56 +1952,92 @@ void taskbar_xaml_set_reading(deskfeed::ReadingContent const& content) {
 bool taskbar_xaml_probe_run(bool dump_only, bool allow_placeholder, bool& visible,
                             std::wstring& error) {
     visible = false;
-    g_state.probe_placeholder = allow_placeholder;
-    g_state.probe_inline = true;
-    hook_post_set_executor(&execute_hook_action, nullptr);
-
-    if (dump_only) {
-        winrt::Windows::Foundation::IInspectable element{nullptr};
-        if (g_diagnostics_closed.load() || !resolve_tray_element(element, error)) {
-            xaml_tap_release_walk(g_state.site_index);
+    if (g_targets.empty()) {
+        if (!create_targets(error)) {
             return false;
         }
-        g_state.tray_element = element.try_as<wux::FrameworkElement>();
-        g_tray_element_held.store(g_state.tray_element != nullptr);
-        log_format(L"resolved %s", winrt::get_class_name(g_state.tray_element).c_str());
-        xaml_tap_release_walk(g_state.site_index);
-        return true;
+    }
+    State& target = *g_targets.front();
+    CurrentTargetGuard guard(&target);
+    target.probe_placeholder = allow_placeholder;
+    target.probe_inline = true;
+    target.slow_apply_ms = g_probe_slow_apply_ms;
+    target.host_window = g_probe_host_window;
+    hook_post_set_executor(&execute_hook_action, &target);
+
+    if (target.tray_element == nullptr && !target.watched_handles.empty()) {
+        winrt::Windows::Foundation::IInspectable element{nullptr};
+        std::uint64_t const handle = target.watched_handles.front();
+        if (!xaml_tap_resolve(target.site_index, handle, element, error)) {
+            xaml_tap_release_walk(target.site_index);
+            return false;
+        }
+        target.tray_element = element.try_as<wux::FrameworkElement>();
+        target.tray_element_held = target.tray_element != nullptr;
+        target.available = target.tray_element != nullptr;
+        if (target.tray_element != nullptr) {
+            log_format(L"resolved %s", winrt::get_class_name(target.tray_element).c_str());
+        }
+    }
+
+    if (dump_only) {
+        if (target.site_index < xaml_tap_sites().size()) {
+            xaml_tap_release_walk(target.site_index);
+        }
+        return target.tray_element != nullptr;
+    }
+
+    if (target.tray_element == nullptr) {
+        error = L"还没有解析出托盘元素（自测宿主必须先走查一次）";
+        return false;
     }
 
     bool const ok = apply_task(allow_placeholder, visible, error);
-    if (ok && !dump_only) {
-        xaml_tap_release_walk(g_state.site_index);
+    if (ok && target.site_index < xaml_tap_sites().size()) {
+        xaml_tap_release_walk(target.site_index);
     }
     return ok;
 }
 
 int taskbar_xaml_probe_hover_cells(long* out, int capacity) {
-    if (out == nullptr || capacity < 4 || g_state.block == nullptr || !g_state.hover_origin_known) {
+    if (out == nullptr || capacity < 4 || g_targets.empty()) {
+        return 0;
+    }
+    State& target = *g_targets.front();
+    CurrentTargetGuard guard(&target);
+    if (target.block == nullptr || !target.hover_origin_known) {
         return 0;
     }
     int written = 0;
-    double const scale = static_cast<double>(window_dpi(g_state.tray)) / 96.0;
-    out[written++] = g_state.hover_origin.x;
-    out[written++] = g_state.hover_origin.y;
-    out[written++] = static_cast<long>(g_state.hover_width * scale);
-    out[written++] = static_cast<long>(g_state.hover_height * scale);
-    for (HoverCell const& cell : g_state.hover_cells) {
+    double const scale = static_cast<double>(window_dpi(target.tray)) / 96.0;
+    out[written++] = target.hover_origin.x;
+    out[written++] = target.hover_origin.y;
+    out[written++] = static_cast<long>(target.hover_width * scale);
+    out[written++] = static_cast<long>(target.hover_height * scale);
+    for (HoverCell const& cell : target.hover_cells) {
         if (written + 4 > capacity) {
             break;
         }
-        out[written++] = static_cast<long>(g_state.hover_origin.x + cell.left * scale);
-        out[written++] = static_cast<long>(g_state.hover_origin.y + cell.top * scale);
-        out[written++] = static_cast<long>(g_state.hover_origin.x + cell.right * scale);
-        out[written++] = static_cast<long>(g_state.hover_origin.y + cell.bottom * scale);
+        out[written++] = static_cast<long>(target.hover_origin.x + cell.left * scale);
+        out[written++] = static_cast<long>(target.hover_origin.y + cell.top * scale);
+        out[written++] = static_cast<long>(target.hover_origin.x + cell.right * scale);
+        out[written++] = static_cast<long>(target.hover_origin.y + cell.bottom * scale);
     }
     return written;
 }
 
-void taskbar_xaml_set_probe_inline(bool inline_mode) { g_state.probe_inline = inline_mode; }
+void taskbar_xaml_set_probe_inline(bool inline_mode) {
+    g_probe_inline_mode = inline_mode;
+    for (auto& target : g_targets) {
+        target->probe_inline = inline_mode;
+    }
+}
 
 void taskbar_xaml_set_host_window(HWND window) {
-    g_state.host_window = window;
+    g_probe_host_window = window;
+    for (auto& target : g_targets) {
+        target->host_window = window;
+    }
     // 钩子收尾时那次"帧已弹掉"的 ping 需要一个**属于任务栏线程**的窗口。真实注入里是
     // Shell_TrayWnd；自测宿主没有它，就由宿主交一个自己的、user32 类的窗口（例如 STATIC），
     // 绝不能用本模块自己的窗口过程当确认目标。
@@ -1350,6 +2047,10 @@ void taskbar_xaml_set_host_window(HWND window) {
 #ifdef DESKFEED_PAYLOAD_PROBE_BUILD
 void taskbar_xaml_probe_set_tray_override(HWND window) {
     g_probe_tray_override.store(window, std::memory_order_release);
+    if (window == nullptr) {
+        g_probe_override_mode = false;
+        g_targets.clear();
+    }
 }
 #endif  // DESKFEED_PAYLOAD_PROBE_BUILD
 

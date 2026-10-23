@@ -849,7 +849,7 @@ void run_frame_cases() {
     patch_u32(bad, 16, static_cast<std::uint32_t>(kFrameMaxReasonBytes) + 1);
     check(!frame_decode(bad.data(), bad.size(), sink), "frame/decode rejects oversized reason");
 
-    std::size_t const first_item = 20 + original.reason.size();
+    std::size_t const first_item = 28 + original.reason.size();
     bad = payload;
     patch_u32(bad, first_item, 3);
     check(!frame_decode(bad.data(), bad.size(), sink), "frame/decode rejects unknown state");

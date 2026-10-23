@@ -9,6 +9,9 @@
 //     u32 failure         （FailureKind 的稳定编号）
 //     u32 reason_bytes
 //     reason 的 UTF-8 字节
+//     u32 screens_configured   （0 / 1）
+//     u32 screen_count
+//     每条屏幕一条：u32 id_bytes + id 的 UTF-8 字节
 //   之后每条 item 一条记录：
 //     u32 state           （0 ok / 1 warn / 2 error）
 //     u32 id_bytes
@@ -32,6 +35,20 @@ void put_u32(std::vector<unsigned char>& out, std::uint32_t value) {
 
 void put_bytes(std::vector<unsigned char>& out, std::string const& text) {
     out.insert(out.end(), text.begin(), text.end());
+}
+
+// 屏幕标识只允许可打印 ASCII 且不含配置分隔符 `;`。显示器接口路径正是这个形状；
+// 这样读端不必为了一个内部标识把 UTF-8 校验器拉进 explorer。
+bool screen_id_bytes_valid(std::string const& id) {
+    if (id.empty() || id.size() > kMaxTaskbarScreenIdBytes) {
+        return false;
+    }
+    for (unsigned char const ch : id) {
+        if (ch < 0x20 || ch == 0x7F || ch == ';') {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool u32_of_state(ItemState state, std::uint32_t& out) {
@@ -157,6 +174,12 @@ bool frame_encode(Frame const& frame, std::vector<unsigned char>& out) {
     if (frame.items.size() > kMaxItems || frame.reason.size() > kFrameMaxReasonBytes) {
         return false;
     }
+    if (frame.screens.size() > kMaxTaskbarScreens) {
+        return false;
+    }
+    if (!frame.screens_configured && !frame.screens.empty()) {
+        return false;  // 未配置时不许夹带屏幕表：读端只按 configured 解释它
+    }
     std::uint32_t kind = 0;
     std::uint32_t failure = 0;
     if (!u32_of_kind(frame.kind, kind) || !u32_of_failure(frame.failure, failure)) {
@@ -171,6 +194,17 @@ bool frame_encode(Frame const& frame, std::vector<unsigned char>& out) {
     put_u32(out, failure);
     put_u32(out, static_cast<std::uint32_t>(frame.reason.size()));
     put_bytes(out, frame.reason);
+
+    put_u32(out, frame.screens_configured ? 1u : 0u);
+    put_u32(out, static_cast<std::uint32_t>(frame.screens.size()));
+    for (std::string const& screen : frame.screens) {
+        if (!screen_id_bytes_valid(screen)) {
+            out.clear();
+            return false;
+        }
+        put_u32(out, static_cast<std::uint32_t>(screen.size()));
+        put_bytes(out, screen);
+    }
 
     for (FrameItem const& item : frame.items) {
         if (item.id.size() > kMaxIdBytes || item.label.size() > kMaxLabelBytes ||
@@ -227,6 +261,30 @@ bool frame_decode(unsigned char const* payload, std::size_t payload_bytes, Frame
         return false;
     }
     decoded.alarm = alarm != 0;
+
+    std::uint32_t screens_configured = 0;
+    std::uint32_t screen_count = 0;
+    if (!cursor.read_u32(screens_configured) || !cursor.read_u32(screen_count)) {
+        return false;
+    }
+    if (screens_configured > 1 || screen_count > kMaxTaskbarScreens ||
+        (screens_configured == 0 && screen_count != 0)) {
+        return false;
+    }
+    decoded.screens_configured = screens_configured != 0;
+    decoded.screens.reserve(screen_count);
+    for (std::uint32_t index = 0; index < screen_count; ++index) {
+        std::uint32_t bytes = 0;
+        if (!cursor.read_u32(bytes)) {
+            return false;
+        }
+        std::string screen;
+        if (!cursor.read_text(bytes, kMaxTaskbarScreenIdBytes, screen) ||
+            !screen_id_bytes_valid(screen)) {
+            return false;
+        }
+        decoded.screens.push_back(std::move(screen));
+    }
 
     decoded.items.reserve(item_count);
     for (std::uint32_t index = 0; index < item_count; ++index) {

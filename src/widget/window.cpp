@@ -95,6 +95,8 @@ enum MenuCommand : UINT {
     kCmdExit = 5,
     // 这一项排在菜单第二，命令号接在旧的五个后面，不动已有取值。
     kCmdTopmost = 6,
+    // 「托盘屏幕」子菜单里的条目从 1000 起，按弹出时现查到的屏幕顺序编号。
+    kCmdScreenBase = 1000,
 };
 
 // 100 纳秒一格，这里换算成毫秒。双击判定与日志节流用它。
@@ -211,6 +213,10 @@ struct WidgetState {
     bool last_press_was_drag = false;
 
     HMENU menu = nullptr;
+    // 「托盘屏幕」子菜单。每次弹出前重建条目：显示器与任务栏会随拔插变化，菜单不能在建窗时
+    // 就把屏幕表冻结下来。screen_entries 与子菜单的命令号一一对应。
+    HMENU screens_menu = nullptr;
+    std::vector<WidgetScreenEntry> screen_entries;
 
     // 状态日志去重：内容没变就不写第二行。
     std::wstring last_status{};
@@ -531,8 +537,9 @@ void create_context_menu_of(WidgetState& self) {
         log_line(L"widget: cannot build the context menu");
         return;
     }
-    // 六项：刷新 / 置顶悬浮窗 / 切换详细与精简 / 任务栏组件 / 隐藏与显示悬浮窗 / 退出。
-    // 勾只用来表示开关状态（置顶、任务栏组件）；详细与隐藏那两项是动态文案，不表示状态。
+    // 刷新 / 置顶悬浮窗 / 切换详细与精简 / 任务栏组件 / 托盘屏幕 / 隐藏与显示悬浮窗 / 退出。
+    // 勾只用来表示开关状态（置顶、任务栏组件、各托盘屏幕）；详细与隐藏那两项是动态文案，
+    // 不表示状态。
     ::AppendMenuW(self.menu, MF_STRING, kCmdRefresh, L"刷新");
     ::AppendMenuW(self.menu, MF_STRING, kCmdTopmost, L"置顶悬浮窗");
     ::AppendMenuW(self.menu, MF_STRING, kCmdExpanded,
@@ -540,6 +547,12 @@ void create_context_menu_of(WidgetState& self) {
     UINT const component_flags =
         MF_STRING | (self.options.taskbar_available ? 0u : static_cast<UINT>(MF_GRAYED));
     ::AppendMenuW(self.menu, component_flags, kCmdTaskbarComponent, L"任务栏组件");
+    // 子菜单的条目在每次弹出前按现查到的屏幕重建（见 show_context_menu_of）。
+    self.screens_menu = ::CreatePopupMenu();
+    if (self.screens_menu != nullptr) {
+        ::AppendMenuW(self.menu, MF_POPUP, reinterpret_cast<UINT_PTR>(self.screens_menu),
+                      L"托盘屏幕");
+    }
     // 「隐藏悬浮窗」是开关（`[window] hidden` 跨启动保持），按当前状态给动态文案：
     // 藏着就写「显示悬浮窗」，显示着就写「隐藏悬浮窗」。
     ::AppendMenuW(self.menu, MF_STRING, kCmdHide,
@@ -1251,14 +1264,45 @@ void show_context_menu_of(WidgetState& self) {
                     MF_BYCOMMAND |
                         (self.preferences.taskbar_component ? MF_CHECKED : MF_UNCHECKED));
 
+    // 「托盘屏幕」：每次弹出前现查，勾按主进程的持久配置画（不按退化后的实际落点画）。
+    // 不可用但已勾选的屏幕仍然可以取消；不可用且未勾选的屏幕不出现，避免伪造“能打开”。
+    std::size_t screen_checked = 0;
+    if (self.screens_menu != nullptr) {
+        while (::GetMenuItemCount(self.screens_menu) > 0) {
+            ::DeleteMenu(self.screens_menu, 0, MF_BYPOSITION);
+        }
+        self.screen_entries.clear();
+        if (self.callbacks.list_screens != nullptr) {
+            self.callbacks.list_screens(self.callbacks.context, self.screen_entries);
+        }
+        if (self.screen_entries.empty()) {
+            ::AppendMenuW(self.screens_menu, MF_STRING | MF_GRAYED, 0, L"没有可用的屏幕");
+        } else {
+            for (std::size_t index = 0; index < self.screen_entries.size(); ++index) {
+                WidgetScreenEntry const& entry = self.screen_entries[index];
+                UINT flags = MF_STRING;
+                if (entry.checked) {
+                    flags |= MF_CHECKED;
+                    ++screen_checked;
+                } else if (!entry.available) {
+                    // 未勾选且当前不可用：没有可以启用的任务栏目标，置灰而不是让点击落空。
+                    flags |= MF_GRAYED;
+                }
+                ::AppendMenuW(self.screens_menu, flags,
+                              static_cast<UINT_PTR>(kCmdScreenBase + index), entry.label.c_str());
+            }
+        }
+    }
+
     // 弹出前把这一份文案记一行：菜单是模态的、外面看不见它，出问题时“菜单上到底写的什么”
     // 就只剩这一行证据（离线夹具也靠它核对动态文案与勾选，不必去抓那个抓不住的弹出菜单）。
     log_format(L"widget: context menu texts: expanded=<%s> hide=<%s> topmost=%s "
-               L"taskbar_component=%s",
+               L"taskbar_component=%s screens=%zu checked=%zu",
                self.preferences.expanded ? L"切换至精简" : L"切换至详细",
                self.preferences.hidden ? L"显示悬浮窗" : L"隐藏悬浮窗",
                self.preferences.topmost ? L"checked" : L"unchecked",
-               self.preferences.taskbar_component ? L"checked" : L"unchecked");
+               self.preferences.taskbar_component ? L"checked" : L"unchecked",
+               self.screen_entries.size(), screen_checked);
 
     POINT cursor{};
     ::GetCursorPos(&cursor);
@@ -1352,6 +1396,21 @@ void run_command_of(WidgetState& self, UINT command) {
             }
             break;
         default:
+            if (command >= kCmdScreenBase) {
+                std::size_t const index = static_cast<std::size_t>(command - kCmdScreenBase);
+                if (index < self.screen_entries.size()) {
+                    WidgetScreenEntry& entry = self.screen_entries[index];
+                    bool const wanted = !entry.checked;
+                    bool reached = wanted;
+                    if (self.callbacks.set_screen_enabled != nullptr) {
+                        reached = self.callbacks.set_screen_enabled(self.callbacks.context, entry.id,
+                                                                     wanted);
+                    }
+                    entry.checked = reached;
+                    log_format(L"widget: tray screen \"%s\" -> %s", entry.id.c_str(),
+                               reached ? L"on" : L"off");
+                }
+            }
             break;
     }
 }
@@ -1369,9 +1428,12 @@ void teardown_window_of(WidgetState& self) {
         ::DestroyWindow(self.tip);
         self.tip = nullptr;
     }
+    // 子菜单挂在主菜单上，由 DestroyMenu(主菜单) 一并销毁；单独先销毁再销毁父菜单会留下
+    // 一个指向已销毁菜单的 MF_POPUP 项，属于重复释放。
     if (self.menu != nullptr) {
         ::DestroyMenu(self.menu);
         self.menu = nullptr;
+        self.screens_menu = nullptr;
     }
     if (self.hwnd != nullptr) {
         HWND const hwnd = self.hwnd;

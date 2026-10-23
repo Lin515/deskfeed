@@ -3,8 +3,9 @@
 #include "payload/payload_flavor.h"
 
 #include <string>
+#include <vector>
 
-// 任务栏那块上两个交互（双击、右键菜单项）的**动作工作线程**。
+// 任务栏那块上的交互（双击、右键菜单项）的**动作工作线程**。
 //
 // 为什么要有它：任务栏线程上不能阻塞。一次 `SendMessageTimeout` 最长等 1.5 秒，放在 UI 线程上
 // 就是把任务栏冻住。所以交互处理器只做一件不阻塞的事——置一个合并标志、唤醒这个常驻工作线程，
@@ -19,6 +20,8 @@ bool action_worker_start(std::wstring const& scope, std::wstring& error);
 // 合并：已经有同类待发请求时不再排第二个（连点两次双击只发一次取数请求）。
 void action_worker_post_refresh();
 void action_worker_post_show_widget();
+// 合并到“最新一份完整启用集合”：托盘菜单一次只切一块，随后到达的集合覆盖尚未发出的那一份。
+void action_worker_post_screens(std::vector<std::wstring> screens);
 
 // 收尾。返回 true 表示工作线程已经终止（模块可以卸载）；false 表示有界时间内没退出，
 // 调用方必须保留模块、不得报告可卸载。

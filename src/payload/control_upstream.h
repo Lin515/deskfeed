@@ -1,9 +1,10 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
-// 负载 → 主进程 的**单向**控制客户端：任务栏那块上的两个交互（双击 / 右键菜单）把请求交给主进程，
-// 由主进程决定“立刻重新取数”或“把桌面悬浮窗叫出来”。
+// 负载 → 主进程 的**单向**控制客户端：任务栏那块上的交互（双击 / 右键菜单）把请求交给主进程，
+// 由主进程决定“立刻重新取数”“把桌面悬浮窗叫出来”或“保存托盘屏幕启用集合”。
 //
 // 走的是 Phase 1 就有的控制通道（`ipc/control_wire.h` 的线格式 + 隐藏窗口类），**不是**任何新的
 // 进程、不接受任何参数、不改变 URL、不做绑定、不改调度。负载只链编码那一半，所以它的源码图里
@@ -18,5 +19,11 @@ bool control_request_refresh(std::wstring const& scope, unsigned timeout_ms, std
 
 // 请求主进程把桌面悬浮窗叫出来。
 bool control_request_show_widget(std::wstring const& scope, unsigned timeout_ms, std::string& error);
+
+// 请求主进程保存**完整的**托盘屏幕启用集合（空表 = 不在任何任务栏显示）。
+// 只是落盘：真正的显示/隐藏由主进程随后重发的显示帧驱动。
+bool control_request_set_screens(std::wstring const& scope,
+                                 std::vector<std::wstring> const& screen_ids, unsigned timeout_ms,
+                                 std::string& error);
 
 }  // namespace deskfeed::payload

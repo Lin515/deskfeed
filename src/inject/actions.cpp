@@ -712,7 +712,9 @@ ActorResult stop_victim_body(Actor& actor, Options const& options, std::wstring 
 
     bool retired = false;
     std::wstring stop_error;
-    if (!stop_one(actor, dll_path, options.unload, retired, stop_error)) {
+    // `stop_one` 的参数是 no_unload，与用户的 `--no-unload` 同义；`options.unload` 是反过来的意图。
+    // 这里曾经把两者直接传反：默认的 `--stop` 被当成 `--no-unload`，模块只停线程、不卸载。
+    if (!stop_one(actor, dll_path, !options.unload, retired, stop_error)) {
         report(L"could not stop the payload in pid " + std::to_wstring(pid) + L": " + stop_error);
         out.code = 1;
         return out;

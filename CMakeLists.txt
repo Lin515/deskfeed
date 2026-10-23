@@ -39,6 +39,14 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# 应用图标：资源脚本与 .ico 同在 assets/，rc 按自身所在目录解析 "deskfeed.ico"（即使 cwd 是
+# 构建目录也能找到）。OBJECT_DEPENDS 把 ico 补成 .res 的隐式依赖，否则只改图标不会重编资源。
+# 只给两个交付 EXE（主进程与注入器）挂图标：诊断工具保持无图标，避免与产品本体混淆。
+set(DESKFEED_APP_ICON_RC "${CMAKE_CURRENT_SOURCE_DIR}/assets/deskfeed.rc")
+set(DESKFEED_APP_ICON_ICO "${CMAKE_CURRENT_SOURCE_DIR}/assets/deskfeed.ico")
+set_source_files_properties("${DESKFEED_APP_ICON_RC}"
+    PROPERTIES OBJECT_DEPENDS "${DESKFEED_APP_ICON_ICO}")
+
 # 全部目标共用的编译口径与 Win32 基础库。
 #
 # 这里**刻意不含** winhttp.lib 与 dbghelp.lib：它们分别代表“对外的网络”与“符号下载”这两种能力，
@@ -244,6 +252,7 @@ target_link_libraries(deskfeed PRIVATE
     deskfeed_display
     deskfeed_widget
 )
+target_sources(deskfeed PRIVATE "${DESKFEED_APP_ICON_RC}")
 
 # 离线检查器与量具。
 add_executable(deskfeed-check
@@ -367,6 +376,7 @@ add_executable(deskfeed-inject
     src/inject/main.cpp
 )
 target_link_libraries(deskfeed-inject PRIVATE deskfeed_inject_support)
+target_sources(deskfeed-inject PRIVATE "${DESKFEED_APP_ICON_RC}")
 
 # 自测探针：自带 Win32 窗口与系统 XAML 岛，绝不注入 explorer。清单作为**源文件**（与负载和
 # 悬浮窗窗口用例同样的做法：/MANIFESTINPUT 单独用会 LNK1220，/MANIFEST:EMBED 会与它重复）。

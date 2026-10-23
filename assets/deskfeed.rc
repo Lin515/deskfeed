@@ -1,0 +1,6 @@
+#pragma code_page(65001)
+
+// DeskFeed 的应用图标。资源 ID 用 1：Explorer 与任务管理器取 EXE 图标时优先用第一个
+// RT_GROUP_ICON，用最小 ID 是各版本 Windows 上最稳的做法。图标本体由
+// assets/deskfeed-icon.svg 导出（多尺寸，见 assets/README.md），不要直接手改 .ico。
+1 ICON "deskfeed.ico"

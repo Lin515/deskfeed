@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="deskfeed-icon-title deskfeed-icon-desc">
+  <title id="deskfeed-icon-title">DeskFeed</title>
+  <desc id="deskfeed-icon-desc">透明背景上的斜向弧边白色悬浮窗，内部为三行浅色标签与青蓝色读数，底部蓝色任务栏包含白色胶囊读数组件。</desc>
+  <defs>
+    <linearGradient id="paper" x1="74" y1="72" x2="181" y2="188" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.58" stop-color="#F2FDFF"/>
+      <stop offset="1" stop-color="#C5E9FF"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="71" y1="67" x2="174" y2="181" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9AE7E7"/>
+      <stop offset="0.55" stop-color="#79CDEB"/>
+      <stop offset="1" stop-color="#6DACE6"/>
+    </linearGradient>
+    <linearGradient id="reading" x1="104" y1="84" x2="184" y2="152" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#16B8D5"/>
+      <stop offset="1" stop-color="#3274E8"/>
+    </linearGradient>
+    <linearGradient id="taskbar" x1="68" y1="147" x2="167" y2="185" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#28C6DA"/>
+      <stop offset="1" stop-color="#3676EF"/>
+    </linearGradient>
+    <clipPath id="window-clip">
+      <path d="M72 71C111 51 163 61 191 88C190 121 180 155 157 177C121 190 82 173 62 147C60 119 63 92 72 71Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- 透明背景上的弧边窗体；投影、高光与折面均不依赖模糊滤镜。 -->
+  <g transform="translate(-61 -53.5) scale(1.5)">
+    <path d="M72 71C111 51 163 61 191 88C190 121 180 155 157 177C121 190 82 173 62 147C60 119 63 92 72 71Z" transform="translate(0 4)" fill="#348FC2" opacity="0.10"/>
+    <path d="M72 71C111 51 163 61 191 88C190 121 180 155 157 177C121 190 82 173 62 147C60 119 63 92 72 71Z" fill="url(#paper)" stroke="url(#edge)" stroke-width="1.5" stroke-linejoin="round"/>
+    <path d="M73 73C112 54 161 63 187 88" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+    <path d="M157 177C168 164 175 149 180 134C163 145 153 160 157 177Z" fill="#A2D9F6" opacity="0.45"/>
+
+    <!-- 三行通用读数：浅色标签与青蓝读数整体顺随窗体倾斜。 -->
+    <g transform="rotate(10 126 118) translate(34.5 36) scale(0.72)">
+      <g fill="#B2DDEB">
+        <rect x="66" y="72" width="22" height="12" rx="6"/>
+        <rect x="66" y="102" width="22" height="12" rx="6"/>
+        <rect x="66" y="132" width="22" height="12" rx="6"/>
+      </g>
+      <g fill="url(#reading)">
+        <rect x="100" y="72" width="62" height="12" rx="6"/>
+        <rect x="100" y="102" width="88" height="12" rx="6"/>
+        <rect x="100" y="132" width="70" height="12" rx="6"/>
+      </g>
+    </g>
+
+    <!-- 任务栏贴合窗体下缘，白色胶囊表示嵌入式读数组件。 -->
+    <g clip-path="url(#window-clip)">
+      <path d="M54 145C95 148 142 165 188 148V192H54Z" fill="url(#taskbar)"/>
+      <path d="M54 145C95 148 142 165 188 148" fill="none" stroke="#D5FBFF" stroke-opacity="0.8" stroke-width="1.2"/>
+      <g transform="rotate(10 124 166) translate(46.9 37.6) scale(0.6)">
+        <rect x="86" y="206" width="84" height="20" rx="10" fill="#1559BB" opacity="0.16"/>
+        <rect x="86" y="204" width="84" height="20" rx="10" fill="#F2FDFF"/>
+        <circle cx="100" cy="214" r="4" fill="#17BBD3"/>
+        <rect x="112" y="210" width="44" height="8" rx="4" fill="#3985E7"/>
+      </g>
+    </g>
+    <path d="M72 71C111 51 163 61 191 88C190 121 180 155 157 177C121 190 82 173 62 147C60 119 63 92 72 71Z" fill="none" stroke="url(#edge)" stroke-width="1.5" stroke-linejoin="round"/>
+  </g>
+</svg>

@@ -29,9 +29,6 @@ std::wstring primary_screen_id();
 // 窗口所在屏幕的稳定标识；窗口无效或不在任何显示器上时为空。
 std::wstring screen_id_for_window(HWND window);
 
-// 一个屏幕坐标矩形所在显示器的稳定标识；矩形不在任何显示器上时为空。
-std::wstring screen_id_for_rect(RECT const& rect);
-
 struct TaskbarWindowInfo {
     HWND window = nullptr;
     DWORD thread_id = 0;

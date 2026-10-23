@@ -20,7 +20,6 @@
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.Xaml.h>
-#include <winrt/Windows.UI.Xaml.Automation.Peers.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Documents.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
@@ -28,6 +27,8 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -42,7 +43,6 @@ namespace wuxc = winrt::Windows::UI::Xaml::Controls;
 namespace wuxd = winrt::Windows::UI::Xaml::Documents;
 namespace wuxi = winrt::Windows::UI::Xaml::Input;
 namespace wuxm = winrt::Windows::UI::Xaml::Media;
-namespace wuxap = winrt::Windows::UI::Xaml::Automation::Peers;
 
 // 任务栏托盘面板里那个容器的名字。读数是插进它的布局，不是叠在它上面。
 constexpr wchar_t kTrayElementName[] = L"SystemTrayFrameGrid";
@@ -1101,36 +1101,108 @@ bool current_content(deskfeed::ReadingContent& out) {
 
 // ---------- 屏幕 → 任务栏目标 ----------
 
-// 从托盘元素反查它所在显示器的稳定标识。元素本身不暴露 HWND/屏幕坐标，但 UIA 的边界矩形是
-// **屏幕坐标**，而每个任务栏岛都有可用的 automation peer（Grid 没有就沿父链找一个）。拿不到
-// 时返回空串，调用方退回“按走查顺序配对”的有界降级——绝不猜测某一块屏幕。
+// 每块任务栏的定位锚点：`Start` 子窗口（Windows 11 的“开始”按钮兼容窗口）左边相对任务栏
+// 左边的物理像素偏移。主任务栏与副屏任务栏的左侧内容不同，这个偏移在真机上能区分它们；
+// 没有这个子窗口的任务栏记 LONG_MIN，不参与匹配。
+constexpr LONG kAnchorNone = LONG_MIN;
+constexpr LONG kAnchorTolerancePx = 32;
+
+struct TaskbarAnchor {
+    HWND taskbar = nullptr;
+    std::wstring screen_id;
+    LONG start_offset = kAnchorNone;
+};
+
+std::vector<TaskbarAnchor> enumerate_taskbar_anchors() {
+    std::vector<TaskbarAnchor> anchors;
+    for (TaskbarWindowInfo const& window : enumerate_taskbar_windows()) {
+        TaskbarAnchor anchor;
+        anchor.taskbar = window.window;
+        anchor.screen_id = window.screen_id;
+        RECT taskbar_rect{};
+        RECT start_rect{};
+        HWND const start = ::FindWindowExW(window.window, nullptr, L"Start", nullptr);
+        if (start != nullptr && ::GetWindowRect(window.window, &taskbar_rect) != FALSE &&
+            ::GetWindowRect(start, &start_rect) != FALSE) {
+            anchor.start_offset = start_rect.left - taskbar_rect.left;
+        }
+        anchors.push_back(std::move(anchor));
+    }
+    return anchors;
+}
+
+// 从托盘元素反查它所在显示器的稳定标识。
+//
+// XAML 没有公开 API 能把一个 XamlRoot 映射回承载它的 HWND（真机上任务栏元素的 UIA peer 全部为空，
+// 拿不到边界矩形；`DesktopWindowXamlSource` 也不从内容侧暴露窗口）。可用的是两侧都存在的几何锚点：
+// 每块任务栏的“开始”按钮在岛内的偏移（XAML 侧，DIP × RasterizationScale）与 Win32 `Start`
+// 子窗口在任务栏内的偏移（物理像素）是同一个位置。两者对上的那块任务栏就是这块岛的宿主。
+//
+// 匹配必须唯一：偏移对不上、或同时对上一块以上任务栏时返回空串，调用方按“未识别”处理，
+// 绝不按走查顺序猜。
 std::wstring screen_id_for_element(wux::FrameworkElement const& element) {
-    wux::FrameworkElement current = element;
-    for (int depth = 0; depth < 12 && current != nullptr; ++depth) {
+    if (element == nullptr) {
+        return std::wstring();
+    }
+    wux::XamlRoot root{nullptr};
+    wux::DependencyObject scope{nullptr};
+    try {
+        root = element.XamlRoot();
+        if (root != nullptr) {
+            scope = root.Content();
+        }
+    } catch (...) {
+        return std::wstring();
+    }
+    if (root == nullptr || scope == nullptr) {
+        log_format(L"screen map: this tray element has no loaded XamlRoot");
+        return std::wstring();
+    }
+
+    wuxc::Control control = scope.try_as<wuxc::Control>();
+    if (control == nullptr) {
         try {
-            auto const peer = wuxap::FrameworkElementAutomationPeer::CreatePeerForElement(current);
-            if (peer != nullptr) {
-                winrt::Windows::Foundation::Rect const bounds = peer.GetBoundingRectangle();
-                if (bounds.Width > 0.0 && bounds.Height > 0.0) {
-                    RECT rect{};
-                    rect.left = static_cast<LONG>(std::floor(bounds.X));
-                    rect.top = static_cast<LONG>(std::floor(bounds.Y));
-                    rect.right = static_cast<LONG>(std::ceil(bounds.X + bounds.Width));
-                    rect.bottom = static_cast<LONG>(std::ceil(bounds.Y + bounds.Height));
-                    std::wstring const id = screen_id_for_rect(rect);
-                    if (!id.empty()) {
-                        return id;
-                    }
-                }
-            }
-        } catch (winrt::hresult_error const&) {
-            // 某些元素没有 automation peer，或者取边界时窗口正在销毁：沿父链再试。
+            auto const first = wuxi::FocusManager::FindFirstFocusableElement(scope);
+            control = first != nullptr ? first.try_as<wuxc::Control>() : nullptr;
         } catch (...) {
         }
-        auto const parent = current.Parent();
-        current = parent != nullptr ? parent.try_as<wux::FrameworkElement>() : nullptr;
     }
-    return std::wstring();
+    if (control == nullptr) {
+        log_format(L"screen map: this island has no first focusable control to anchor on");
+        return std::wstring();
+    }
+
+    double const scale = root.RasterizationScale() > 0.0 ? root.RasterizationScale() : 1.0;
+    LONG offset_x = kAnchorNone;
+    try {
+        auto const point = control.TransformToVisual(nullptr).TransformPoint({0.0f, 0.0f});
+        offset_x = static_cast<LONG>(std::lround(point.X * scale));
+    } catch (...) {
+    }
+    if (offset_x == kAnchorNone) {
+        log_format(L"screen map: the anchor control has no island-local position");
+        return std::wstring();
+    }
+
+    std::wstring id;
+    int matches = 0;
+    for (TaskbarAnchor const& anchor : enumerate_taskbar_anchors()) {
+        if (anchor.start_offset == kAnchorNone) {
+            continue;
+        }
+        if (std::labs(anchor.start_offset - offset_x) <= kAnchorTolerancePx) {
+            ++matches;
+            id = anchor.screen_id;
+            log_format(L"screen map: anchor %ld px matched taskbar %p (%s)", offset_x, anchor.taskbar,
+                       anchor.screen_id.c_str());
+        }
+    }
+    if (matches != 1) {
+        log_format(L"screen map: anchor %ld px matched %d taskbar(s); leaving this island unidentified",
+                   offset_x, matches);
+        return std::wstring();
+    }
+    return id;
 }
 
 bool screen_config_contains(std::vector<std::wstring> const& ids, std::wstring const& id) {
@@ -1256,7 +1328,7 @@ bool create_targets(std::wstring& error) {
 bool execute_hook_action(void* context, HookAction action, std::wstring& error);
 
 // 在任务栏线程上执行：把已经走查到的句柄解析成对象，并映射到屏幕。`xaml_tap_resolve` 返回的
-// 元素属于这条线程；UIA 的屏幕边界也必须在同一条线程上取（XAML 元素有线程亲和性）。
+// 元素属于这条线程；屏幕归属的几何锚点也必须在同一条线程上取（XAML 元素有线程亲和性）。
 bool resolve_watched_elements(std::wstring& error) {
     std::vector<XamlTapSite> const sites = xaml_tap_sites();
     if (sites.empty()) {
@@ -1319,18 +1391,30 @@ bool resolve_watched_elements(std::wstring& error) {
         }
     }
 
-    // UIA 边界矩形拿不到（或 peer 尚未结算）时的有界降级：只把剩余元素按走查顺序配给同一条
-    // 任务栏线程上尚未配对的屏幕，并明确记日志。绝不跨线程配对，也绝不据此改写配置。
-    for (Pending const& item : pending) {
+    // 探针没认出屏幕时只做**无歧义**的补齐：同一条任务栏线程上只剩一个未配对元素、一个未配对
+    // 屏幕时，两者必然是一对。多于一个候选就绝不按走查顺序猜——真机上走查顺序与屏幕顺序不一致，
+    // 猜错会把块画到用户没启用的屏幕上。
+    if (!pending.empty() && pending.size() != 1) {
+        log_format(L"taskbar xaml: %zu tray element(s) could not be tied to a screen; leaving them unmatched",
+                   pending.size());
+    } else if (pending.size() == 1) {
+        State* only_target = nullptr;
+        int candidates = 0;
         for (auto& target : g_targets) {
-            if (target->tray_element == nullptr && target->thread_id == item.thread_id) {
-                target->tray_element = item.element;
-                target->tray_element_held = true;
-                target->available = true;
-                log_format(L"taskbar xaml: %s mapped by walk order (the screen could not be identified)",
-                           target->label.c_str());
-                break;
+            if (target->tray_element == nullptr && target->thread_id == pending.front().thread_id) {
+                only_target = target.get();
+                ++candidates;
             }
+        }
+        if (candidates == 1) {
+            only_target->tray_element = pending.front().element;
+            only_target->tray_element_held = true;
+            only_target->available = true;
+            log_format(L"taskbar xaml: %s was the only unmatched screen on this thread",
+                       only_target->label.c_str());
+        } else {
+            log_format(L"taskbar xaml: a tray element could not be tied to a screen and %d candidate(s) remain; leaving them unmatched",
+                       candidates);
         }
     }
 

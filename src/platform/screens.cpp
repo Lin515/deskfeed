@@ -121,10 +121,6 @@ std::wstring screen_id_for_window(HWND window) {
     return screen_id_for_monitor(::MonitorFromWindow(window, MONITOR_DEFAULTTONULL));
 }
 
-std::wstring screen_id_for_rect(RECT const& rect) {
-    return screen_id_for_monitor(::MonitorFromRect(&rect, MONITOR_DEFAULTTONULL));
-}
-
 std::vector<TaskbarWindowInfo> enumerate_taskbar_windows() {
     struct Search {
         std::vector<TaskbarWindowInfo> windows;

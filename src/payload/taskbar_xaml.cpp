@@ -654,7 +654,10 @@ void hide_tip() {
 // ---------- 菜单（自己一条线程：TrackPopupMenu 内部是模态消息循环） ----------
 
 std::mutex g_menu_mutex;
-HANDLE g_menu_thread = nullptr;
+// 每次弹出菜单都创建一条短命线程（TrackPopupMenu 是模态循环）。线程句柄留在这里，直到
+// `reap_menu_threads_locked` 确认它真的退出——收尾要拿它证明线程已退出，不能只看
+// `g_menu_running`（那只表示“菜单关了”，线程可能还没返回）。
+std::vector<HANDLE> g_menu_threads;
 DWORD g_menu_thread_id = 0;
 HWND g_menu_owner = nullptr;
 bool g_menu_running = false;
@@ -670,6 +673,18 @@ std::vector<MenuScreenEntry> g_active_menu_entries;
 
 DWORD WINAPI menu_thread_entry(LPVOID parameter);
 
+// 回收已经退出的菜单线程句柄；还在跑的原样留着，交给收尾等。调用方必须持有 g_menu_mutex。
+void reap_menu_threads_locked() {
+    for (auto it = g_menu_threads.begin(); it != g_menu_threads.end();) {
+        if (::WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
+            ::CloseHandle(*it);
+            it = g_menu_threads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void start_menu(int x, int y) {
     std::vector<MenuScreenEntry> entries;
     {
@@ -677,20 +692,26 @@ void start_menu(int x, int y) {
         entries = g_menu_model;
     }
     std::lock_guard<std::mutex> guard(g_menu_mutex);
-    if (g_menu_running || g_menu_thread != nullptr) {
-        return;  // 合并：菜单已经开着就不再开第二个
+    reap_menu_threads_locked();
+    // 只按“菜单是否开着”合并。这里**不能**再看线程句柄非空：上一轮菜单线程结束后句柄在收尾前
+    // 仍然留着，按句柄判断会让菜单只能打开一次。
+    if (g_menu_running) {
+        return;
     }
     g_menu_running = true;
     g_active_menu_entries = std::move(entries);
-    g_menu_thread = ::CreateThread(nullptr, 0, menu_thread_entry,
-                                   reinterpret_cast<LPVOID>(static_cast<INT_PTR>(
-                                       (static_cast<long long>(y) << 32) | static_cast<unsigned>(x))),
-                                   0, &g_menu_thread_id);
-    if (g_menu_thread == nullptr) {
+    HANDLE const thread = ::CreateThread(
+        nullptr, 0, menu_thread_entry,
+        reinterpret_cast<LPVOID>(static_cast<INT_PTR>((static_cast<long long>(y) << 32) |
+                                                     static_cast<unsigned>(x))),
+        0, &g_menu_thread_id);
+    if (thread == nullptr) {
         g_menu_running = false;
         g_active_menu_entries.clear();
         log_format(L"cannot start the menu thread: %s", last_error_text().c_str());
+        return;
     }
+    g_menu_threads.push_back(thread);
 }
 
 DWORD WINAPI menu_thread_entry(LPVOID parameter) {
@@ -730,8 +751,10 @@ DWORD WINAPI menu_thread_entry(LPVOID parameter) {
             }
         }
         ::SetForegroundWindow(owner);
+        log_format(L"menu: opened at %d,%d with %zu screen entry/entries", x, y, entries.size());
         UINT const chosen = ::TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, owner,
                                              nullptr);
+        log_format(L"menu: closed (chosen=%u)", chosen);
         // 官方 pattern：SetForegroundWindow(owner) → TrackPopupMenu → PostMessage(owner, WM_NULL)。
         // 最后这一下是让菜单真的收干净（否则它会留着"最后一次菜单"的状态影响下一次弹出）。
         ::PostMessageW(owner, WM_NULL, 0, 0);
@@ -793,19 +816,20 @@ BOOL CALLBACK find_own_menu_window(HWND window, LPARAM param) {
     return FALSE;  // 找到了，停
 }
 
-// 收菜单：先把本进程的弹出菜单窗口用 ESC 请走，再等线程句柄。返回 false = 线程还没退出，
-// 调用方必须保留模块。
+// 收菜单：先把本进程的弹出菜单窗口用 ESC 请走，再等**所有**菜单线程句柄。返回 false = 还有
+// 线程没退出，调用方必须保留模块（只看“菜单关了”不算收尾证明）。
 bool close_menu(unsigned timeout_ms) {
-    HANDLE thread = nullptr;
+    std::vector<HANDLE> threads;
     HWND owner = nullptr;
     DWORD menu_thread_id = 0;
     {
         std::lock_guard<std::mutex> guard(g_menu_mutex);
-        thread = g_menu_thread;
+        reap_menu_threads_locked();
+        threads = g_menu_threads;
         owner = g_menu_owner;
         menu_thread_id = g_menu_thread_id;
     }
-    if (thread == nullptr) {
+    if (threads.empty()) {
         return true;
     }
     if (owner != nullptr) {
@@ -823,15 +847,23 @@ bool close_menu(unsigned timeout_ms) {
             ::PostMessageW(owner, WM_CANCELMODE, 0, 0);
         }
     }
-    if (::WaitForSingleObject(thread, timeout_ms) != WAIT_OBJECT_0) {
-        log_format(L"the menu thread did not exit within %u ms", timeout_ms);
-        return false;
+    unsigned long long const deadline = ::GetTickCount64() + timeout_ms;
+    for (HANDLE const thread : threads) {
+        unsigned long long const now = ::GetTickCount64();
+        unsigned long const remaining =
+            now >= deadline ? 0ul : static_cast<unsigned long>(deadline - now);
+        if (::WaitForSingleObject(thread, remaining) != WAIT_OBJECT_0) {
+            log_format(L"the menu thread did not exit within %u ms", timeout_ms);
+            return false;
+        }
     }
     {
         std::lock_guard<std::mutex> guard(g_menu_mutex);
-        ::CloseHandle(g_menu_thread);
-        g_menu_thread = nullptr;
-        g_menu_running = false;
+        reap_menu_threads_locked();
+        // 收尾期间用户又开了一次菜单：句柄还在，不能把“正在开着”抹掉。
+        if (g_menu_threads.empty()) {
+            g_menu_running = false;
+        }
     }
     return true;
 }

@@ -53,9 +53,17 @@ cmd /c 'chcp 65001 >nul && call vcvarsall.bat x64 && cmake --build .agent/build/
 ## 测试
 
 ```powershell
+# 串行：整轮约一分钟（Debug），时间主要花在真子进程与真实墙钟预算上
 ctest --test-dir .agent/build/debug --output-on-failure
-.\.agent\build\debug\bin\deskfeed-tests.exe --filter health
+
+# 并行：各套件互不共享 scope / 临时目录 / 窗口类，整轮墙钟约等于最慢的一条
+ctest --test-dir .agent/build/debug -j 8 --output-on-failure
+
+# 单套件 + 单条用例耗时（--timing 只在两个框架式套件上提供）
+.\.agent\build\debug\bin\deskfeed-tests.exe --filter health --timing
 ```
+
+耗时构成与优化原则见 [testing.md](testing.md) 的“用例耗时与并行”。
 
 ## 发布（tag）
 

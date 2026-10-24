@@ -2,7 +2,7 @@
 // 地址处理、设置落盘、进程绑定、以及回环 mock 生产端上的 HTTP 墙钟预算与取消。
 // 不读凭据、不连外网、不注入 explorer、不碰用户正在跑的实例。
 //
-// 运行：build/bin/deskfeed-tests.exe [--filter <子串>]
+// 运行：build/bin/deskfeed-tests.exe [--filter <子串>] [--timing]
 
 // winsock2.h 必须先于 windows.h（否则 windows.h 会先拉进 winsock 1 的头）。
 #include <winsock2.h>
@@ -57,6 +57,16 @@ namespace {
 
 // 单调时钟，只用于用例里的“不许拖过预算”这类计时断言。
 long long tick_ms() { return static_cast<long long>(::GetTickCount64()); }
+
+// `--timing`：给每条用例的输出补上耗时（毫秒）。默认关闭，输出与以前一致。
+bool g_case_timing = false;
+
+std::string timing_suffix(long long started) {
+    if (!g_case_timing) {
+        return std::string();
+    }
+    return "  [" + std::to_string(::GetTickCount64() - started) + " ms]";
+}
 
 // 墙钟 Unix 毫秒：协议里的 expiresAtMs 就是这个域。与进程内的绝对时间比较必须用它，
 // 不能拿单调时钟凑（两者不能互相换算）。
@@ -1988,7 +1998,9 @@ TEST(http_get_abort_mid_read_keeps_context_and_buffer_alive) {
 
     HttpLimits limits;
     limits.timeout_ms = 4000;
-    for (int round = 0; round < 16; ++round) {
+    // 四档“取消落在读中间”的时刻各跑两遍就够了：这里要的是让迟到的完成回调反复落在还活着的
+    // 上下文上，不是把时间堆在轮数上。
+    for (int round = 0; round < 8; ++round) {
         auto abort = std::make_shared<std::atomic<bool>>(false);
         HttpResult result;
         std::thread worker([&] {
@@ -2992,7 +3004,7 @@ TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
     CHECK(master.start(exe,
                        {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
                         L"--frame-mailbox", L"--url", server.url(L"/hang"), L"--poll-ms", L"30000",
-                        L"--retry-ms", L"10000", L"--timeout-ms", L"1500"},
+                        L"--retry-ms", L"10000", L"--timeout-ms", L"800"},
                        error));
 
     DisplayFrameConsumer consumer;
@@ -3011,10 +3023,10 @@ TEST(master_publishes_the_fetch_timeout_into_the_mailbox_before_the_retry) {
     long long const started_wall = unix_ms();
     long long const alarm_produced = wait_for_alarm(consumer, 6000);
     CHECK(alarm_produced > 0);
-    // 15 ms 之内起的子进程、1500 ms 预算、再加上进程启动与用例轮询的余量。
-    if (alarm_produced - started_wall > 5000) {
+    // 子进程启动、800 ms 预算、再加上进程启动与用例轮询的余量。
+    if (alarm_produced - started_wall > 3000) {
         testing::report_failure("timeout alarm took " + std::to_string(alarm_produced - started_wall) +
-                                " ms to reach the mailbox (budget was 1500 ms)");
+                                " ms to reach the mailbox (budget was 800 ms)");
     }
 
     Frame alarm;
@@ -3070,10 +3082,10 @@ TEST(master_keeps_publishing_during_a_nested_modal_dispatch) {
     }
     CHECK(attached);
 
-    // 模态派发循环：2 秒，每次取一条消息就派发给主进程的控制窗口（TrackPopupMenu 内部
-    // 就是这种节奏）。取数结果与心跳都在这个窗口里被处理。
+    // 模态派发循环：1.3 s（快照 TTL 是 0.8 s，留 0.5 s 余量），每次取一条消息就派发给主进程的
+    // 控制窗口（TrackPopupMenu 内部就是这种节奏）。取数结果与心跳都在这个窗口里被处理。
     long long const started_wall = unix_ms();
-    long long const modal_deadline = tick_ms() + 2000;
+    long long const modal_deadline = tick_ms() + 1300;
     long long content_produced = 0;
     long long alarm_produced = 0;
     while (tick_ms() < modal_deadline) {
@@ -3097,7 +3109,7 @@ TEST(master_keeps_publishing_during_a_nested_modal_dispatch) {
 
     // 结果没丢：模态期间仍然拿到了内容帧。
     CHECK(content_produced > 0);
-    // 到期没被推迟：整体失效在有界时间内发布出来了（模态循环只有 2 秒，之后主循环恢复，
+    // 到期没被推迟：整体失效在有界时间内发布出来了（模态循环只有 1.3 秒，之后主循环恢复，
     // 所以这条断言真正证明的是“模态期间也在推进”，而不是“模态结束后补上”）。
     CHECK(alarm_produced > 0);
     CHECK(alarm_produced - content_produced <= 2500);
@@ -3524,7 +3536,9 @@ TEST(master_keeps_the_new_binding_when_a_conditional_quit_is_still_pending) {
 
     ChildProcess master;
     {
-        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        // 延期窗口只需覆盖一次“新接管”子进程的启动 + IPC（实测百毫秒级），不必留到 4 s：
+        // 用例等的是“条件退出到期”的那两行日志，不是一段死等。
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"1200");
         CHECK(master.start(exe,
                            {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
                             L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
@@ -3560,10 +3574,10 @@ TEST(master_keeps_the_new_binding_when_a_conditional_quit_is_still_pending) {
     CHECK(takeover.wait(15000));
     CHECK_EQ(takeover.exit_code(), 0LL);
 
-    // 等过延迟窗口：到期的条件退出必须被丢弃，实例还活着。
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // 等到期的条件退出被丢弃（延迟队列由心跳推进，最多再多一个心跳周期）。这条日志就是
+    // “到期并已被丢弃”的机械证据，不需要先睡死一段固定时间。
+    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 8000);
     CHECK_EQ(master.exit_code(), -1LL);
-    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 5000);
 
     ChildProcess quit;
     CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
@@ -3591,7 +3605,7 @@ TEST(master_keeps_the_new_binding_when_the_old_producer_exit_is_still_pending) {
 
     ChildProcess master;
     {
-        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"1200");
         CHECK(master.start(exe,
                            {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
                             L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
@@ -3623,9 +3637,9 @@ TEST(master_keeps_the_new_binding_when_the_old_producer_exit_is_still_pending) {
     CHECK(takeover.wait(15000));
     CHECK_EQ(takeover.exit_code(), 0LL);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // 等日志证明“到期的条件退出已被丢弃”，而不是先睡死一段固定时间。
+    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 8000);
     CHECK_EQ(master.exit_code(), -1LL);
-    check_log_marker(log_path, L"丢弃已被新绑定取代的条件退出", 5000);
 
     ChildProcess quit;
     CHECK(quit.start(exe, {L"--scope", scope, L"--quit"}, error));
@@ -3653,7 +3667,7 @@ TEST(master_rejects_a_takeover_after_an_unconditional_quit_was_queued) {
 
     ChildProcess master;
     {
-        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"4000");
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"1200");
         CHECK(master.start(exe,
                            {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
                             L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
@@ -3684,7 +3698,8 @@ TEST(master_rejects_a_takeover_after_an_unconditional_quit_was_queued) {
 
 TEST(master_waits_for_the_actual_exit_only_when_asked) {
     // `--wait-exit-ms`：确认被接受后还要等到实例进程**真的退出**。用延迟注入点把“退出被消费”
-    // 推迟约 3 s：带等待的客户端必须活到那之后才返回；不带等待（缺省 0）时只等 IPC 确认。
+    // 推迟约 0.8 s（远大于一次 IPC 往返）：带等待的客户端必须活到那之后才返回；不带等待
+    // （缺省 0）时只等 IPC 确认。
     LoopbackServer server;
     std::string error;
     CHECK(server.start(error));
@@ -3697,7 +3712,7 @@ TEST(master_waits_for_the_actual_exit_only_when_asked) {
 
     ChildProcess master;
     {
-        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"3000");
+        ScopedEnvironmentVariable const defer(L"DESKFEED_TEST_DEFER_QUIT_MS", L"800");
         CHECK(master.start(exe,
                            {L"--scope", scope, L"--state-dir", state_dir.path(), L"--headless",
                             L"--url", server.url(L"/ok"), L"--poll-ms", L"30000", L"--timeout-ms",
@@ -3712,8 +3727,8 @@ TEST(master_waits_for_the_actual_exit_only_when_asked) {
     CHECK(quit.wait(20000));
     long long const elapsed = tick_ms() - started;
     CHECK_EQ(quit.exit_code(), 0LL);
-    // 退出被延迟了 3 s 才被消费，所以“等到实例真的退出”的客户端至少也要活到那之后。
-    CHECK(elapsed >= 2500);
+    // 退出被延迟了约 0.8 s 才被消费，所以“等到实例真的退出”的客户端至少也要活到那之后。
+    CHECK(elapsed >= 600);
     CHECK(master.wait(15000));
     cleanup_isolated_instance(scope, state_dir.path());
 }
@@ -3837,12 +3852,17 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     std::string filter;
+    bool timing = false;
     for (int index = 1; index < argc; ++index) {
         std::wstring const arg(argv[index]);
         if (arg == L"--filter" && index + 1 < argc) {
             filter = utf8_from_wide(argv[++index]);
+        } else if (arg == L"--timing") {
+            // 输出每个用例的耗时：排查“整套多久、慢在哪一条”时用，默认输出保持不变。
+            timing = true;
         }
     }
+    g_case_timing = timing;
 
     int passed = 0;
     int failed = 0;
@@ -3850,17 +3870,19 @@ int wmain(int argc, wchar_t** argv) {
         if (!filter.empty() && std::string(test.name).find(filter) == std::string::npos) {
             continue;
         }
+        long long const started = ::GetTickCount64();
         try {
             test.body();
             ++passed;
-            console_write_stdout(std::string("ok   ") + test.name + "\n");
+            console_write_stdout(std::string("ok   ") + test.name + timing_suffix(started) + "\n");
         } catch (testing::Failure const& failure) {
             ++failed;
-            console_write_stdout(std::string("FAIL ") + test.name + ": " + failure.message + "\n");
+            console_write_stdout(std::string("FAIL ") + test.name + ": " + failure.message +
+                                 timing_suffix(started) + "\n");
         } catch (std::exception const& error) {
             ++failed;
             console_write_stdout(std::string("FAIL ") + test.name + ": exception " + error.what() +
-                                 "\n");
+                                 timing_suffix(started) + "\n");
         }
     }
     console_write_stdout(std::to_string(passed) + " passed, " + std::to_string(failed) + " failed\n");

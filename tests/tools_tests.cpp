@@ -1285,9 +1285,9 @@ void run_remote_late_write_case() {
         check(remote_write(child_pid, buffer.address, header, sizeof(header), buffer_error),
               "remote/late-write POD header written");
 
-        // 真实的远程调用超时：线程已创建、250ms 内不退出，而写发生在 800ms 之后。
+        // 真实的远程调用超时：线程已创建、150 ms 内不退出，而写发生在 400 ms 之后。
         RemoteCall call = call_remote_export(child_pid, dll_base, info.rva,
-                                             reinterpret_cast<void*>(buffer.address), 250);
+                                             reinterpret_cast<void*>(buffer.address), 150);
         check(call.thread_created, "remote/late-write remote thread created");
         check(!call.signaled, "remote/late-write the call really timed out");
         check(call.thread != nullptr, "remote/late-write the unresolved call keeps its thread handle");
@@ -1305,7 +1305,7 @@ void run_remote_late_write_case() {
               "remote/late-write remote_fetch_pod reports the retained buffer");
         release_remote_call(pod_call);
 
-        ::Sleep(1200);  // 让两个远程写者都完成它们那 144 字节
+        ::Sleep(700);  // 让两个远程写者都完成（写者自己的延迟是 400 ms）那 144 字节
         unsigned char read_back[144]{};
         bool const read_ok =
             remote_read(child_pid, buffer.address, read_back, sizeof(read_back), buffer_error);
@@ -1506,7 +1506,7 @@ void run_park_cases() {
             check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/late-write buffer allocated");
 
             RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
-                                                    reinterpret_cast<void*>(buffer.address), 250);
+                                                    reinterpret_cast<void*>(buffer.address), 150);
             check(call.thread_created, "park/late-write the remote thread was created");
             check(!call.signaled, "park/late-write the call really timed out first");
             check(remote_call_unresolved(call), "park/late-write the call is unresolved after the timeout");
@@ -1556,7 +1556,7 @@ void run_park_cases() {
 
             HANDLE stop_event = ::CreateEventW(nullptr, TRUE, TRUE, nullptr);
             RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
-                                                    reinterpret_cast<void*>(buffer.address), 250);
+                                                    reinterpret_cast<void*>(buffer.address), 150);
             check(call.thread_created && !call.signaled, "park/interrupted the call timed out first");
             ParkResult const parked = park_remote_call(call, target.process, 50, stop_event);
             check(parked == ParkResult::Interrupted, "park/interrupted reports the interruption");
@@ -1587,11 +1587,11 @@ void run_park_cases() {
             check(remote_alloc(child.pid, 144, buffer, buffer_error), "park/target-death buffer allocated");
 
             RemoteCall call = call_remote_export_on(target.process, child.dll_base, child.export_info.rva,
-                                                    reinterpret_cast<void*>(buffer.address), 250);
+                                                    reinterpret_cast<void*>(buffer.address), 150);
             check(call.thread_created && !call.signaled,
                   "park/target-death the call is still unresolved when the target is killed");
 
-            // 在写者那 800ms 睡完之前杀掉**自己 spawn 的**目标进程，并等进程对象真的 signal：
+            // 在写者那 400 ms 睡完之前杀掉**自己 spawn 的**目标进程，并等进程对象真的 signal：
             // 这样 park 的第一轮判定就同时看到"线程句柄 signal + 进程句柄 signal"，用来钉住
             // "目标死亡优先于入口返回"这条规则（不靠时间竞态取胜）。
             ::TerminateProcess(child.process.hProcess, 0);
@@ -1630,7 +1630,7 @@ void run_park_cases() {
 
             RemoteCall call = call_remote_export_on(target.process, child.dll_base,
                                                     child.export_info.rva,
-                                                    reinterpret_cast<void*>(buffer.address), 250);
+                                                    reinterpret_cast<void*>(buffer.address), 150);
             check(call.thread_created && !call.signaled,
                   "park/target-death-mid-park the call is unresolved before the kill");
 

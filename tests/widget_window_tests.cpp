@@ -611,7 +611,9 @@ void test_hover_and_detail_stress_keeps_state_consistent() {
     bool nodes_always_match = true;
     bool hidden_when_empty = true;
     bool handles_stable = true;
-    int const rounds = 60;
+    // 60 轮只是把同一份证据重复三遍：每轮都已经走完整的 apply + 悬停扫查，24 轮足以覆盖
+    // 详细/精简切换、空帧与定时器的各种交错。
+    int const rounds = 24;
     for (int round = 0; round < rounds; ++round) {
         std::size_t const items = static_cast<std::size_t>(round % 6) + 1;
         deskfeed::Frame const frame = detailed_content_frame(items);
@@ -1158,8 +1160,8 @@ LRESULT CALLBACK menu_gate_helper_proc(HWND hwnd, UINT message, WPARAM wparam, L
         state->phase = 1;
         return 0;
     }
-    if (state->phase == 1 && elapsed >= 2600) {
-        // 守卫定时器是 1000 ms 一次：等满两个多周期，它必然在菜单开着的时候跑过。
+    if (state->phase == 1 && elapsed >= 2000) {
+        // 守卫定时器是 1000 ms 一次：剥掉置顶位之后至少跨过一整轮，它必然在菜单开着的时候跑过。
         POINT at{0, 0};
         state->visible_after_guard = menu_overlap_point(state->widget, state->menu, &at) &&
                                      ::WindowFromPoint(at) == state->menu;
@@ -1177,8 +1179,16 @@ LRESULT CALLBACK menu_gate_helper_proc(HWND hwnd, UINT message, WPARAM wparam, L
         ::PostMessageW(state->widget, WM_CONTEXTMENU, 0, MAKELPARAM(5, 5));
         return 0;
     }
-    if (state->phase == 2 && elapsed >= 4200) {
-        state->topmost_restored = is_topmost(state->widget);
+    if (state->phase == 2 && is_topmost(state->widget)) {
+        // 守卫的下一次 tick 把置顶补回来（只是延后，不是禁用）。等它真的补上就收工，
+        // 不再死等一段固定时间。
+        state->topmost_restored = true;
+        ::KillTimer(hwnd, kMenuGateTimer);
+        state->phase = 3;
+        return 0;
+    }
+    if (state->phase == 2 && elapsed >= 6000) {
+        // 兜底：守卫始终没有补回来 ⇒ 交给断言报红，别把用例挂死。
         ::KillTimer(hwnd, kMenuGateTimer);
         state->phase = 3;
         return 0;

@@ -49,6 +49,36 @@ pid + 创建时间命名、`DllMain` 每个进程只 attach 一次，所以“Na
 邮箱生产者（`probtray*` 用它让负载真的走到 attach）；窗口都是不可见的 STATIC，不注入 explorer、
 不起可见 GUI、不碰真实任务栏与光标。
 
+### 用例耗时与并行
+
+这些用例大多是**真进程**的集成验收：每个 `master_*` 用例要起若干次 `deskfeed.exe`（启动 + IPC +
+退出，Debug 下约百毫秒级），负载侧每条“能退休”的断言都要真装一次成品 DLL 并等负载线程起完
+（约 1 s），HTTP 预算、编排 tick、置顶守卫又都按**真实墙钟**等。所以整轮时间主要不是断言本身，
+而是这些真实动作。
+
+两条缩短原则，改动慢用例时照此处理：
+
+- **等机械证据，不等固定时长**。延迟退出这类用例等的是主进程日志里“已到期 / 已丢弃”那一行，
+  不是 `Sleep(5000)`；测试注入点的窗口（`DESKFEED_TEST_DEFER_QUIT_MS` 等）只留到覆盖真实动作的
+  最小倍数，不再按“大概够”放大若干倍。
+- **重复轮数只保留能独立咬住缺陷的那几轮**。例如 `reload` 的逐轮净零：首轮取参考值，后两轮各
+  证明一次；再多的轮次是同一份证据的重复。
+
+单套件内想知道慢在哪一条，两个框架式套件（`deskfeed-tests`、`deskfeed-supervisor-tests`）支持
+`--timing`，在每条结果后面追加耗时（毫秒），默认输出不受影响：
+
+```powershell
+.\.agent\build\debug\bin\deskfeed-tests.exe --timing
+.\.agent\build\debug\bin\deskfeed-tests.exe --filter master_ --timing
+```
+
+8 条 CTest 之间互不共享状态（scope、临时目录、窗口类与邮箱名都按用例自己命名），可以用
+`-j` 并行跑，整轮墙钟约等于最慢那条套件：
+
+```powershell
+ctest --test-dir .agent/build/debug -j 8 --output-on-failure
+```
+
 ### 句柄判据为什么是“逐轮净零”，不是“装载后 = 稳态 + N”
 
 `reload` 场景曾经断言“一次装载恰好比上一轮稳态多 4 个句柄”（本模块自有的清理事件 + 守卫

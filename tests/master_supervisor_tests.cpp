@@ -267,7 +267,7 @@ TEST(supervisor_does_not_load_when_the_payload_is_already_in_place) {
         testing::report_failure("连状态问询都没有发生：" + join_log(read_log(log)));
     }
     // 再推一段：已经装载就绝不该出现 --load。
-    long long const deadline = monotonic_ms() + 600;
+    long long const deadline = monotonic_ms() + 250;
     while (monotonic_ms() < deadline) {
         supervisor.tick(monotonic_ms());
         ::Sleep(5);
@@ -351,7 +351,7 @@ TEST(supervisor_does_not_lose_a_stop_that_arrives_while_a_load_is_running) {
     set_environment(L"DESKFEED_FAKE_LOG", log);
     set_environment(L"DESKFEED_FAKE_STATUS", L"1");  // 未装载
     // 让第一次状态问询慢下来，好让“关掉组件”落在它还在跑的时候。
-    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"600");
+    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"300");
 
     TaskbarSupervisor supervisor;
     std::string error;
@@ -381,7 +381,7 @@ TEST(supervisor_rechecks_after_a_stop_when_the_component_was_turned_back_on) {
     set_environment(L"DESKFEED_FAKE_LOG", log);
     set_environment(L"DESKFEED_FAKE_STATUS", L"0");  // 已装载 → 停止完成后重新问，会发现仍装载
     // 让停止慢下来，好让“用户又把组件打开”真的落在它还在跑的时候。
-    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"600");
+    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"300");
 
     TaskbarSupervisor supervisor;
     std::string error;
@@ -446,7 +446,7 @@ TEST(supervisor_shutdown_does_not_wait_for_a_running_action) {
     set_environment(L"DESKFEED_FAKE_LOG", log);
     set_environment(L"DESKFEED_FAKE_STATUS", L"0");
     // 让动作长时间不返回：收尾**绝不能**在这里等它。
-    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"1200");
+    set_environment(L"DESKFEED_FAKE_DELAY_MS", L"600");
 
     TaskbarSupervisor supervisor;
     std::string error;
@@ -457,8 +457,8 @@ TEST(supervisor_shutdown_does_not_wait_for_a_running_action) {
     long long const before = monotonic_ms();
     supervisor.shutdown();
     long long const elapsed = monotonic_ms() - before;
-    // 收尾只请求、不等待：这里必须立刻返回（留足调度余量，但远小于动作的 1200 ms）。
-    CHECK(elapsed < 500);
+    // 收尾只请求、不等待：这里必须立刻返回（留足调度余量，但远小于动作的 600 ms）。
+    CHECK(elapsed < 300);
 
     // 那次还在跑的动作结束后，收尾落的停止令牌必须被发出去，而不是随进程一起丢掉。
     std::vector<std::string> const expected{line_for("--status", scope), line_for("--stop", scope)};
@@ -532,7 +532,7 @@ TEST(supervisor_armed_with_the_component_off_spawns_nothing) {
     CHECK(supervisor.started());
     CHECK(!supervisor.enabled());
 
-    long long const deadline = monotonic_ms() + 800;
+    long long const deadline = monotonic_ms() + 300;
     while (monotonic_ms() < deadline) {
         supervisor.tick(monotonic_ms());
         ::Sleep(5);
@@ -559,7 +559,7 @@ TEST(supervisor_not_started_never_spawns_anything) {
     TaskbarSupervisor supervisor;
     CHECK(!supervisor.started());
 
-    long long const deadline = monotonic_ms() + 800;
+    long long const deadline = monotonic_ms() + 300;
     while (monotonic_ms() < deadline) {
         supervisor.tick(monotonic_ms());
         ::Sleep(5);
@@ -591,12 +591,16 @@ TEST(supervisor_not_started_never_spawns_anything) {
 
 int wmain(int argc, wchar_t** argv) {
     std::string filter;
+    bool timing = false;
     for (int index = 1; index < argc; ++index) {
         std::wstring const arg(argv[index]);
         if (arg == L"--filter" && index + 1 < argc) {
             filter = testing::to_display(std::wstring(argv[++index]));
+        } else if (arg == L"--timing") {
+            // 输出每条用例的耗时（毫秒）：排查“整套多久、慢在哪一条”时用，默认输出保持不变。
+            timing = true;
         } else if (arg == L"--help" || arg == L"-h") {
-            std::printf("deskfeed-supervisor-tests.exe [--filter <substring>]\n");
+            std::printf("deskfeed-supervisor-tests.exe [--filter <substring>] [--timing]\n");
             return 0;
         }
     }
@@ -608,18 +612,24 @@ int wmain(int argc, wchar_t** argv) {
         if (!filter.empty() && name.find(filter) == std::string::npos) {
             continue;
         }
+        long long const started = ::GetTickCount64();
+        auto const suffix = [timing, started]() -> std::string {
+            return timing ? "  [" + std::to_string(::GetTickCount64() - started) + " ms]"
+                          : std::string();
+        };
         try {
             test.body();
-            std::printf("ok   %s\n", test.name);
+            std::printf("ok   %s%s\n", test.name, suffix().c_str());
             ++passed;
         } catch (testing::Failure const& failure) {
-            std::printf("FAIL %s: %s\n", test.name, failure.message.c_str());
+            std::printf("FAIL %s: %s%s\n", test.name, failure.message.c_str(), suffix().c_str());
             ++failed;
         } catch (std::exception const& error) {
-            std::printf("FAIL %s: unexpected exception: %s\n", test.name, error.what());
+            std::printf("FAIL %s: unexpected exception: %s%s\n", test.name, error.what(),
+                        suffix().c_str());
             ++failed;
         } catch (...) {
-            std::printf("FAIL %s: unknown exception\n", test.name);
+            std::printf("FAIL %s: unknown exception%s\n", test.name, suffix().c_str());
             ++failed;
         }
     }

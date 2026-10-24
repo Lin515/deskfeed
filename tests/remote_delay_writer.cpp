@@ -16,7 +16,8 @@ unsigned char const kLateWriteMagic[8] = {0x44, 0x46, 0x4C, 0x41, 0x54, 0x45, 0x
 // 睡够 `kDelayMs` 之后，把 144 字节（含 magic）写进调用方给的缓冲，返回 1。
 // 参数与返回值形状与 `DWORD WINAPI f(void*)` 的远程调用 ABI 一致。
 extern "C" __declspec(dllexport) DWORD WINAPI DeskFeedTestDelayedWrite(void* buffer) {
-    constexpr DWORD kDelayMs = 800;
+    // 只求“调用方先超时、写入后到”：400 ms 已经远大于调用方 150 ms 的等待窗口。
+    constexpr DWORD kDelayMs = 400;
     if (buffer == nullptr) {
         return 0;
     }

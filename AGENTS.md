@@ -65,6 +65,10 @@
    注入器**必须保留映射**（不得 `FreeLibrary`、不得按镜像名杀进程）；负载侧永不置、永不清那个粘性
    不确定事件，也永不读 actor 快照（`[8,40)`）。这套门只对本协议的合作参与者成立，**不要**据此宣称
    "整进程任意第三方线程都安全"。
+9. **跑 CTest 一律带 `-j 8`**：`ctest --test-dir <构建目录> -j 8 --output-on-failure`。8 条用例之间
+   不共享 scope、临时目录、窗口类与邮箱名，可以并行（串行整轮约 54 s，`-j 8` 约 23 s）。要看单条
+   用例的耗时，用 `deskfeed-tests.exe --timing`（`deskfeed-supervisor-tests.exe` 同样支持）；
+   耗时构成与并行前提见 `docs/testing.md` 的“用例耗时与并行”。
 
 ## 目录
 

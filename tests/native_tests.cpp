@@ -1501,7 +1501,9 @@ int child_actor_held_references() {
 // 净零判据对"少一次 CloseHandle"仍然是确定性的：删掉任一归还，本轮结尾就比参考高，等式立刻不成立；
 // 上面两条"对象消失"断言再从内核对象一侧独立咬一次。
 int child_reload_objects_gone() {
-    constexpr int kCycles = 6;
+    // 三轮就够：首轮建立“一次性增长之后”的参考值，后两轮各独立证明逐轮净零。更多轮只是重复
+    // 同一份证据，每轮却要真装/真卸一次成品 DLL。
+    constexpr int kCycles = 3;
     DWORD baseline = 0;
     ::GetProcessHandleCount(::GetCurrentProcess(), &baseline);
     std::printf("reload: handles before any load=%lu\n", static_cast<unsigned long>(baseline));

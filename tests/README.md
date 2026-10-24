@@ -3,10 +3,10 @@
 | 文件 | 作用 |
 | --- | --- |
 | `test_support.h` | 极简测试框架：`TEST` / `CHECK` / `CHECK_EQ`，失败抛异常、由入口按用例捕获；不引第三方依赖。 |
-| `tests.cpp` | 主进程侧全部离线用例与入口（`--filter <子串>` 只跑匹配的用例，末尾打印通过/失败数，失败时返回 1）。 |
+| `tests.cpp` | 主进程侧全部离线用例与入口（`--filter <子串>` 只跑匹配的用例，`--timing` 在每条结果后追加耗时，末尾打印通过/失败数，失败时返回 1）。 |
 | `native_tests.cpp` | 任务栏负载侧的离线用例与**成品 DLL 审计**入口：显示帧消费策略、钩子门收尾协议、C++/SEH 边界、IAT 改写的恢复路径、回收门位、真 DLL 的 `status` / `glue` / `failclosed`、进程守卫（纯函数 + 自起子进程场景，含 `reload` 的句柄零增长与 `hookevents` 的无名钩子事件归还）。 |
 | `tools_tests.cpp` | 注入器与探针工具的离线用例：目标解析、严格 PE 解析、远程调用超时与迟到写者、per-target 租约与真实动作路径（后两者用下面三个夹具）。 |
-| `master_supervisor_tests.cpp` | 主进程侧任务栏编排的用例（配 `fake_injector.cpp`，只做假注入）。 |
+| `master_supervisor_tests.cpp` | 主进程侧任务栏编排的用例（配 `fake_injector.cpp`，只做假注入；`--filter` / `--timing` 同上）。 |
 | `widget_tests.cpp` | 桌面悬浮窗的纯逻辑与偏好用例。 |
 | `widget_window_tests.cpp` | 悬浮窗的隐藏窗口门禁：真的建窗口，但强制隐藏（`force_hidden`），所以真实窗口不会出现在桌面上。覆盖建窗与偏好回滚、菜单命令、外部销毁、拖动收尾与捕获被抢走、全屏信号口径、字体度量，以及**悬停与双击的真实消息路径**：合成 `WM_MOUSEMOVE` / `WM_MOUSELEAVE` / `WM_LBUTTONDOWN`+`WM_LBUTTONUP`+`WM_LBUTTONDBLCLK` 驱动生产代码，断言每个条目悬停出**自己**的提示（与任务栏同源的 `ReadingRow::tip`）、提示落在显示器工作区内、同一节点内不重发不移动、空内容不留提示，以及详细↔精简 + 悬停 + 定时器的压力循环里句柄不重建、GDI/USER 对象不增长。通知区域图标也在这里验：合成 `kTrayIconMessage` 的单击事件不写偏好不显示，双击走显示请求并清掉持久隐藏标记，`--hidden` 下双击仍然不绕过；用例把 `tray_icon_available` 关掉，**不登记真实托盘图标**。**不移动光标**（合成的消息就是生产路径：命中判定在窗口里，显示走 `TTM_TRACKACTIVATE`），也不注入 explorer、不碰用户实例。另有一条**右键菜单保活**：在**私有桌面**（`CreateDesktop`，不是输入桌面）上建真正显示的生产 `WidgetWindow`，用通知区域图标的右键回调（`kTrayIconMessage` + `WM_CONTEXTMENU`）开**真的** `TrackPopupMenu` 模态菜单，证明托盘右键复用的就是悬浮窗那一份菜单；把 topmost 位剥掉以定死守卫的“置顶位丢了”那条判据；断言守卫 tick 之后菜单仍是它自己区域的最上层（守卫没把窗口抬到自己菜单之上）、取消菜单不隐藏不退出、菜单开着时递进来的重复右键不叠加第二个菜单、菜单结束后下一 tick 置顶按原判据恢复，并用生产日志核对“菜单开着的那一段没有补置顶、关掉之后才补”。整轮不碰用户桌面、不移动真实光标。 |
 | `fake_injector.cpp` | **测试专用**假注入器：主进程任务栏编排用例的目标，不注入任何进程。 |

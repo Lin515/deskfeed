@@ -6,6 +6,9 @@ DeskFeed 只有一个取数与状态决策的地方：主进程 `deskfeed.exe`�
 缓存、到期与整体失效判断，并把同一个 `View` 交给各个显示面。桌面悬浮窗与任务栏组件因此不可能
 对同一份快照给出不同解释。
 
+桌面悬浮窗还挂一个通知区域（系统托盘）图标：右键弹出的是悬浮窗那一份菜单，左键双击把窗口
+叫出来并在已显示时抬到最前，左键单击不动作。图标挂在悬浮窗自己的 HWND 上，不新增线程。
+
 ## 默认行为与开关
 
 - 主进程**默认就建两个显示面**：桌面悬浮窗，以及任务栏组件。`[taskbar] component` 缺省为
@@ -13,8 +16,8 @@ DeskFeed 只有一个取数与状态决策的地方：主进程 `deskfeed.exe`�
 - 任务栏编排（`src/master/taskbar_supervisor.*`）本身**不注入**：它只按一份有界的命令行契约异步
   调用 `deskfeed-inject.exe`，真正找任务栏属主、装载/卸载负载的能力都在注入器里。
 - 本次运行的开关：`--headless`（不显示悬浮窗、也不碰任务栏）、`--no-inject` / `--no-taskbar`
-  （不碰任务栏）、`--hidden`（悬浮窗保持隐藏，取数与任务栏组件照旧）。持久关闭任务栏组件写
-  `[taskbar] component=false`。这些开关都**不落盘**，只有 `[taskbar] component` 落盘。
+  （不碰任务栏）、`--hidden`（悬浮窗与通知区域图标都不显示，取数与任务栏组件照旧）。持久关闭
+  任务栏组件写 `[taskbar] component=false`。这些开关都**不落盘**，只有 `[taskbar] component` 落盘。
 - 没有显示邮箱就不武装编排层：邮箱建不起来时一次注入动作都不会发（不“盲装”负载）。
 - 自测与验收必须用隔离实例（`--scope` 等），见 [testing.md](testing.md) 的安全验收流程。
 
@@ -44,7 +47,7 @@ DeskFeed 只有一个取数与状态决策的地方：主进程 `deskfeed.exe`�
 | `src/master/` | `deskfeed` | 单实例生命周期、命令事务、取数调度、到期定时器、消息循环、显示面接线（悬浮窗 + 显示邮箱 + 任务栏编排）、把显示模型发布出去。 |
 | `src/payload/` | `deskfeed_payload`、`deskfeed_payload_test` | 注入 `explorer.exe` 的任务栏负载：只读最新显示帧、渲染进任务栏 XAML 树、带可证明的拆除门禁与进程守卫（见 [native-safety.md](native-safety.md)）。两个产物同源，只差 `DESKFEED_DLL_TEST_API`。 |
 | `src/inject/`、`src/probe/` | `deskfeed_inject_support`、`deskfeed-inject`、`deskfeed-probe` | 注入/卸载工具与自测宿主（探针自带 Win32 窗口与系统 XAML 岛，**绝不注入 explorer**）。 |
-| `src/widget/` | `deskfeed_widget` | 桌面悬浮窗（窗口、主题、文本度量、界面偏好、全屏判定）。 |
+| `src/widget/` | `deskfeed_widget` | 桌面悬浮窗（窗口、主题、文本度量、界面偏好、全屏判定）与通知区域图标；托盘右键复用窗口菜单。 |
 | `src/tools/check/` | `deskfeed-check` | 离线协议检查器与 HTTP 量具。 |
 | `tests/` | `deskfeed-tests` 等 | 离线用例（见 [testing.md](testing.md)）。 |
 

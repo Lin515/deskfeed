@@ -94,13 +94,17 @@ deskfeed-check.exe --url "https://example.com/snapshot" --report json
 - **默认启动就会建立两个显示面**：桌面悬浮窗，以及任务栏组件。`[taskbar] component` 默认为
   `true`，主进程侧的任务栏编排因此会被武装，并按需调用 `deskfeed-inject.exe` 向当前任务栏属主
   进程装载负载。注入不是“需要额外打开”的能力，而是默认行为。
-- **托盘可以同时显示在多块屏幕上**。托盘读数块或悬浮窗的右键菜单里有「托盘屏幕」勾选；
+- **通知区域（系统托盘）里有一个 DeskFeed 图标**：右键弹出的是与悬浮窗**同一份**菜单（刷新、
+  置顶、详细/精简、任务栏组件、托盘屏幕、隐藏/显示、退出）；左键双击把悬浮窗叫出来，已经显示
+  时把它抬到最前并尝试取得前台焦点，左键单击不触发任何动作。图标由悬浮窗窗口自己挂载，不新增
+  线程或消息循环；`--hidden` 本次运行不挂图标。
+- **任务栏托盘读数块可以同时显示在多块屏幕上**。托盘读数块或悬浮窗的右键菜单里有「托盘屏幕」勾选；
   `[taskbar] screens` 缺省或不存在时只在主屏显示，显式空值表示不在任何任务栏显示。启用的屏幕
   一块都不可用时只在主屏显示，**不改写配置**；只失效一部分时不退化。细节见
   [docs/taskbar-injection.md](<docs/taskbar-injection.md>) 的“多屏与退化”。
 - 不要这两个显示面时：`--headless`（本次运行不显示悬浮窗、也不碰任务栏）、`--no-inject` /
-  `--no-taskbar`（不碰任务栏）、`--hidden`（悬浮窗保持隐藏，取数与任务栏组件照旧运行）；
-  想持久关掉任务栏组件就写 `[taskbar] component=false`。命令行开关只对本次运行有效；
+  `--no-taskbar`（不碰任务栏）、`--hidden`（悬浮窗与通知区域图标都不显示，取数与任务栏组件照旧
+  运行）；想持久关掉任务栏组件就写 `[taskbar] component=false`。命令行开关只对本次运行有效；
   `[taskbar] component` 与 `[taskbar] screens` 会落盘（见 [docs/configuration.md](<docs/configuration.md>)）。
 - **自测与验收必须用隔离实例**：`--scope <名字>`（或 `--test-instance`，或环境变量
   `DESKFEED_SCOPE`）会隔开互斥体、控制窗口类名、设置文件与日志；再加 `--headless` 保证不碰界面

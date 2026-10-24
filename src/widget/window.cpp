@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+// Shell_NotifyIconW / NOTIFYICONDATAW：通知区域图标（托盘图标）只在 Shell 那一侧登记，
+// 图标句柄仍归窗口所有。
+#include <shellapi.h>
 // WIN32_LEAN_AND_MEAN 的 windows.h 不带 objidl.h，而 GDI+ 的头里要用 STDMETHOD / IUnknown：
 // 先显式带进来，否则是一串“未定义基类 IUnknown”。
 #include <objidl.h>
@@ -10,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -30,6 +34,13 @@ namespace {
 
 constexpr wchar_t kWindowTitle[] = L"DeskFeed";
 constexpr wchar_t kSegmentSeparator[] = L" · ";
+
+// 通知区域图标：一个窗口最多登记一个，uID 与资源 ID 都固定下来。图标资源由主进程的
+// `assets/deskfeed.rc` 以 ID 1 挂上；测试目标没有这个资源时退回系统默认图标。
+constexpr UINT kTrayIconId = 1;
+constexpr int kTrayIconResourceId = 1;
+// Shell 在资源管理器重启后广播的注册消息名。所有顶层窗口都会收到，收到后图标要重新登记。
+constexpr wchar_t kTaskbarCreatedMessage[] = L"TaskbarCreated";
 
 constexpr UINT_PTR kTimerTopmost = 1;
 constexpr UINT_PTR kTimerSaveState = 2;
@@ -218,6 +229,13 @@ struct WidgetState {
     HMENU screens_menu = nullptr;
     std::vector<WidgetScreenEntry> screen_entries;
 
+    // 通知区域图标。tray_added 表示 Shell 那一侧当前确实有这个图标（资源管理器重启后会变 false，
+    // 由 TaskbarCreated 广播触发重新登记）；tray_icon_owned 决定收尾要不要 DestroyIcon。
+    bool tray_added = false;
+    HICON tray_icon = nullptr;
+    bool tray_icon_owned = false;
+    UINT taskbar_created_message = 0;
+
     // 状态日志去重：内容没变就不写第二行。
     std::wstring last_status{};
     bool gdiplus_held = false;
@@ -233,6 +251,13 @@ void show_hover_tip_of(WidgetState& self, int node);
 void place_hover_tip_of(WidgetState& self, RECT const& node_screen);
 void track_mouse_leave_of(WidgetState& self);
 void on_mouse_leave_of(WidgetState& self);
+// 通知区域图标：登记/撤销、Shell 回调分发、左键双击激活。
+void add_tray_icon_of(WidgetState& self);
+void remove_tray_icon_of(WidgetState& self);
+void on_tray_event_of(WidgetState& self, UINT event);
+void on_tray_double_click_of(WidgetState& self);
+// 把窗口叫到前面并（在可见时）抬到最前。control 的 ShowWidget 与托盘双击共用这一条。
+void show_on_request_of(WidgetState& self, wchar_t const* source);
 void create_context_menu_of(WidgetState& self);
 std::vector<std::pair<int, int>> segment_spans_of(WidgetState const& self, ReadingLine const& line,
                                                   int left);
@@ -265,6 +290,9 @@ void on_lbutton_up_of(WidgetState& self, POINT screen);
 void on_lbutton_dblclk_of(WidgetState& self, POINT screen);
 void finish_drag_after_move_of(WidgetState& self);
 void on_rbutton_up_of(WidgetState& self, POINT screen);
+// 弹出右键菜单前的统一入口：同一次右键手势在 v4 下会同时送 WM_RBUTTONUP 与 WM_CONTEXTMENU，
+// 这里按时间戳去重；托盘图标与悬浮窗自己的右键都走它。
+void request_context_menu_of(WidgetState& self);
 void show_context_menu_of(WidgetState& self);
 void run_command_of(WidgetState& self, UINT command);
 // 拆窗口/提示/菜单/计时器（**不落盘**），与释放 GDI/GDI+ 资源分开：外部 DestroyWindow 之后
@@ -562,6 +590,118 @@ void create_context_menu_of(WidgetState& self) {
                     MF_BYCOMMAND | (self.preferences.topmost ? MF_CHECKED : MF_UNCHECKED));
     ::CheckMenuItem(self.menu, kCmdTaskbarComponent,
                     MF_BYCOMMAND | (self.preferences.taskbar_component ? MF_CHECKED : MF_UNCHECKED));
+}
+
+// 通知区域图标：只用窗口自己的 HWND 做 Shell 回调的接收者，不另建消息循环、不另设线程。
+// 图标资源由主进程挂载（ID 1）；测试目标没有资源时退回系统默认图标，仍然不 panic。
+HICON load_tray_icon(HINSTANCE instance, bool* owned) {
+    *owned = false;
+    int const width = ::GetSystemMetrics(SM_CXSMICON);
+    int const height = ::GetSystemMetrics(SM_CYSMICON);
+    HICON const brand = static_cast<HICON>(::LoadImageW(
+        instance, MAKEINTRESOURCEW(kTrayIconResourceId), IMAGE_ICON, width, height, LR_DEFAULTCOLOR));
+    if (brand != nullptr) {
+        *owned = true;
+        return brand;
+    }
+    return static_cast<HICON>(
+        ::LoadImageW(nullptr, IDI_APPLICATION, IMAGE_ICON, width, height, LR_SHARED));
+}
+
+void add_tray_icon_of(WidgetState& self) {
+    // --hidden 是“本次运行不要任何窗口界面”的诊断开关：连通知区域图标也不挂，避免验收/自测
+    // 在真实托盘里留下图标。用户的持久隐藏（[window] hidden）不走这一条，图标照常存在。
+    if (!self.options.tray_icon_available || self.options.force_hidden || self.hwnd == nullptr ||
+        self.tray_added) {
+        return;
+    }
+    if (self.tray_icon == nullptr) {
+        self.tray_icon = load_tray_icon(self.options.instance, &self.tray_icon_owned);
+        if (self.tray_icon == nullptr) {
+            log_format(L"widget: cannot load the notification area icon (%s)",
+                       last_error_text().c_str());
+            return;
+        }
+    }
+
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = self.hwnd;
+    data.uID = kTrayIconId;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+#ifdef NIF_SHOWTIP
+    // v4 默认会压掉系统标准悬停提示；这里要的就是系统那一条。
+    data.uFlags |= NIF_SHOWTIP;
+#endif
+    data.uCallbackMessage = kTrayIconMessage;
+    data.hIcon = self.tray_icon;
+    std::wstring const tip = kWindowTitle;
+    std::size_t const tip_length = std::min(tip.size(), std::size(data.szTip) - 1);
+    std::copy_n(tip.c_str(), tip_length, data.szTip);
+    data.szTip[tip_length] = L'\0';
+
+    if (!::Shell_NotifyIconW(NIM_ADD, &data)) {
+        log_format(L"widget: cannot add the notification area icon (%s)",
+                   last_error_text().c_str());
+        return;
+    }
+    // v4 的回调把通知事件放在 LOWORD(lParam)、图标 ID 放在 HIWORD(lParam)。设置失败也保留图标，
+    // 因为处理函数同时兼容旧版的 WM_RBUTTONUP / WM_LBUTTONDBLCLK，不能把已经加上的图标当失败。
+    data.uVersion = NOTIFYICON_VERSION_4;
+    if (!::Shell_NotifyIconW(NIM_SETVERSION, &data)) {
+        log_format(L"widget: the notification area icon is up but NIM_SETVERSION failed (%s); "
+                   L"falling back to the legacy callback layout",
+                   last_error_text().c_str());
+    }
+    self.tray_added = true;
+    log_format(L"widget: notification area icon added (icon=%s)",
+               self.tray_icon_owned ? L"brand" : L"system default");
+}
+
+void remove_tray_icon_of(WidgetState& self) {
+    if (self.tray_added && self.hwnd != nullptr) {
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = self.hwnd;
+        data.uID = kTrayIconId;
+        if (!::Shell_NotifyIconW(NIM_DELETE, &data)) {
+            log_format(L"widget: cannot remove the notification area icon (%s)",
+                       last_error_text().c_str());
+        }
+        self.tray_added = false;
+    }
+    if (self.tray_icon != nullptr) {
+        if (self.tray_icon_owned) {
+            ::DestroyIcon(self.tray_icon);
+        }
+        self.tray_icon = nullptr;
+        self.tray_icon_owned = false;
+    }
+}
+
+void on_tray_double_click_of(WidgetState& self) {
+    if (self.menu_open) {
+        return;  // 菜单开着时不再抢前台：菜单的模态循环正握着鼠标
+    }
+    log_line(L"widget: the notification area icon was double-clicked");
+    show_on_request_of(self, L"the notification area icon");
+}
+
+void on_tray_event_of(WidgetState& self, UINT event) {
+    // v4 对一次物理动作会同时送旧鼠标消息与语义通知（右键 = WM_RBUTTONUP + WM_CONTEXTMENU）；
+    // 只按下面这几种事件分派，同一次右键由 request_context_menu_of 去重。
+    // 左键单击会送 NIN_SELECT 与 WM_LBUTTONUP，两者都**不处理**：单击不触发任何事情。
+    switch (event) {
+        case WM_LBUTTONDBLCLK:
+            on_tray_double_click_of(self);
+            return;
+        case WM_CONTEXTMENU:
+        case WM_RBUTTONUP:
+            request_context_menu_of(self);
+            return;
+        default:
+            return;
+    }
 }
 
 // 一行里每个段落在客户区里的横向范围（[start, end)）。**量、画、命中判定共用这一份算术**：
@@ -1233,8 +1373,18 @@ void on_lbutton_dblclk_of(WidgetState& self, POINT screen) {
 
 void on_rbutton_up_of(WidgetState& self, POINT client) {
     (void)client;
-    // 记下这次手势的时刻：Windows 可能紧接着补一条 WM_CONTEXTMENU，那一条要按这个时刻去重。
-    self.last_menu_ms = now_ms();
+    request_context_menu_of(self);
+}
+
+void request_context_menu_of(WidgetState& self) {
+    // 同一次右键手势里 WM_RBUTTONUP 与随后的 WM_CONTEXTMENU 之间只隔几毫秒；v4 的托盘图标
+    // 还会把这两个都送一遍。窗口自己的 WM_CONTEXTMENU（键盘菜单键）也走这里，所以两条路都
+    // 按同一个时间窗去重，避免同一个手势弹出两次菜单。
+    unsigned long long const now = now_ms();
+    if (self.last_menu_ms != 0 && now - self.last_menu_ms <= kMenuRepeatMs) {
+        return;
+    }
+    self.last_menu_ms = now;
     show_context_menu_of(self);
 }
 
@@ -1416,6 +1566,8 @@ void run_command_of(WidgetState& self, UINT command) {
 }
 
 void teardown_window_of(WidgetState& self) {
+    // 通知区域图标先撤：它挂在 hwnd 上，窗口一销毁就只剩一个指向死句柄的图标。
+    remove_tray_icon_of(self);
     // 提示先收掉再拆：它是独立的顶层小窗，直接销毁窗口会留下一个悬空的可见提示。
     hide_hover_tip_of(self);
     if (self.hwnd != nullptr) {
@@ -1478,6 +1630,69 @@ void destroy_window_of(WidgetState& self) {
     }
     teardown_window_of(self);
     release_resources_of(self);
+}
+
+// 外部（或托盘双击）要求把悬浮窗叫出来。两条语义必须保留：
+//   * `--hidden` 是本次运行的强制隐藏，连用户存的隐藏标记都不动；
+//   * 已经显示时也要把它抬到最前并抢一次前台——`ShowWindow` 不会改变已显示窗口的 z 序，
+//     托盘双击在窗口被别的窗口盖住时必须有可见结果。
+void show_on_request_of(WidgetState& self, wchar_t const* source) {
+    if (self.hwnd == nullptr) {
+        // 窗口已经不在：不做任何 Win32 调用（与 apply 同一条理由）。
+        return;
+    }
+    if (self.options.force_hidden) {
+        // --hidden 是本次运行的强制隐藏：连用户的隐藏标记都不动。一次诊断运行不该改写
+        // 用户存下来的 `[window] hidden`。
+        log_format(L"widget: a show request arrived from %s but --hidden is in effect for this run",
+                   source);
+        record_status_of(self, L"隐藏", L"--hidden：本次运行强制隐藏，显示请求被忽略");
+        return;
+    }
+    bool const was_visible = ::IsWindowVisible(self.hwnd) != FALSE;
+    WindowPreferences const before = self.preferences;
+    self.preferences.hidden = false;
+    if (!save_preferences_of(self, before)) {
+        // 落盘失败：隐藏标记已回滚，界面保持与磁盘一致（继续藏着）。
+        log_format(L"widget: a show request arrived from %s but the preference could not be "
+                   L"persisted; staying hidden",
+                   source);
+        return;
+    }
+    if (self.fullscreen) {
+        // 全屏还没结束：只把用户的意图记下来（隐藏标记已清），窗口等全屏结束再出来。
+        log_format(L"widget: a show request arrived from %s while a fullscreen application owns "
+                   L"the screen; it will show when the fullscreen application is gone",
+                   source);
+        record_status_of(self, L"隐藏", L"前台是全屏程序，显示请求等它退出后再显示");
+        return;
+    }
+    if (!self.rendered_once || !self.has_content) {
+        // 还没拿到第一份有内容的快照：拿到之后它自己会显示（隐藏标记已经清掉了）。
+        log_format(L"widget: a show request arrived from %s before the first content; it will show "
+                   L"when the first content lands",
+                   source);
+        return;
+    }
+    self.ready_to_show = true;
+    place_by_anchor_of(self);
+    if (!was_visible) {
+        ::ShowWindow(self.hwnd, SW_SHOWNORMAL);
+    }
+    BOOL raised = FALSE;
+    if (!self.menu_open) {
+        // 前台权是系统给的：调用方不在前台时 Windows 会拒绝。抬到最前这一步不受前台锁约束，
+        // 所以即使 SetForegroundWindow 失败，窗口也不会继续被别的窗口盖着。
+        ::BringWindowToTop(self.hwnd);
+        raised = ::SetForegroundWindow(self.hwnd);
+    } else {
+        // 自己的右键菜单正开着：把它抬到菜单之上会让菜单被自家窗口盖住、却仍握着鼠标捕获。
+        // 菜单返回之后的下一 tick 由置顶守护按原判据补，不在这里抢。
+        log_line(L"widget: a show request arrived while our own context menu is open; not raising "
+                 L"the window above the menu");
+    }
+    log_format(L"widget: shown on a request from %s (was_visible=%d foreground=%s)", source,
+               was_visible ? 1 : 0, raised != FALSE ? L"yes" : L"no");
 }
 
 }  // namespace
@@ -1571,6 +1786,11 @@ bool WidgetWindow::create(WidgetOptions const& options, WidgetCallbacks const& c
             }
             break;
         }
+        // 通知区域图标是可选能力：登记失败只记日志，不把整个悬浮窗判成建不出来。图标挂在
+        // 这个窗口上，右键菜单直接复用上面那一份 menu（见 on_tray_event_of）。
+        candidate->taskbar_created_message =
+            ::RegisterWindowMessageW(kTaskbarCreatedMessage);
+        add_tray_icon_of(*candidate);
         built = true;
     } while (false);
 
@@ -1713,10 +1933,12 @@ LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPA
             // 键盘的「菜单键」（VK_APPS）/ Shift+F10 走这条消息；真实右键则先到上面的
             // WM_RBUTTONUP，Windows 可能紧接着补一条 WM_CONTEXTMENU。两条路都指向同一个菜单，
             // 所以这里按时间戳去重，避免同一个手势弹两次。
-            if (self.last_menu_ms == 0 || now_ms() - self.last_menu_ms > kMenuRepeatMs) {
-                self.last_menu_ms = now_ms();
-                show_context_menu_of(self);
-            }
+            request_context_menu_of(self);
+            return 0;
+        case kTrayIconMessage:
+            // 通知区域图标的事件。v4 把通知码放在 LOWORD(lParam)、图标 ID 放在 HIWORD；
+            // 旧版布局里整个 lParam 就是鼠标消息，LOWORD 取出来正好还是那一条。
+            on_tray_event_of(self, LOWORD(lparam));
             return 0;
         case WM_COMMAND:
             // 菜单本身用 TrackPopupMenu(TPM_RETURNCMD)，选中一项不会发 WM_COMMAND——那条路由
@@ -1727,6 +1949,11 @@ LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPA
             log_format(L"widget: WM_COMMAND %u arrived from outside (menu_open=%d)",
                        static_cast<unsigned>(wparam & 0xFFFFu), self.menu_open ? 1 : 0);
             run_command_of(self, static_cast<UINT>(wparam & 0xFFFFu));
+            return 0;
+        case WM_DESTROY:
+            // 外部 DestroyWindow 不会经过 WidgetWindow::destroy()；图标必须以窗口句柄为锚
+            // 主动撤掉，不能等收尾那条路（那时句柄可能已经不在了）。
+            remove_tray_icon_of(self);
             return 0;
         case WM_CLOSE:
             // Alt+F4 与菜单「退出」走同一条收尾路径：外面按“先摘任务栏负载、再关窗”的顺序来。
@@ -1739,6 +1966,13 @@ LRESULT WidgetWindow::handle_message(HWND hwnd, UINT message, WPARAM wparam, LPA
             }
             return 0;
         default:
+            // 资源管理器重启会广播 TaskbarCreated；通知区域里的图标随之消失，必须重新登记。
+            // 图标关闭（测试 / 无托盘模式）时 add_tray_icon_of 自己会 no-op。
+            if (self.taskbar_created_message != 0 && message == self.taskbar_created_message) {
+                self.tray_added = false;
+                add_tray_icon_of(self);
+                return 0;
+            }
             return ::DefWindowProcW(hwnd, message, wparam, lparam);
     }
 }
@@ -1799,46 +2033,7 @@ void WidgetWindow::show_from_request() {
     if (impl_ == nullptr) {
         return;
     }
-    WidgetState& self = *impl_;
-    if (self.hwnd == nullptr) {
-        // 窗口已经不在：不做任何 Win32 调用（与 apply 同一条理由）。
-        return;
-    }
-    if (self.options.force_hidden) {
-        // --hidden 是本次运行的强制隐藏：连用户的隐藏标记都不动。一次诊断运行不该改写
-        // 用户存下来的 `[window] hidden`。
-        log_line(L"widget: a show request arrived but --hidden is in effect for this run");
-        record_status_of(self, L"隐藏", L"--hidden：本次运行强制隐藏，显示请求被忽略");
-        return;
-    }
-    WindowPreferences const before = self.preferences;
-    self.preferences.hidden = false;
-    if (!save_preferences_of(self, before)) {
-        // 落盘失败：隐藏标记已回滚，界面保持与磁盘一致（继续藏着）。
-        log_line(L"widget: a show request arrived but the preference could not be persisted; "
-                 L"staying hidden");
-        return;
-    }
-    if (self.fullscreen) {
-        // 全屏还没结束：只把用户的意图记下来（隐藏标记已清），窗口等全屏结束再出来。
-        log_line(L"widget: a show request arrived while a fullscreen application owns the screen; "
-                 L"it will show when the fullscreen application is gone");
-        record_status_of(self, L"隐藏", L"前台是全屏程序，显示请求等它退出后再显示");
-        return;
-    }
-    if (!self.rendered_once || !self.has_content) {
-        // 还没拿到第一份有内容的快照：拿到之后它自己会显示（隐藏标记已经清掉了）。
-        log_line(L"widget: a show request arrived before the first content; it will show when the "
-                 L"first content lands");
-        return;
-    }
-    self.ready_to_show = true;
-    place_by_anchor_of(self);
-    ::ShowWindow(hwnd_, SW_SHOWNORMAL);
-    // 前台权是系统给的：调用方不在前台时 Windows 会拒绝（窗口照旧显示，因为它本来就是置顶的）。
-    BOOL const raised = ::SetForegroundWindow(hwnd_);
-    log_format(L"widget: shown on request from another process (foreground=%s)",
-               raised != FALSE ? L"yes" : L"no");
+    show_on_request_of(*impl_, L"another process");
 }
 
 void WidgetWindow::destroy() {

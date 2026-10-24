@@ -6,7 +6,7 @@
 | --- | --- |
 | `deskfeed-icon.svg` | 应用图标的唯一矢量源（256 × 256 画布），透明背景，可无损缩放 |
 | `deskfeed.ico` | 由 SVG 逐尺寸导出的 Windows 图标：16/20/24/32/40/48/64/128 为 BMP 条目，256 为 PNG 条目 |
-| `deskfeed.rc` | 资源脚本：资源 ID 1 的 `RT_GROUP_ICON`，只挂给 `deskfeed.exe` 与 `deskfeed-inject.exe` |
+| `deskfeed.rc` | 资源脚本：资源 ID 1 的 `RT_GROUP_ICON`，挂给 `deskfeed.exe` 与 `deskfeed-inject.exe`；主进程的通知区域（托盘）图标也按小图标尺寸从这里加载 |
 
 ## 图形与配色
 

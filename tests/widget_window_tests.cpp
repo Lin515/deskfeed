@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 
 #include <objidl.h>
 #include <gdiplus.h>
@@ -165,6 +166,8 @@ bool create_hidden(deskfeed::widget::WidgetWindow& window, Recorder& recorder,
     options.class_name = kTestClass;
     options.taskbar_available = true;
     options.force_hidden = true;  // 关键：整轮门禁都不会显示真实窗口
+    // 用例不登记真实通知区域图标：Shell 的图标属于当前桌面，离线门禁不该在用户托盘里留东西。
+    options.tray_icon_available = false;
     options.preferences = preferences;
     return window.create(options, callbacks_for(recorder), &error);
 }
@@ -772,6 +775,47 @@ void test_show_request_leaves_disk_alone_while_force_hidden() {
     check(recorder.saves == saves_before,
           "--hidden: a show request does not rewrite the saved hidden flag");
     check(!::IsWindowVisible(window.handle()), "the window still never shows");
+
+    // 托盘双击走的是同一条显示路径，同样不能绕过 --hidden。
+    ::SendMessageW(window.handle(), deskfeed::widget::kTrayIconMessage, 0,
+                   MAKELPARAM(WM_LBUTTONDBLCLK, 1));
+    check(recorder.saves == saves_before,
+          "--hidden: a tray double-click does not rewrite the saved hidden flag");
+    check(!::IsWindowVisible(window.handle()), "--hidden: a tray double-click still never shows");
+    window.destroy();
+}
+
+// 通知区域图标的契约：左键单击什么都不做；左键双击走“叫出悬浮窗”的那条路。
+// 这一轮不 force_hidden，但在调用双击前没有内容（没有 apply 帧），所以显示路径会停在
+// “拿到第一份内容再显示”，窗口全程不可见——门禁仍然是隐藏窗口门禁。
+void test_tray_single_click_is_inert_and_double_click_requests_show() {
+    Recorder recorder;
+    deskfeed::widget::WidgetWindow window;
+    std::wstring error;
+    deskfeed::widget::WindowPreferences preferences;
+    preferences.hidden = true;  // 用户存下来的“藏着”：双击应该把它清掉并落盘
+    deskfeed::widget::WidgetOptions options;
+    options.instance = ::GetModuleHandleW(nullptr);
+    options.class_name = kTestClass;
+    options.taskbar_available = true;
+    options.force_hidden = false;
+    options.tray_icon_available = false;
+    options.preferences = preferences;
+    check(window.create(options, callbacks_for(recorder), &error), "create for the tray gate");
+    HWND const hwnd = window.handle();
+    int const saves_before = recorder.saves;
+
+    // 单击：v4 会送 NIN_SELECT + WM_LBUTTONUP，旧版只有 WM_LBUTTONUP。两条都不触发任何动作。
+    ::SendMessageW(hwnd, deskfeed::widget::kTrayIconMessage, 0, MAKELPARAM(NIN_SELECT, 1));
+    ::SendMessageW(hwnd, deskfeed::widget::kTrayIconMessage, 0, MAKELPARAM(WM_LBUTTONUP, 1));
+    check(recorder.saves == saves_before, "a single tray click writes no preference");
+    check(!::IsWindowVisible(hwnd), "a single tray click does not reveal the window");
+
+    // 双击：只走“显示请求”，清掉隐藏标记；没有内容，所以窗口仍然不出现。
+    ::SendMessageW(hwnd, deskfeed::widget::kTrayIconMessage, 0, MAKELPARAM(WM_LBUTTONDBLCLK, 1));
+    check(recorder.saves == saves_before + 1, "a tray double-click takes the show path once");
+    check(!recorder.last_saved.hidden, "a tray double-click clears the saved hidden flag");
+    check(!::IsWindowVisible(hwnd), "without content the window still does not appear");
     window.destroy();
 }
 
@@ -1058,6 +1102,8 @@ bool create_for_menu_gate(deskfeed::widget::WidgetWindow& window, Recorder& reco
     options.class_name = kMenuGateClass;  // 独立类名：与其它用例的隐藏窗口互不干扰
     options.taskbar_available = true;
     options.force_hidden = false;  // 这一轮要真的显示（显示在私有桌面上）
+    // 私有桌面上没有真实的 Shell 通知区域；图标开关关掉，菜单本身仍然由窗口自己建。
+    options.tray_icon_available = false;
     options.preferences = preferences;
     return window.create(options, callbacks_for(recorder), &error);
 }
@@ -1173,7 +1219,8 @@ DWORD WINAPI menu_gate_thread(void* param) {
     if (state->widget_created) {
         window.apply(content_frame(2));
         state->widget = window.handle();
-        // 用户是**在悬浮窗上**右键的，菜单因此压在窗口上：把窗口摆到菜单要出现的位置。
+        // 菜单来源用**通知区域图标**的右键回调：它必须打开悬浮窗那一份菜单（同一个 HMENU）。
+        // 这里仍把窗口摆到菜单要出现的位置，验证的是菜单与置顶守护的关系，与手势来源无关。
         RECT rect{};
         if (state->widget != nullptr && ::GetWindowRect(state->widget, &rect)) {
             ::SetWindowPos(state->widget, nullptr, cursor.x, cursor.y, rect.right - rect.left,
@@ -1184,7 +1231,8 @@ DWORD WINAPI menu_gate_thread(void* param) {
         if (state->widget != nullptr && state->helper != nullptr) {
             state->start = ::GetTickCount64();
             ::SetTimer(state->helper, kMenuGateTimer, kMenuGateTickMs, nullptr);
-            ::PostMessageW(state->widget, WM_RBUTTONUP, 0, MAKELPARAM(5, 5));
+            ::PostMessageW(state->widget, deskfeed::widget::kTrayIconMessage, 0,
+                           MAKELPARAM(WM_CONTEXTMENU, 1));
             unsigned long long const deadline = state->start + 9000;
             MSG message{};
             while (::GetTickCount64() < deadline && state->phase < 3) {
@@ -1320,6 +1368,7 @@ int main() {
     test_create_is_hidden_and_tooltips_are_configured();
     test_menu_toggles_callbacks_rollback_and_refresh();
     test_show_request_leaves_disk_alone_while_force_hidden();
+    test_tray_single_click_is_inert_and_double_click_requests_show();
     test_anchor_is_not_rewritten_by_content_churn();
     test_external_destroy_invalidates_the_object();
     test_capture_changed_ends_the_drag();

@@ -19,6 +19,10 @@
 //     循环已经会泵它的消息，所以这里不需要新的线程或消息循环。
 namespace deskfeed::widget {
 
+// 通知区域图标（托盘图标）留给窗口过程的消息号。图标本身由窗口在创建时登记、销毁时撤销；
+// 这条消息只承载 Shell 的鼠标/键盘事件。离线用例也按这个号码合成事件，因此不要在别处复用。
+constexpr UINT kTrayIconMessage = WM_APP + 10;
+
 // 界面偏好：与 settings.ini 的 `[window]` 一节一一对应。
 //
 // `taskbar_component` 对应 `[taskbar] component`，但它**不由** save_preferences 落盘：
@@ -87,7 +91,11 @@ struct WidgetOptions {
     std::wstring class_name;
     // --no-taskbar 时为 false：菜单里那一项置灰（没打算守护就绝不许碰目标进程）。
     bool taskbar_available = true;
+    // 是否挂通知区域图标。缺省挂；离线用例设 false，避免在真实通知区域里留下图标。
+    // 关掉它只影响图标，不影响窗口、菜单与右键菜单项。
+    bool tray_icon_available = true;
     // --hidden：本次运行强制隐藏，且**不落盘**（这是运行开关，不是用户的持久意图）。
+    // 同时不挂通知区域图标：诊断/验收运行不该在真实托盘里留下东西。
     bool force_hidden = false;
     WindowPreferences preferences{};
 };
